@@ -3,9 +3,10 @@ import { getShapeDefinition, getShapeDefinitionForLegacyType } from './registry'
 import { ActivityPolicy } from './activityPolicy';
 import { StatePolicy, type BehavioralPolicyRecord } from './statePolicy';
 import { connectorEndpointPairAllowed, connectorEndpointSideAllowed, containerAcceptsSemanticChild } from './semantics';
+import { isMultiOperandOperator, isSequenceFragmentOperator } from './sequence';
 import { UML_FOUNDATION_SCHEMA_VERSION } from './types';
 import type {
-  DiagramContextId, DiagramNotationCapabilities, EndpointSide, ShapeDefinition, UMLDiagramFamily,
+  DiagramContextId, DiagramNotationCapabilities, EndpointSide, SequenceFragmentOperator, ShapeDefinition, UMLDiagramFamily,
 } from './types';
 
 export { UML_FOUNDATION_SCHEMA_VERSION };
@@ -320,6 +321,8 @@ function sequenceSemanticDiagnostics(
     const expectedKind: Readonly<Record<string, string>> = {
       'uml.sequence-message': 'synchronous', 'uml.async-message': 'asynchronous',
       'uml.return-message': 'return', 'uml.create-message': 'create',
+      'uml.self-call-message': 'self-call',
+      'uml.lost-message': 'lost', 'uml.found-message': 'found',
     };
     const expected = expectedKind[String(record.shapeId)];
     const sourceParticipantId = typeof event.sourceParticipantId === 'string' ? event.sourceParticipantId : undefined;
@@ -505,10 +508,10 @@ function sequenceSemanticDiagnostics(
       }
       const operator = data.operator;
       const operands = Array.isArray(data.operands) ? data.operands.filter(object) : [];
-      if (!['alt', 'opt', 'loop', 'par'].includes(String(operator)))
-        push(record.id, 'invalid-sequence-fragment-operator', 'invalid', 'Only alt, opt, loop, and par fragments are supported.', [record.id]);
-      const multi = operator === 'alt' || operator === 'par';
-      if (operands.length < (multi ? 2 : 1) || operands.length > (multi ? 16 : 1))
+      if (!isSequenceFragmentOperator(operator))
+        push(record.id, 'invalid-sequence-fragment-operator', 'invalid', 'Unsupported sequence fragment operator.', [record.id]);
+      const multi = isMultiOperandOperator(operator as SequenceFragmentOperator);
+      if (operands.length < (multi ? 2 : 1) || operands.length > 16)
         push(record.id, 'invalid-sequence-fragment-operands', 'invalid', 'The fragment operator has an unsupported operand count.', [record.id]);
       const operandIds = new Set<string>();
       operands.forEach((operand, index) => {

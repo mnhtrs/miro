@@ -8,9 +8,20 @@ const MESSAGE_KIND_BY_SHAPE: Readonly<Record<string, SequenceMessageKind>> = Obj
   'uml.async-message': 'asynchronous',
   'uml.return-message': 'return',
   'uml.create-message': 'create',
+  'uml.self-call-message': 'self-call',
+  'uml.lost-message': 'lost',
+  'uml.found-message': 'found',
 });
-const FRAGMENT_OPERATORS = new Set<SequenceFragmentOperator>(['alt', 'opt', 'loop', 'par']);
-const MESSAGE_KINDS = new Set<SequenceMessageKind>(['synchronous', 'asynchronous', 'return', 'create', 'self-call']);
+const FRAGMENT_OPERATORS = new Set<SequenceFragmentOperator>([
+  'alt', 'opt', 'loop', 'par', 'critical', 'break', 'seq', 'strict', 'neg', 'assert', 'ignore', 'consider',
+]);
+const MESSAGE_KINDS = new Set<SequenceMessageKind>([
+  'synchronous', 'asynchronous', 'return', 'create', 'self-call', 'lost', 'found',
+]);
+
+export function isMultiOperandOperator(operator: SequenceFragmentOperator): boolean {
+  return ['alt', 'par', 'seq', 'strict'].includes(operator);
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
@@ -149,8 +160,9 @@ function newOperand(id: string, order: number): SequenceFragmentOperand {
 export function normalizeSequenceFragmentData(value: unknown, frameId: string): SequenceFragmentData | undefined {
   if (!isRecord(value) || typeof value.operator !== 'string' || !FRAGMENT_OPERATORS.has(value.operator as SequenceFragmentOperator)) return undefined;
   const operator = value.operator as SequenceFragmentOperator;
-  const minimum = operator === 'alt' || operator === 'par' ? 2 : 1;
-  const maximum = operator === 'alt' || operator === 'par' ? 16 : 1;
+  const isMulti = isMultiOperandOperator(operator);
+  const minimum = isMulti ? 2 : 1;
+  const maximum = 16;
   const source = Array.isArray(value.operands) ? value.operands.slice(0, maximum) : [];
   const used = new Set<string>();
   const operands = source.flatMap((candidate, index) => {

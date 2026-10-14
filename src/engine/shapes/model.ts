@@ -18,7 +18,7 @@ export const LEGACY_RAW_TYPES = [
 ] as const;
 export type LegacyRawType = typeof LEGACY_RAW_TYPES[number];
 const OLD_SHAPE_TYPES = new Set<string>(LEGACY_RAW_TYPES);
-const MARKERS = new Set<EndpointMarker>(['none', 'arrow', 'openArrow', 'blockArrow', 'hollowTriangle', 'diamond', 'filledDiamond', 'circle', 'bar', 'crowFoot', 'zeroOrOne', 'oneOrMany', 'zeroOrMany']);
+const MARKERS = new Set<EndpointMarker>(['none', 'arrow', 'openArrow', 'blockArrow', 'hollowTriangle', 'diamond', 'filledDiamond', 'circle', 'filledCircle', 'bar', 'crowFoot', 'zeroOrOne', 'oneOrMany', 'zeroOrMany']);
 const CARDINALITIES = new Set<Cardinality>(['one', 'zero-or-one', 'many', 'one-or-many', 'zero-or-many']);
 const BEHAVIORAL_NODE_ROLES = new Set<BehavioralNodeRole>(['decision', 'merge', 'fork', 'join', 'choice', 'junction']);
 const isBehavioralNodeRole = (value: unknown): value is BehavioralNodeRole => typeof value === 'string' && BEHAVIORAL_NODE_ROLES.has(value as BehavioralNodeRole);
@@ -131,10 +131,11 @@ export function resizeBoxFromHandle(
     if (vertical ? (handle !== 'n' && handle !== 's') : (handle !== 'e' && handle !== 'w')) return null;
     const local = worldPointToObject(shape, worldPointer);
     const mouse = vertical ? local.y - shape.h / 2 : local.x - shape.w / 2;
-    const sign = vertical ? sy : sx;
-    const fixed = -(sign) * (vertical ? shape.h : shape.w) / 2;
-    const size = Math.max(vertical ? minHeight : minWidth, sign * (mouse - fixed));
-    const centerOffset = (mouse + fixed) / 2;
+    const signAxis = vertical ? sy : sx;
+    const oldSize = vertical ? shape.h : shape.w;
+    const fixed = -signAxis * oldSize / 2;
+    const size = Math.max(vertical ? minHeight : minWidth, signAxis * (mouse - fixed));
+    const centerOffset = signAxis * (size - oldSize) / 2;
     const centerX = shape.x + shape.w / 2, centerY = shape.y + shape.h / 2;
     const [newCenterX, newCenterY] = vertical
       ? rotatePoint(centerX, centerY + centerOffset, centerX, centerY, normalizeRotation(shape.rotation))
@@ -145,30 +146,93 @@ export function resizeBoxFromHandle(
   }
   const local = worldPointToObject(shape, worldPointer);
   const mouseX = local.x - shape.w / 2, mouseY = local.y - shape.h / 2;
-  let width = shape.w, height = shape.h, centerOffsetX = 0, centerOffsetY = 0;
+  let width = shape.w, height = shape.h;
   if (sx !== 0) {
     const fixedX = -sx * shape.w / 2;
     width = Math.max(minWidth, sx * (mouseX - fixedX));
-    centerOffsetX = (mouseX + fixedX) / 2;
   }
   if (sy !== 0) {
     const fixedY = -sy * shape.h / 2;
     height = Math.max(minHeight, sy * (mouseY - fixedY));
-    centerOffsetY = (mouseY + fixedY) / 2;
   }
   if (policy.mode === 'aspect') {
-    const ratio = Number.isFinite(policy.aspectRatio) && policy.aspectRatio > 0 ? policy.aspectRatio : 1;
+    const ratio = policy.mode === 'aspect' && Number.isFinite(policy.aspectRatio) && policy.aspectRatio > 0 ? policy.aspectRatio : 1;
     const aspectWidth = Math.max(sx ? width : shape.w, (sy ? height : shape.h) * ratio,
       minWidth, minHeight * ratio);
     width = aspectWidth;
     height = aspectWidth / ratio;
-    centerOffsetX = sx ? sx * (width - shape.w) / 2 : 0;
-    centerOffsetY = sy ? sy * (height - shape.h) / 2 : 0;
   }
+  const centerOffsetX = sx !== 0 ? sx * (width - shape.w) / 2 : 0;
+  const centerOffsetY = sy !== 0 ? sy * (height - shape.h) / 2 : 0;
   const centerX = shape.x + shape.w / 2, centerY = shape.y + shape.h / 2;
   const [newCenterX, newCenterY] = rotatePoint(centerX + centerOffsetX, centerY + centerOffsetY,
     centerX, centerY, normalizeRotation(shape.rotation));
   return { x: newCenterX - width / 2, y: newCenterY - height / 2, w: width, h: height };
+}
+
+export function normalizeDragBox(
+  origin: { x: number; y: number },
+  pointer: { x: number; y: number },
+  resizePolicy: ShapeResizePolicy = { mode: 'free' },
+  definition?: ShapeDefinition,
+) {
+  let x = Math.min(origin.x, pointer.x), y = Math.min(origin.y, pointer.y);
+  let w = Math.abs(pointer.x - origin.x), h = Math.abs(pointer.y - origin.y);
+
+  if (resizePolicy.mode === 'aspect' || definition?.aspectLocked) {
+    const defW = definition?.width || 1;
+    const defH = definition?.height || 1;
+    const ratio = resizePolicy.mode === 'aspect' && Number.isFinite(resizePolicy.aspectRatio) && resizePolicy.aspectRatio > 0
+      ? resizePolicy.aspectRatio
+      : (defW / Math.max(1, defH));
+    const width = Math.max(w, h * ratio, 10);
+    h = width / ratio;
+    w = width;
+    x = pointer.x < origin.x ? origin.x - w : origin.x;
+    y = pointer.y < origin.y ? origin.y - h : origin.y;
+    return { x, y, w, h };
+  }
+
+  if (definition) {
+    const isSequenceParticipant = definition.semantic?.family === 'uml.sequence-participant'
+      || ['uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity'].includes(definition.id);
+
+    if (isSequenceParticipant) {
+      // Standard sequence participant sizing:
+      // Width is anchored to the standard participant width (defW, 75 for actor matching use-case actor, 118 for lifeline).
+      // Height follows user drag naturally with the default height as the baseline (e.g. 210 for actor, 220 for lifeline).
+      const defW = definition.width || 75;
+      const defH = definition.height || 210;
+      const targetW = defW;
+      const targetH = Math.max(defH, h);
+
+      const nextX = pointer.x < origin.x ? origin.x - targetW : origin.x;
+      const nextY = pointer.y < origin.y ? origin.y - targetH : origin.y;
+      return { x: nextX, y: nextY, w: targetW, h: targetH };
+    }
+
+    if (definition.id === 'uml.activation') {
+      const defW = definition.width || 24;
+      const targetH = Math.max(40, h);
+      const nextX = pointer.x < origin.x ? origin.x - defW : origin.x;
+      const nextY = pointer.y < origin.y ? origin.y - targetH : origin.y;
+      return { x: nextX, y: nextY, w: defW, h: targetH };
+    }
+
+    if (['uml.frame', 'uml.package', 'uml.component'].includes(definition.id)) {
+      const minW = 140;
+      const minH = 90;
+      const targetW = Math.max(minW, w);
+      const targetH = Math.max(minH, h);
+      const nextX = pointer.x < origin.x ? origin.x - targetW : origin.x;
+      const nextY = pointer.y < origin.y ? origin.y - targetH : origin.y;
+      return { x: nextX, y: nextY, w: targetW, h: targetH };
+    }
+  }
+
+  w = Math.max(10, w);
+  h = Math.max(10, h);
+  return { x, y, w, h };
 }
 
 export function rotatedBoxCorners(shape: BoxTransform): [number, number][] {

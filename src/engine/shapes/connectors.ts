@@ -206,7 +206,7 @@ export function connectorMarkerOccupancy(marker: EndpointMarker | undefined, car
   const size = Math.max(8, width * 3.1);
   if (marker === 'diamond' || marker === 'filledDiamond') return size * 1.8;
   if (marker === 'openArrow' || marker === 'hollowTriangle') return size * 1.55;
-  if (marker === 'circle' || marker === 'zeroOrOne') return size * 0.8;
+  if (marker === 'circle' || marker === 'filledCircle' || marker === 'zeroOrOne') return size * 0.8;
   if (marker === 'crowFoot' || marker === 'oneOrMany' || marker === 'zeroOrMany') return size * 1.2;
   if (marker === 'bar') return size * 0.55;
   return size;
@@ -362,8 +362,8 @@ function markerPath(marker: string, point: [number, number], neighbor: [number, 
   if (marker === 'openArrow') return [line(base(size * 1.55, 0.60), point), line(point, base(size * 1.55, -0.60))];
   if (marker === 'hollowTriangle') return [triangle('surface')];
   if (marker === 'diamond' || marker === 'filledDiamond') return [diamond(marker === 'filledDiamond')];
-  if (marker === 'circle') return [{ commands: [command('moveTo', point[0] + size * 0.45, point[1]),
-    command('ellipse', point[0], point[1], size * 0.45, size * 0.45, 0, 0, Math.PI * 2, 0), command('closePath')], fill: 'surface' }];
+  if (marker === 'circle' || marker === 'filledCircle') return [{ commands: [command('moveTo', point[0] + size * 0.45, point[1]),
+    command('ellipse', point[0], point[1], size * 0.45, size * 0.45, 0, 0, Math.PI * 2, 0), command('closePath')], fill: marker === 'filledCircle' ? 'currentColor' : 'surface' }];
   if (marker === 'bar') return [line([point[0] + nx * size * 0.55, point[1] + ny * size * 0.55], [point[0] - nx * size * 0.55, point[1] - ny * size * 0.55])];
   if (marker === 'crowFoot') return [line(point, base(size * 1.6, 0.62)), line(point, base(size * 1.6, 0)), line(point, base(size * 1.6, -0.62))];
   return [];

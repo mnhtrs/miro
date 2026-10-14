@@ -20,6 +20,7 @@
     "test:uml:sequence:deep-corrective": "node scripts/verify-uml-sequence-deep-corrective.mjs",
     "test:usecase": "npx tsx src/engine/shapes/__tests__/usecase.test.mjs",
     "test:class": "npx tsx src/engine/shapes/__tests__/class.test.mjs",
+    "test:sequence": "npx tsx src/engine/shapes/__tests__/sequence.test.mjs",
     "test:pen-browser": "node scripts/verify-pen-browser.mjs",
     "lint": "eslint .",
     "preview": "vite preview",

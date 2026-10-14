@@ -40,7 +40,7 @@ import { compareSequenceEvents, createSequenceMessageEvent, isSequenceMessageSha
   sequenceMessageKindForShape } from './shapes/sequence';
 import { normalizeExtendRelationshipData, normalizeUseCaseDiagramData } from './shapes/usecaseData';
 import { buildSolid3DProjection, normalizeSolid3DScale, projectSolid3DAxes, projectSolid3DVector, rotateSolid3DOrientationAboutLocalAxis, solid3DCameraDepth, solid3DLocalAxisSpans, solid3DScaleFromBounds, solid3DSizeGroup, solid3DRotationFrames, SOLID3D_CANVAS_INITIAL_YAW_DEGREES, SOLID3D_POSE_VERSION, type Solid3DGeometry, type Solid3DRotationAxis, type Solid3DScale } from './shapes/solid3d';
-import { connectionPointById, connectionPointsAtSequenceTime, connectionPointsForBox, connectorBounds, deserializeBoardShape, deriveStructuredShapeParameters, isDoubleClickTextEditableShape, objectPointToWorld, persistentSequencePointId, resizeBoxFromHandle, resizeDiagramEmbeddedTextScale, rotatedBoxBounds, rotatedBoxCorners, rotatePoint, unrotatePoint, worldPointToObject } from './shapes/model';
+import { connectionPointById, connectionPointsAtSequenceTime, connectionPointsForBox, connectorBounds, deserializeBoardShape, deriveStructuredShapeParameters, isDoubleClickTextEditableShape, normalizeDragBox, objectPointToWorld, persistentSequencePointId, resizeBoxFromHandle, resizeDiagramEmbeddedTextScale, rotatedBoxBounds, rotatedBoxCorners, rotatePoint, unrotatePoint, worldPointToObject } from './shapes/model';
 import type { BehavioralNodeRole, Cardinality, ConnectorShapeObject, DiagramShapeObject, EndpointIntent, EndpointMarker, EndpointSide, PathCommand, SequenceActivationData, SequenceFragmentData, SequenceLifecycleData, SequenceMessageEventData, SequenceParticipantData, ShapeConnectionPoint, ShapeDefinition, ShapeResizePolicy, UMLActivityNodeData, UMLClassifierData, UMLDiagramFamily, UMLInstanceData, UMLStatePointData, UMLStateVertexData, UMLUseCaseData } from './shapes/types';
 
 export type ToolType =
@@ -227,6 +227,7 @@ export class CanvasEngine {
 
   public  cam: Camera = { x:0, y:0, zoom:1 };
   public  tool: ToolType = 'pen';
+  private previousCreationTool: ToolType | null = null;
   public  penMode: 'normal' | 'smart' = 'normal';
   private diagramContext: UMLDiagramFamily | null = null;
   private graphNotifyQueued = false;
@@ -578,36 +579,67 @@ export class CanvasEngine {
     // --- 1. HIT TEST for existing objects ---
     let hit: AnyShape | null = null;
 
-    const rawHit = this.hitShape(w.x, w.y);
-    if (rawHit) {
-      if (this.tool === 'select') {
-        hit = rawHit;
-      } else if (isTextTool(this.tool)) {
-        if (isTextTool(rawHit.type)) hit = rawHit;
-      } else if (this.tool === 'sticky') {
-        if (rawHit.type === 'sticky') hit = rawHit;
-      } else if (isConnectorTool(this.tool)) {
-        // Connector tools are explicit creation modes. Let a new relationship start even when an
-        // existing line crosses the chosen semantic node/port; normal select mode edits old edges.
-      } else if (isBoxShapeTool(this.tool)) {
-        const childDefinition = getVisibleShapeDefinitionByToolId(this.tool);
-        const hitDefinition = this.definitionForEndpoint(rawHit);
-        const acceptedNestedContainer = childDefinition?.kind === 'shape'
-          ? this.findAcceptedContainerAtPoint(childDefinition, w.x, w.y) : undefined;
-        const directlyAcceptsChild = rawHit.type === 'diagram' && childDefinition?.kind === 'shape'
-          && Boolean(hitDefinition && containerAcceptsSemanticChild(hitDefinition, childDefinition));
-        const placesInsideTopContainer = rawHit.type === 'diagram' && Boolean(hitDefinition?.semantic?.container)
-          && acceptedNestedContainer !== undefined && acceptedNestedContainer.id !== rawHit.id;
-        // Container backgrounds are painted behind their contents. If a larger frame wins the
-        // geometric hit but a nested semantic container accepts this glyph, prefer that owner.
-        const placingSemanticChild = directlyAcceptsChild || placesInsideTopContainer;
-        if (!placingSemanticChild && (isBoxShapeTool(rawHit.type) || rawHit.type === 'diagram' || isConnectorShape(rawHit))) hit = rawHit;
-      } else if (this.tool === 'image') {
-        if (rawHit.type === 'image') hit = rawHit;
+    // Prioritize selected shapes: clicking on/inside an already selected shape's bounds
+    // always interacts with / drags it, and NEVER draws a new shape over it!
+    if (this.sel.size > 0 && this.tool !== 'pen') {
+      for (const id of this.sel) {
+        const s = this.shapes.get(id);
+        if (s && 'minX' in s && 'maxX' in s && 'minY' in s && 'maxY' in s) {
+          const tol = 8 / this.cam.zoom;
+          if (w.x >= s.minX - tol && w.x <= s.maxX + tol && w.y >= s.minY - tol && w.y <= s.maxY + tol) {
+            hit = s;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!hit) {
+      const rawHit = this.hitShape(w.x, w.y);
+      if (rawHit) {
+        if (this.tool === 'select') {
+          hit = rawHit;
+        } else if (this.sel.has(rawHit.id)) {
+          hit = rawHit;
+        } else if (isTextTool(this.tool)) {
+          if (isTextTool(rawHit.type)) hit = rawHit;
+        } else if (this.tool === 'sticky') {
+          if (rawHit.type === 'sticky') hit = rawHit;
+        } else if (isConnectorTool(this.tool)) {
+          if (isConnectorShape(rawHit) || !isConnectableShape(rawHit)) {
+            hit = rawHit;
+          } else {
+            const definition = getShapeDefinitionByToolId(this.tool);
+            const nearbyCandidates = definition
+              ? this.connectionPointCandidates(w.x, w.y, 'preview', definition, 'source', { includeIncompatible: true, maxDistance: 24 / this.cam.zoom })
+              : [];
+            if (nearbyCandidates.length === 0) {
+              hit = rawHit;
+            }
+          }
+        } else if (isBoxShapeTool(this.tool)) {
+          const childDefinition = getVisibleShapeDefinitionByToolId(this.tool);
+          const hitDefinition = this.definitionForEndpoint(rawHit);
+          const acceptedNestedContainer = childDefinition?.kind === 'shape'
+            ? this.findAcceptedContainerAtPoint(childDefinition, w.x, w.y) : undefined;
+          const directlyAcceptsChild = rawHit.type === 'diagram' && childDefinition?.kind === 'shape'
+            && Boolean(hitDefinition && containerAcceptsSemanticChild(hitDefinition, childDefinition));
+          const placesInsideTopContainer = rawHit.type === 'diagram' && Boolean(hitDefinition?.semantic?.container)
+            && acceptedNestedContainer !== undefined && acceptedNestedContainer.id !== rawHit.id;
+          const placingSemanticChild = directlyAcceptsChild || placesInsideTopContainer;
+          if (!placingSemanticChild && (isBoxShapeTool(rawHit.type) || rawHit.type === 'diagram' || isConnectorShape(rawHit))) hit = rawHit;
+        } else if (this.tool === 'image') {
+          if (rawHit.type === 'image') hit = rawHit;
+        }
       }
     }
 
     if (hit) {
+      if (this.tool !== 'select') {
+        if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+        this.tool = 'select';
+        this.onTool?.('select');
+      }
       if (!e.shiftKey && !this.sel.has(hit.id)) { this.sel.clear(); }
       this.sel.add(hit.id);
       this.onSel?.([...this.sel]);
@@ -634,13 +666,8 @@ export class CanvasEngine {
     }
 
     // --- 2. DESELECT IF CLICKING BOARD ---
-    if (this.sel.size > 0 && !e.shiftKey && !isBoxShapeTool(this.tool) && !isConnectorTool(this.tool)) {
-      this.sel.clear();
-      this.onSel?.([]);
-      this.dirty = true;
-      // In selection mode, clicking the board drops selection without also drawing.
-      // Explicit registered diagram tools remain creation modes, including when placing an
-      // accepted semantic child on an existing container or connection point.
+    if (this.sel.size > 0 && !e.shiftKey) {
+      this.clearSelection();
       return;
     }
 
@@ -991,31 +1018,9 @@ export class CanvasEngine {
         if (!shape || !origin) return;
         const isSequenceMessage = origin.type === 'connector'
           && getShapeDefinition((origin as ConnectorShape).shapeId)?.semantic?.family === 'uml.sequence-edge';
-        let effectiveDy = dy;
-        if (origin.type === 'diagram' && this.sel.has(id)) {
-          const definition = getShapeDefinition(origin.shapeId);
-          if (definition?.semantic?.family === 'uml.sequence-participant' || origin.shapeId === 'uml.frame')
-            effectiveDy = 0; // Sequence participants and frames stay on the shared temporal baseline.
-        }
-        if (origin.type === 'diagram' || origin.type === 'connector') {
-          let parentId = origin.containerId;
-          const visited = new Set<string>();
-          while (parentId && !visited.has(parentId)) {
-            if (this.sel.has(parentId)) {
-              const parent = this.shapes.get(parentId);
-              if (parent?.type === 'diagram' && (getShapeDefinition(parent.shapeId)?.semantic?.family === 'uml.sequence-participant'
-                || parent.shapeId === 'uml.frame')) effectiveDy = 0;
-              if (parent?.type === 'diagram' && (getShapeDefinition(parent.shapeId)?.semantic?.family === 'uml.sequence-participant'
-                || parent.shapeId === 'uml.frame')) break;
-            }
-            visited.add(parentId);
-            const parent = this.shapes.get(parentId);
-            parentId = parent?.type === 'diagram' ? parent.containerId : undefined;
-          }
-        }
         let moved = isSequenceMessage && this.sel.has(id)
-          ? this.moveSequenceMessageGesture(origin as ConnectorShape, dx, effectiveDy)
-          : moveShape(origin, orig.x + dx, orig.y + effectiveDy);
+          ? this.moveSequenceMessageGesture(origin as ConnectorShape, dx, dy)
+          : moveShape(origin, orig.x + dx, orig.y + dy);
         if (moved.type === 'diagram') {
           const definition = getShapeDefinition(moved.shapeId);
           if (definition?.semantic?.family === 'uml.sequence-participant') lifecycleOwners.add(moved.id);
@@ -1124,7 +1129,7 @@ export class CanvasEngine {
       const definition = s.type === 'diagram' ? getShapeDefinition(s.shapeId) : getShapeDefinitionForLegacyType(s.type);
       // A registered 3D shape is never sent through the generic 2D drag-box resize path.
       if (s.type === 'diagram' && definition?.solid3d) return;
-      const box = normalizeDragBox(this.shapeOrigin, w, getShapeCreationResizePolicy(definition));
+      const box = normalizeDragBox(this.shapeOrigin, w, getShapeCreationResizePolicy(definition), definition);
       const next = { ...s, ...box };
       Object.assign(next, rotatedBoxBounds(next));
       this.put(next as AnyShape);
@@ -1261,7 +1266,7 @@ export class CanvasEngine {
           if (this.solidCreationGesture?.id === shape.id)
             this.updateAnchoredSolidCreation(shape as DiagramShape, definition, world);
         } else {
-          const box = normalizeDragBox(this.shapeOrigin, world, getShapeCreationResizePolicy(definition));
+          const box = normalizeDragBox(this.shapeOrigin, world, getShapeCreationResizePolicy(definition), definition);
           const defW = definition?.width ?? 120, defH = definition?.height ?? 80;
           const dragScale = Math.max(0.25, Math.min(16, Math.sqrt((box.w / defW) * (box.h / defH))));
           const next = { ...shape, ...box, ...(shape.type === 'diagram' ? { embeddedTextScale: dragScale } : {}) };
@@ -1282,7 +1287,7 @@ export class CanvasEngine {
           shape = this.shapes.get(this.currId);
         }
         // Click-to-create uses each registered definition's dimensions; legacy box tools keep 120×80.
-        if (this.tool !== 'pen' && shape && isPositionedShape(shape) && shape.w < 5 && shape.h < 5) {
+        if (this.tool !== 'pen' && shape && isPositionedShape(shape) && (shape.w <= 15 || shape.h <= 15)) {
           const definition = shape.type === 'diagram' ? getShapeDefinition(shape.shapeId) : getShapeDefinitionForLegacyType(shape.type);
           const width = definition?.width ?? 120;
           const height = definition?.height ?? 80;
@@ -1334,9 +1339,14 @@ export class CanvasEngine {
           this.sel.clear();
           this.sel.add(this.currId);
           this.onSel?.([...this.sel]);
+          if (this.tool !== 'select') {
+            if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+            this.tool = 'select';
+            this.onTool?.('select');
+          }
           this.dirty = true;
         } else {
-          this.sel.clear(); this.onSel?.([]);
+          this.clearSelection();
           this.dirty = true;
         }
 
@@ -1773,8 +1783,18 @@ export class CanvasEngine {
       return depth;
     };
     // Match the painter's semantic layering: a contained child wins where its real geometry is
-    // hit, while an uncovered container background remains directly selectable.
-    preciseHits.sort((a, b) => containmentDepth(a) - containmentDepth(b) || a.id.localeCompare(b.id));
+    // hit, connectors/lines beat large background boxes, and smaller shapes beat large containers.
+    const hitPriority = (shape: AnyShape) => {
+      const isStrokeOnly = isConnectorShape(shape) || shape.type === 'curve' || shape.type === 'pen';
+      const depth = containmentDepth(shape);
+      let areaPenalty = 0;
+      if ('w' in shape && 'h' in shape && typeof shape.w === 'number' && typeof shape.h === 'number') {
+        const area = Math.max(1, shape.w * shape.h);
+        areaPenalty = Math.min(100, Math.log10(area) * 15);
+      }
+      return (depth * 1000) + (isStrokeOnly ? 500 : 0) - areaPenalty;
+    };
+    preciseHits.sort((a, b) => hitPriority(a) - hitPriority(b) || a.id.localeCompare(b.id));
     return preciseHits[preciseHits.length-1] ?? null;
   }
 
@@ -2671,6 +2691,11 @@ export class CanvasEngine {
       this.cancelPointer();
     }
     this.tool = t;
+    if (t !== 'select' && t !== 'lasso-select') {
+      this.previousCreationTool = t;
+    } else {
+      this.previousCreationTool = null;
+    }
     this.connectorTargetFeedback = null;
     this.connectorSourceFeedback = null;
     this.hoveredSolidControl = null;
@@ -2678,6 +2703,17 @@ export class CanvasEngine {
     this.sel.clear(); this.onSel?.([]);
     this.dirty = true;
     this.onCursor?.(this.cursorForTool());
+  }
+
+  public clearSelection() {
+    this.sel.clear();
+    this.onSel?.([]);
+    if (this.previousCreationTool) {
+      const restore = this.previousCreationTool;
+      this.tool = restore;
+      this.onTool?.(restore);
+    }
+    this.dirty = true;
   }
 
   /** End any transient pointer gesture safely on pointercancel, lost focus, tool switch, or teardown. */
@@ -2757,7 +2793,8 @@ export class CanvasEngine {
 
   deleteSel() {
     this.deleteShapes([...this.sel]);
-    this.sel.clear(); this.onSel?.([]); this.saveH();
+    this.clearSelection();
+    this.saveH();
   }
 
   dupSel() {
@@ -3124,6 +3161,19 @@ export class CanvasEngine {
   private diagramContentMinimumSize(shape: DiagramShape, text = shape.text ?? '', data = shape.data): { width: number; height: number } | null {
     const definition = getShapeDefinition(shape.shapeId);
     if (!definition) return null;
+    if (['uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity'].includes(shape.shapeId)) {
+      const headerH = Math.min(definition.height, sequenceParticipantHeaderHeight(definition.geometry));
+      return { width: Math.max(48, Math.round(definition.width * 0.5)), height: headerH + 30 };
+    }
+    if (shape.shapeId === 'uml.activation') {
+      return { width: 16, height: 40 };
+    }
+    if (shape.shapeId === 'uml.destroy') {
+      return { width: 24, height: 24 };
+    }
+    if (['uml.frame', 'uml.package', 'uml.component'].includes(shape.shapeId)) {
+      return { width: 140, height: 90 };
+    }
     const textCapabilities = diagramCapabilitiesFor(definition, shape.diagramContext).text;
     const baseFontSize = Math.max(textCapabilities.minFontSize ?? 12, shape.fs ?? 14);
     const typography = diagramTypography(textCapabilities.role ?? 'state', baseFontSize, textCapabilities.minFontSize ?? 12);
@@ -6073,6 +6123,16 @@ export class CanvasEngine {
     cx.fillStyle = shape.textColor ?? '#1f2937';
     cx.textAlign = 'center'; cx.textBaseline = 'middle';
     cx.font = `${params.italicName === true ? 'italic ' : ''}${fs}px Inter, 'Segoe UI', sans-serif`;
+
+    const isStructuredShape = definition.geometry === 'table' && (
+      (Boolean(shape.data?.table) && Array.isArray((shape.data?.table as Record<string, unknown>)?.columns)) ||
+      (Boolean(shape.data?.classifier) && Array.isArray((shape.data?.classifier as Record<string, unknown>)?.compartments)) ||
+      (Boolean(shape.data?.instance) && Array.isArray((shape.data?.instance as Record<string, unknown>)?.values))
+    );
+    if (shape.id === this.editingId && !isStructuredShape && shape.shapeId !== 'uml.use-case-ext') {
+      cx.restore(); return;
+    }
+
     if (definition.geometry === 'table' && definition.dataCapabilities?.includes('table')
       && shape.data?.table && isRecord(shape.data.table) && Array.isArray(shape.data.table.columns)) {
       this.drawStructuredErTableLabel(shape, definition, shape.data.table.columns as unknown[]);
@@ -6276,14 +6336,23 @@ export class CanvasEngine {
       cx.restore(); return;
     }
     if (definition.geometry === 'umlRole') {
-      const stereotype = typeof params.stereotype === 'string' ? params.stereotype : '';
+      const stereotype = typeof params.stereotype === 'string' ? params.stereotype.trim() : '';
       const headerHeight = Math.min(h, SEQUENCE_ROLE_HEADER_HEIGHT);
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
       if (stereotype) {
-        cx.font = `600 ${Math.max(minFont(4), Math.min(secondaryFs, headerHeight * 0.18))}px Inter, 'Segoe UI', sans-serif`;
-        cx.fillText(stereotype, w / 2, headerHeight * 0.72, Math.max(1, w - minFont(8)));
+        cx.font = `600 ${Math.max(minFont(4), Math.min(secondaryFs, headerHeight * 0.16))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.fillText(stereotype, w / 2, headerHeight * 0.65, Math.max(1, w - minFont(8)));
+        cx.font = `600 ${Math.max(minFont(5), Math.min(titleFs, headerHeight * 0.20))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        cx.fillText(text, w / 2, headerHeight * 0.88, Math.max(1, w - minFont(8)));
+      } else {
+        const nameFs = Math.max(11, Math.min(14, fs));
+        cx.font = `600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        const labelCenterY = Math.round(headerHeight * 0.75);
+        cx.fillText(text, w / 2, labelCenterY, Math.max(1, w - minFont(8)));
       }
-      cx.font = `600 ${Math.max(minFont(5), Math.min(titleFs, headerHeight * 0.20))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(text, w / 2, Math.min(headerHeight - 2, headerHeight * 0.91), Math.max(1, w - minFont(8)));
       cx.restore(); return;
     }
     if (definition.geometry === 'umlState' && shape.shapeId === 'uml.state') {
@@ -6372,25 +6441,24 @@ export class CanvasEngine {
       cx.restore(); return;
     }
     if (definition.geometry === 'umlBoundary') {
-      const titleHeight = Math.min(h * 0.25, Math.max(32, UML_BOUNDARY_TITLE_HEIGHT * Math.min(2.5, fontScale)));
+      const titleHeight = Math.min(h, UML_BOUNDARY_TITLE_HEIGHT);
       const stereotype = typeof params.stereotype === 'string' ? params.stereotype.trim()
         : (shape.data?.subjectBoundary as { stereotype?: string } | undefined)?.stereotype?.trim() || '';
-      cx.textAlign = 'left'; cx.textBaseline = 'middle';
-      const padLeft = Math.max(14, 14 * Math.min(2.0, fontScale));
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
       if (stereotype) {
         const stereoFs = Math.max(9, Math.min(titleHeight * 0.32, secondaryFs));
         const nameFs = Math.max(11, Math.min(titleHeight * 0.42, fs));
         cx.font = `600 ${stereoFs}px Inter, 'Segoe UI', sans-serif`;
         cx.fillStyle = '#64748b';
-        cx.fillText(stereotype.toUpperCase(), padLeft, titleHeight * 0.30, Math.max(1, w - padLeft * 2));
+        cx.fillText(stereotype.toUpperCase(), w / 2, titleHeight * 0.30, Math.max(1, w - 24));
         cx.font = `600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
         cx.fillStyle = shape.textColor ?? '#0f172a';
-        cx.fillText(text, padLeft, titleHeight * 0.70, Math.max(1, w - padLeft * 2));
+        cx.fillText(text, w / 2, titleHeight * 0.70, Math.max(1, w - 24));
       } else {
-        const nameFs = Math.max(11, Math.min(titleHeight * 0.45, fs));
+        const nameFs = Math.max(11, Math.min(15, shape.fs ?? 14));
         cx.font = `600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
         cx.fillStyle = shape.textColor ?? '#0f172a';
-        cx.fillText(text, padLeft, titleHeight / 2, Math.max(1, w - padLeft * 2));
+        cx.fillText(text, w / 2, titleHeight / 2, Math.max(1, w - 24));
       }
       cx.restore(); return;
     }
@@ -6772,11 +6840,12 @@ export class CanvasEngine {
     if (marker === 'none') return;
     const size = Math.max(8, width * 3.1), ux = Math.cos(angle), uy = Math.sin(angle), nx = -uy, ny = ux;
     const baseX = x - ux * size, baseY = y - uy * size;
-    cx.save(); cx.lineWidth = Math.max(1, width); cx.strokeStyle = String(cx.strokeStyle); cx.fillStyle = ['hollowTriangle', 'diamond', 'circle', 'zeroOrOne'].includes(marker) ? '#ffffff' : String(cx.fillStyle);
+    cx.save(); cx.lineWidth = Math.max(1, width); cx.strokeStyle = String(cx.strokeStyle); cx.fillStyle = ['hollowTriangle', 'diamond', 'circle', 'zeroOrOne'].includes(marker) ? '#ffffff' : marker === 'filledCircle' ? color : String(cx.fillStyle);
     if (marker === 'bar') {
       cx.beginPath(); cx.moveTo(x + nx * size * 0.42, y + ny * size * 0.42); cx.lineTo(x - nx * size * 0.42, y - ny * size * 0.42); cx.stroke();
-    } else if (marker === 'circle' || marker === 'zeroOrOne') {
-      cx.beginPath(); cx.arc(x - ux * size * 0.5, y - uy * size * 0.5, size * 0.25, 0, Math.PI * 2); cx.fill(); cx.stroke();
+    } else if (marker === 'circle' || marker === 'filledCircle' || marker === 'zeroOrOne') {
+      if (marker === 'filledCircle') cx.fillStyle = color;
+      cx.beginPath(); cx.arc(x - ux * size * 0.5, y - uy * size * 0.5, size * 0.35, 0, Math.PI * 2); cx.fill(); cx.stroke();
       if (marker === 'zeroOrOne') drawEndpointMarkerAt(cx, 'bar', baseX - ux * size * 0.15, baseY - uy * size * 0.15, angle, size * 0.45);
     } else if (marker === 'crowFoot') {
       drawCrowFoot(cx, x, y, angle, size);
@@ -7458,8 +7527,9 @@ function pointTouchesDiagram(shape: DiagramShape, point: { x: number; y: number 
     const x = localX - shape.x, y = localY - shape.y;
     if (definition.geometry === 'annotation') return x >= 0 && x <= shape.w && y >= 0 && y <= shape.h;
     const headerHeight = Math.min(shape.h, sequenceParticipantHeaderHeight(definition.geometry));
-    if (definition.geometry !== 'umlLifeline' && x >= 0 && x <= shape.w && y >= 0 && y <= headerHeight) return true;
     if (x >= 0 && x <= shape.w && y >= 0 && y <= headerHeight) return true;
+    const stemHitWidth = Math.max(32, shape.w * 0.45);
+    if (Math.abs(x - shape.w / 2) <= stemHitWidth / 2 && y >= headerHeight && y <= shape.h) return true;
   }
   if (geometryUsesFill(definition.geometry) && outlines.some(path => path.length >= 3 && pointInsidePolygon(point, path))) return true;
   if (intrinsicFills.some(path => path.length >= 3 && pointInsidePolygon(point, path))) return true;
@@ -7638,7 +7708,7 @@ function connectorMarkerPaths(marker: EndpointMarker | undefined, point: [number
   if (marker === 'openArrow') return [line(base(size * 1.55, 0.6), point), line(point, base(size * 1.55, -0.6))];
   if (marker === 'hollowTriangle') return [triangle];
   if (marker === 'diamond' || marker === 'filledDiamond') return [diamond];
-  if (marker === 'circle' || marker === 'zeroOrOne') return [circlePolygon([point[0] - ux * size * 0.5, point[1] - uy * size * 0.5], size * 0.25)];
+  if (marker === 'circle' || marker === 'filledCircle' || marker === 'zeroOrOne') return [circlePolygon([point[0] - ux * size * 0.5, point[1] - uy * size * 0.5], size * 0.35)];
   if (marker === 'bar') return [line([point[0] + nx * size * 0.45, point[1] + ny * size * 0.45],
     [point[0] - nx * size * 0.45, point[1] - ny * size * 0.45])];
   if (marker === 'crowFoot') return [line(point, base(size * 1.6, 0.62)), line(point, base(size * 1.6, 0)), line(point, base(size * 1.6, -0.62))];
@@ -7745,23 +7815,7 @@ function eraserSegmentTouchesShape(
   return false;
 }
 
-function normalizeDragBox(
-  origin: { x: number; y: number },
-  pointer: { x: number; y: number },
-  resizePolicy: ShapeResizePolicy = { mode: 'free' },
-) {
-  let x = Math.min(origin.x, pointer.x), y = Math.min(origin.y, pointer.y);
-  let w = Math.abs(pointer.x - origin.x), h = Math.abs(pointer.y - origin.y);
-  if (resizePolicy.mode === 'aspect') {
-    const ratio = resizePolicy.aspectRatio;
-    const width = Math.max(w, h * ratio, Math.max(1, ratio));
-    h = width / ratio;
-    x = pointer.x < origin.x ? origin.x - width : origin.x;
-    y = pointer.y < origin.y ? origin.y - h : origin.y;
-    w = width;
-  }
-  return { x, y, w, h };
-}
+export { normalizeDragBox };
 
 function uid() { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 

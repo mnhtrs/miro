@@ -11,7 +11,7 @@ import {
 import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
 import { listShapePickerDefinitions, getShapeDefinition, getShapeDefinitionForLegacyType, getShapePickerLabel } from './engine/shapes/registry';
-import { geometryCommandsToSvg, shapePreviewGeometry } from './engine/shapes/geometry';
+import { geometryCommandsToSvg, shapePreviewGeometry, UML_BOUNDARY_TITLE_HEIGHT } from './engine/shapes/geometry';
 import { buildConnectorPreviewGeometry, connectorDisplayLabel } from './engine/shapes/connectors';
 import { SHAPE_CATEGORIES } from './engine/shapes/types';
 import type { Cardinality, DiagramShape, EndpointMarker, SequenceFragmentData, SequenceFragmentOperator, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle, UMLClassifierData, UMLClassifierMember, UMLDiagramFamily, UMLExtensionPoint, UMLInstanceData, UMLInstanceValue, UMLSubjectBoundaryData, UMLUseCaseData, UMLVisibility } from './engine/shapes/types';
@@ -449,6 +449,8 @@ export default function App() {
   }, [penColor, penSize, fill, stroke, sw, stickyBg, fontSize]);
 
   const [openGroup, setOpenGroup] = useState<PopoverGroup | null>(null);
+  const openGroupRef = useRef(openGroup);
+  openGroupRef.current = openGroup;
   const [penMode, setPenMode] = useState<'normal' | 'smart'>('normal');
   const popoverAnchorRefs = useRef<Record<PopoverGroup, HTMLDivElement | null>>({ pen: null, shapes: null, text: null, select: null });
   const popoverPanelRef = useRef<HTMLDivElement>(null);
@@ -792,14 +794,20 @@ export default function App() {
             eng.setEditingClassifierContext({ shapeId: shape.id, target: 'header' });
           }
         } else if (def?.id === 'uml.system-boundary') {
-          const scale = Number.isFinite(diagram.embeddedTextScale) ? diagram.embeddedTextScale! : 1;
-          const headerH = Math.min(shape.h * 0.25, Math.max(32, 32 * Math.min(2.5, scale)));
-          localBounds = { x: 14, y: 8, w: shape.w - 28, h: headerH };
+          const headerH = Math.min(shape.h, UML_BOUNDARY_TITLE_HEIGHT);
+          localBounds = { x: 10, y: 0, w: Math.max(20, shape.w - 20), h: headerH };
           boxL = sp.x + localBounds.x * eng.cam.zoom;
           boxT = sp.y + localBounds.y * eng.cam.zoom;
           boxW = localBounds.w * eng.cam.zoom;
           boxH = localBounds.h * eng.cam.zoom;
           text = shape.text || 'System';
+        } else if (def?.id === 'uml.use-case' || def?.geometry === 'useCase') {
+          localBounds = { x: Math.max(4, shape.w * 0.12), y: Math.max(4, shape.h * 0.20), w: Math.max(20, shape.w * 0.76), h: Math.max(16, shape.h * 0.60) };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          text = shape.text || def.defaultText || 'Use Case';
         } else if (def?.id === 'erd.er-table' || def?.id === 'erd.table') {
           const hit = eng.getErTableHit(shape.id, cx, cy);
           if (hit) {
@@ -878,6 +886,36 @@ export default function App() {
           boxL = sp.x + localBounds.x * eng.cam.zoom;
           boxW = localBounds.w * eng.cam.zoom;
           text = shape.text || 'Package';
+        } else if (def?.id === 'uml.lifeline') {
+          const headerH = Math.min(shape.h, 48);
+          localBounds = { x: 4, y: 4, w: Math.max(20, shape.w - 8), h: Math.max(16, headerH - 8) };
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          text = shape.text || def.defaultText || 'Lifeline';
+        } else if (def?.id === 'uml.boundary' || def?.id === 'uml.control' || def?.id === 'uml.entity') {
+          localBounds = { x: 4, y: 52, w: Math.max(20, shape.w - 8), h: 28 };
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          text = shape.text || def.defaultText || '';
+        } else if (def?.id === 'uml.sequence-actor') {
+          localBounds = { x: 4, y: 58, w: Math.max(20, shape.w - 8), h: 28 };
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          text = shape.text || 'Actor';
+        } else if (def?.id === 'uml.frame') {
+          const tabH = Math.min(shape.h * 0.25, 26);
+          localBounds = { x: 6, y: 4, w: Math.min(shape.w * 0.5, 90), h: tabH };
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxH = tabH * eng.cam.zoom;
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          text = shape.text || (shape.params?.title as string) || 'sd';
         } else if (def?.id === 'uml.note') {
           localBounds = { x: 8, y: 8, w: shape.w - 20, h: shape.h - 16 };
           boxT = sp.y + 8 * eng.cam.zoom;
@@ -1191,7 +1229,7 @@ export default function App() {
         case 'tool': setTool(shortcut.tool); break;
         case 'open-image': fileRef.current?.click(); break;
         case 'clear-selection':
-          eng.sel.clear(); setSelIds([]); eng.mark();
+          eng.clearSelection();
           break;
       }
     };
@@ -1618,6 +1656,12 @@ export default function App() {
         <div ref={wrapRef} className="canvas-workspace relative flex-1 min-w-0 min-h-0 overflow-hidden" style={{ cursor: renderedCursor }}
           onPointerDown={e => {
             const eng = engRef.current; if (!eng) return;
+            // If any sidebar popover or flyout panel is open, clicking canvas dismisses it first,
+            // without immediately drawing or creating an object on the board!
+            if (openGroupRef.current !== null || document.querySelector('.tool-popover')) {
+              setOpenGroup(null);
+              return;
+            }
             // Right- and middle-button gestures are camera-only, regardless of the active drawing tool.
             if (e.button === 2 || e.button === 1) {
               canvasRef.current?.focus({ preventScroll: true });
@@ -1799,12 +1843,22 @@ export default function App() {
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
                         ? '1px 6px'
                         : editShape.type === 'diagram' && ['uml.use-case', 'uml.use-case-ext'].includes((editShape as DiagramShape).shapeId)
-                        ? `${Math.max(6, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 12px 6px`
+                        ? `${Math.max(4, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 12px 4px`
+                        : editShape.type === 'diagram' && ['uml.system-boundary'].includes((editShape as DiagramShape).shapeId)
+                        ? `${Math.max(2, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 8px`
+                        : editShape.type === 'diagram' && ['uml.lifeline'].includes((editShape as DiagramShape).shapeId)
+                        ? `${Math.max(2, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 4px`
+                        : editShape.type === 'diagram' && ['uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity'].includes((editShape as DiagramShape).shapeId)
+                        ? '4px 4px'
                         : editShape.type === 'diagram' && ['uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'].includes((editShape as DiagramShape).shapeId)
                         ? `${Math.max(4, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 8px 4px`
                         : editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.actor'
                         ? '4px 6px'
-                        : 16,
+                        : editShape.type === 'diagram' && ['uml.package', 'uml.module', 'uml.frame'].includes((editShape as DiagramShape).shapeId)
+                        ? '2px 6px'
+                        : editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.note'
+                        ? '8px 8px'
+                        : editShape.type === 'sticky' ? 16 : 8,
                       fontFamily: "'Inter','Segoe UI',sans-serif",
                       fontWeight: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
@@ -1829,9 +1883,13 @@ export default function App() {
                       wordBreak: 'break-word', overflowWrap: 'break-word', overflowX: 'hidden',
                       textAlign: editingClassifierContextRef.current ? editingClassifierContextRef.current.textAlign
                         : editingErContextRef.current && editingErContextRef.current.target === 'column' ? 'left'
-                        : editShape.type === 'diagram' && ['uml.system-boundary', 'uml.note', 'uml.package', 'uml.module'].includes((editShape as DiagramShape).shapeId)
+                        : editShape.type === 'diagram' && ['uml.note', 'uml.package', 'uml.module', 'uml.frame'].includes((editShape as DiagramShape).shapeId)
                         ? 'left'
-                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && ['uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'].includes((editShape as DiagramShape).shapeId)) ? 'center' : 'left',
+                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && [
+                            'uml.system-boundary', 'uml.actor', 'uml.use-case',
+                            'uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity',
+                            'uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'
+                          ].includes((editShape as DiagramShape).shapeId)) ? 'center' : 'left',
                       overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
                     }}
                   />
@@ -1960,7 +2018,7 @@ export default function App() {
                       <select aria-label="Sequence fragment operator" value={sequenceFragment.operator}
                         onChange={event => {
                           const operator = event.target.value as SequenceFragmentOperator;
-                          const multiOperand = operator === 'alt' || operator === 'par';
+                          const multiOperand = ['alt', 'par', 'seq', 'strict'].includes(operator);
                           const operands = sequenceFragment.operands.slice(0, multiOperand ? 16 : 1);
                           while (operands.length < (multiOperand ? 2 : 1)) {
                             operands.push({ id: `operand:${selectedDiagram.id}:${Date.now()}:${operands.length + 1}`,
@@ -1971,7 +2029,15 @@ export default function App() {
                         <option value="alt">alt — alternatives</option>
                         <option value="opt">opt — optional</option>
                         <option value="loop">loop — repetition</option>
-                        <option value="par">par — parallel operands</option>
+                        <option value="par">par — parallel</option>
+                        <option value="critical">critical — critical region</option>
+                        <option value="break">break — break</option>
+                        <option value="seq">seq — weak sequencing</option>
+                        <option value="strict">strict — strict sequencing</option>
+                        <option value="neg">neg — negative trace</option>
+                        <option value="assert">assert — assertion</option>
+                        <option value="ignore">ignore — ignore messages</option>
+                        <option value="consider">consider — consider messages</option>
                       </select>
                     </label>
                     <p>Operands own the guards and message occurrences in each region. Resizing the frame does not scale its contents.</p>
@@ -1984,13 +2050,13 @@ export default function App() {
                             item.id === operand.id ? { ...item, guard: event.target.value } : item) }, false)}
                           onBlur={event => updateSequenceFragment({ ...sequenceFragment, operands: sequenceFragment.operands.map(item =>
                             item.id === operand.id ? { ...item, guard: event.currentTarget.value } : item) }, true)} />
-                        {(sequenceFragment.operator === 'alt' || sequenceFragment.operator === 'par') && sequenceFragment.operands.length > 2
+                        {['alt', 'par', 'seq', 'strict'].includes(sequenceFragment.operator) && sequenceFragment.operands.length > 2
                           && <button type="button" aria-label={`Remove fragment operand ${index + 1}`} title="Remove operand"
                             onClick={() => updateSequenceFragment({ ...sequenceFragment,
                               operands: sequenceFragment.operands.filter(item => item.id !== operand.id) }, true)}><X size={13} /></button>}
                       </div>
                     </label>)}
-                    {(sequenceFragment.operator === 'alt' || sequenceFragment.operator === 'par')
+                    {['alt', 'par', 'seq', 'strict'].includes(sequenceFragment.operator)
                       && <button type="button" className="shape-property-add" disabled={sequenceFragment.operands.length >= 16}
                         onClick={() => updateSequenceFragment({ ...sequenceFragment, operands: [...sequenceFragment.operands,
                           { id: `operand:${selectedDiagram.id}:${Date.now()}`, order: sequenceFragment.operands.length, guard: '' }] }, true)}>
@@ -2223,7 +2289,7 @@ export default function App() {
                     <label className="shape-property-field">
                       <span>Stereotype</span>
                       <input aria-label="Subject stereotype"
-                        value={subjectBoundaryModel?.stereotype ?? (selectedDiagram.params?.stereotype as string) ?? '«system»'}
+                        value={subjectBoundaryModel?.stereotype ?? (selectedDiagram.params?.stereotype as string) ?? ''}
                         placeholder="«system», «subsystem», «component»"
                         onChange={event => {
                           const val = event.target.value;
@@ -2350,12 +2416,12 @@ export default function App() {
                     <label className="shape-property-field"><span>Start marker</span><select value={selectedConnector.startMarker}
                       onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { startMarker: event.target.value as EndpointMarker })}>
                       <option value="none">None</option><option value="arrow">Arrow</option><option value="openArrow">Open arrow</option><option value="hollowTriangle">Hollow triangle</option>
-                      <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
+                      <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="filledCircle">Filled circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
                     </select></label>
                     <label className="shape-property-field"><span>End marker</span><select value={selectedConnector.endMarker}
                       onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { endMarker: event.target.value as EndpointMarker })}>
                       <option value="none">None</option><option value="arrow">Arrow</option><option value="openArrow">Open arrow</option><option value="hollowTriangle">Hollow triangle</option>
-                      <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
+                      <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="filledCircle">Filled circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
                     </select></label>
                   </div>}
                   {selectedConnectorCapabilities?.cardinalityEditable && <div className="shape-property-grid-two">

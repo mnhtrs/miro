@@ -30,19 +30,23 @@ function roundedRectPath(width: number, height: number, radius: number): PathCom
 
 function actorCommands(width: number, height: number): PathCommand[] {
   const w = Math.max(1, width), h = Math.max(1, height), cx = w / 2;
-  const radius = Math.min(w * 0.18, h * 0.14);
-  const headCenterY = radius + 3;
+  // Golden proportions for UML stick figure: arm span ~ 72% of figure height, leg spread ~ 56% of height
+  const figureSpan = Math.min(w * 0.85, h * 0.72);
+  const armHalf = figureSpan / 2;
+  const legHalf = (figureSpan * 0.78) / 2;
+  const radius = Math.min(h * 0.15, armHalf * 0.40);
+  const headCenterY = radius + 2;
   const neckY = headCenterY + radius;
   const shoulderY = neckY + h * 0.08;
-  const torsoBottom = h * 0.66;
+  const torsoBottom = h * 0.65;
   const handY = shoulderY + h * 0.12;
   return [
     command('moveTo', cx + radius, headCenterY), command('ellipse', cx, headCenterY, radius, radius, 0, 0, Math.PI * 2, 0),
     command('closePath'),
     command('moveTo', cx, neckY), command('lineTo', cx, torsoBottom),
-    command('moveTo', w * 0.14, handY), command('lineTo', cx, shoulderY), command('lineTo', w * 0.86, handY),
-    command('moveTo', cx, torsoBottom), command('lineTo', w * 0.22, h * 0.98),
-    command('moveTo', cx, torsoBottom), command('lineTo', w * 0.78, h * 0.98),
+    command('moveTo', cx - armHalf, handY), command('lineTo', cx, shoulderY), command('lineTo', cx + armHalf, handY),
+    command('moveTo', cx, torsoBottom), command('lineTo', cx - legHalf, h * 0.98),
+    command('moveTo', cx, torsoBottom), command('lineTo', cx + legHalf, h * 0.98),
   ];
 }
 
@@ -187,10 +191,55 @@ export function buildGeometryCommands(
     }
     case 'umlRole': {
       const header = Math.min(h, SEQUENCE_ROLE_HEADER_HEIGHT);
-      const ry = Math.min(16, header * 0.19), rx = Math.min(w * 0.28, 17);
-      const centerY = ry + 4;
-      return [command('moveTo', cx + rx, centerY), command('ellipse', cx, centerY, rx, ry, 0, 0, Math.PI * 2, 0),
-        command('closePath'), command('moveTo', cx, centerY + ry), command('lineTo', cx, header * 0.68)];
+      const role = String(params.ecbKind ?? (
+        params.stereotype === '«boundary»' ? 'boundary' :
+        params.stereotype === '«control»' ? 'control' :
+        params.stereotype === '«entity»' ? 'entity' : 'entity'
+      )).toLowerCase();
+
+      const r = Math.min(18, Math.max(14, Math.round(Math.min(w * 0.22, header * 0.23))));
+      const centerY = r + 8;
+
+      if (role === 'boundary') {
+        // UML Robustness Boundary (Draw.io SeqBoundaryShape: vertical bar on left, horizontal link, circle centered on lifeline)
+        const barX = cx - r - Math.round(r * 1.05);
+        const barHalfH = Math.round(r * 0.85);
+        return [
+          command('moveTo', cx + r, centerY),
+          command('ellipse', cx, centerY, r, r, 0, 0, Math.PI * 2, 0),
+          command('closePath'),
+          command('moveTo', barX, centerY - barHalfH),
+          command('lineTo', barX, centerY + barHalfH),
+          command('moveTo', barX, centerY),
+          command('lineTo', cx - r, centerY),
+        ];
+      }
+      if (role === 'control') {
+        // UML Robustness Control (Exact Draw.io UmlControlShape: circle with crisp chevron arrow at top curve)
+        const vx = cx - Math.round(r * 0.28);
+        const vy = centerY - Math.round(r * 0.96);
+        const legX = cx + Math.round(r * 0.32);
+        const upperY = centerY - Math.round(r * 1.30);
+        const lowerY = centerY - Math.round(r * 0.66);
+        return [
+          command('moveTo', cx + r, centerY),
+          command('ellipse', cx, centerY, r, r, 0, 0, Math.PI * 2, 0),
+          command('closePath'),
+          command('moveTo', legX, upperY),
+          command('lineTo', vx, vy),
+          command('lineTo', legX, lowerY),
+        ];
+      }
+      // UML Robustness Entity (Draw.io UmlEntityShape: circle resting on flat horizontal tangent baseline)
+      const baselineY = centerY + r;
+      const baseSpan = Math.round(r * 1.35);
+      return [
+        command('moveTo', cx + r, centerY),
+        command('ellipse', cx, centerY, r, r, 0, 0, Math.PI * 2, 0),
+        command('closePath'),
+        command('moveTo', cx - baseSpan, baselineY),
+        command('lineTo', cx + baseSpan, baselineY),
+      ];
     }
     case 'frame':
       return [command('moveTo', 0, 0), command('lineTo', w * 0.38, 0), command('lineTo', w * 0.45, h * 0.14), command('lineTo', w, h * 0.14),

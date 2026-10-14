@@ -156,9 +156,9 @@ export const UML_FOUNDATION_SCHEMA_VERSION = 3;
 export type UMLDiagramFamily = typeof UML_DIAGRAM_FAMILIES[number];
 export type DiagramContextId = UMLDiagramFamily | 'freeform' | 'mixed';
 export type ConnectionPointKind = 'fixed' | 'floating' | 'relative' | 'structured' | 'sequence-time' | 'special';
-
-export type SequenceMessageKind = 'synchronous' | 'asynchronous' | 'return' | 'create' | 'self-call';
-export type SequenceFragmentOperator = 'alt' | 'opt' | 'loop' | 'par';
+export type SequenceMessageKind = 'synchronous' | 'asynchronous' | 'return' | 'create' | 'self-call' | 'lost' | 'found';
+export type SequenceFragmentOperator =
+  | 'alt' | 'opt' | 'loop' | 'par' | 'critical' | 'break' | 'seq' | 'strict' | 'neg' | 'assert' | 'ignore' | 'consider';
 
 export type UMLStatePointSide = 'north' | 'east' | 'south' | 'west';
 export type UMLActivityPartitionOrientation = 'vertical' | 'horizontal';
@@ -382,7 +382,7 @@ export type EndpointSide = 'source' | 'target';
 
 export type EndpointMarker =
   | 'none' | 'arrow' | 'openArrow' | 'blockArrow' | 'hollowTriangle'
-  | 'diamond' | 'filledDiamond' | 'circle' | 'bar' | 'crowFoot'
+  | 'diamond' | 'filledDiamond' | 'circle' | 'filledCircle' | 'bar' | 'crowFoot'
   | 'zeroOrOne' | 'oneOrMany' | 'zeroOrMany';
 export type Cardinality = 'one' | 'zero-or-one' | 'many' | 'one-or-many' | 'zero-or-many';
 
