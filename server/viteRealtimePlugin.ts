@@ -52,7 +52,7 @@ export function hocuspocusPlugin(): Plugin {
         const address = httpServer.address();
         const port = address && typeof address !== 'string'
           ? address.port
-          : viteServer.config.server.port ?? 5173;
+          : viteServer.config.server.port ?? 5175;
 
         void hocuspocus.hooks('onListen', {
           instance: hocuspocus,

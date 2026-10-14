@@ -47,7 +47,6 @@ export const SHAPE_PARAMETER_SCHEMA: Readonly<Record<string, ParameterSchema>> =
   underlineName: { label: 'Underline name', description: 'Underline the object/classifier name.', control: { type: 'checkbox' }, previewImpact: 'label' },
   componentGlyph: { label: 'Component glyph', description: 'Show the UML component glyph in the shape header.', control: { type: 'checkbox' }, previewImpact: 'geometry' },
   doubleBorder: { label: 'Double border', description: 'Add the notation-specific inner outline.', control: { type: 'checkbox' }, previewImpact: 'geometry' },
-  innerDiamond: { label: 'Inner diamond', description: 'Add the inner diamond outline to the associative entity.', control: { type: 'checkbox' }, previewImpact: 'geometry' },
   key: { label: 'Key role', description: 'Mark this attribute as a primary or foreign key.', control: { type: 'select', options: options(['primary', 'Primary key'], ['foreign', 'Foreign key'], ['none', 'No key']) }, previewImpact: 'label' },
   underline: { label: 'Underline attribute', description: 'Underline an ER attribute to mark a key.', control: { type: 'checkbox' }, previewImpact: 'geometry' },
   lineStyle: { label: 'Line style', description: 'Stroke pattern for the shape outline and applicable interior rules.', control: { type: 'select', options: options(['solid', 'Solid'], ['dashed', 'Dashed'], ['dotted', 'Dotted']) }, previewImpact: 'style' },
@@ -64,6 +63,7 @@ export const SHAPE_PARAMETER_SCHEMA: Readonly<Record<string, ParameterSchema>> =
 export const LEGACY_SHAPE_PARAMETER_METADATA: Readonly<Record<string, string>> = Object.freeze({
   cornerRadius: 'Legacy absolute corner radius. New controls use cornerRadiusRatio so resizing remains proportional.',
   keyColumns: 'Legacy table split hint. Structured table column data is authoritative.',
+  innerDiamond: 'Legacy associative-entity flag. The Chen rectangle/diamond composition is intrinsic to its geometry.',
   title: 'Legacy title fallback. Shape text is edited through the shared Name / label field.',
   lollipop: 'Legacy UML interface decoration value; provided/required identity is carried by the semantic definition.',
   history: 'Legacy history-kind marker; shallow/deep history are separate semantic definitions.',
@@ -137,5 +137,5 @@ export function shapeDataCapabilities(
 ): readonly ShapeDataCapability[] {
   const data = definition.defaultData;
   if (!data || typeof data !== 'object') return [];
-  return (['classifier', 'table', 'column'] as const).filter(capability => capability in data);
+  return (['classifier', 'instance', 'table', 'column', 'usecase'] as const).filter(capability => capability in data);
 }

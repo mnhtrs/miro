@@ -1,4 +1,4 @@
-import type { ConnectorRouteKind, EndpointMarker, PathCommand, ShapeDefinition } from './types';
+import type { ConnectorRouteKind, ConnectorShapeObject, EndpointMarker, PathCommand, ShapeDefinition } from './types';
 
 export interface ConnectorRouteInput {
   routeKind?: ConnectorRouteKind;
@@ -7,14 +7,77 @@ export interface ConnectorRouteInput {
   x2: number;
   y2: number;
   waypoints: readonly [number, number][];
+  parallelLane?: number;
+  parallelLaneSpacing?: number;
+  selfLoopKind?: 'sequence' | 'behavioral';
+  selfLoopSide?: string;
 }
 
 const command = (op: PathCommand['op'], ...values: number[]): PathCommand => ({ op, values });
+
+/** Extra room for parallel UML relationship routes and their independent labels. */
+export const UML_RELATIONSHIP_LANE_SPACING = 40;
+export const UML_RELATIONSHIP_LABEL_LANE_SPACING = 24;
+/** Sequence lanes need enough visual separation to remain individually targetable at normal zoom. */
+export const UML_SEQUENCE_LANE_SPACING = 40;
+
+export function parallelConnectorLabelOffset(offset: number, lane: number | undefined, isUmlRelationship: boolean): number {
+  return offset + (isUmlRelationship ? (lane ?? 0) * UML_RELATIONSHIP_LABEL_LANE_SPACING : 0);
+}
 
 /** Shared deterministic route construction used by live connectors, hit testing, bounds and previews. */
 export function buildConnectorRoute(connector: ConnectorRouteInput): [number, number][] {
   const start: [number, number] = [connector.x1, connector.y1], end: [number, number] = [connector.x2, connector.y2];
   const routeKind = connector.routeKind ?? 'straight';
+  if (connector.selfLoopKind && connector.waypoints.length === 0) {
+    const laneOffset = (connector.parallelLane ?? 0) * 18;
+    const offset = Math.max(22, 34 + laneOffset);
+    if (connector.selfLoopKind === 'sequence') {
+      const loopX = Math.max(start[0], end[0]) + offset;
+      return [start, [loopX, start[1]], [loopX, end[1]], end];
+    }
+    const side = connector.selfLoopSide ?? '';
+    if (/(^|:)(n|nw|ne|top)(:|$)/.test(side)) {
+      const loopY = Math.min(start[1], end[1]) - offset;
+      return [start, [start[0], loopY], [end[0], loopY], end];
+    }
+    if (/(^|:)(s|sw|se|bottom)(:|$)/.test(side)) {
+      const loopY = Math.max(start[1], end[1]) + offset;
+      return [start, [start[0], loopY], [end[0], loopY], end];
+    }
+    if (/(^|:)(w|left)(:|$)/.test(side)) {
+      const loopX = Math.min(start[0], end[0]) - offset;
+      return [start, [loopX, start[1]], [loopX, end[1]], end];
+    }
+    const loopX = Math.max(start[0], end[0]) + offset;
+    return [start, [loopX, start[1]], [loopX, end[1]], end];
+  }
+  if (routeKind === 'straight' && connector.waypoints.length === 0 && Math.abs(connector.parallelLane ?? 0) > 1e-6) {
+    const dx = end[0] - start[0], dy = end[1] - start[1], length = Math.hypot(dx, dy);
+    if (length > 1e-8) {
+      const spacing = connector.parallelLaneSpacing ?? 18;
+      const offset = (connector.parallelLane ?? 0) * spacing, nx = -dy / length, ny = dx / length;
+      const control: [number, number] = [(start[0] + end[0]) / 2 + nx * offset, (start[1] + end[1]) / 2 + ny * offset];
+      return Array.from({ length: 17 }, (_, index): [number, number] => {
+        const t = index / 16, u = 1 - t;
+        return [u * u * start[0] + 2 * u * t * control[0] + t * t * end[0],
+          u * u * start[1] + 2 * u * t * control[1] + t * t * end[1]];
+      });
+    }
+  }
+  if ((routeKind === 'orthogonal' || routeKind === 'elbow') && connector.waypoints.length === 0
+    && Math.abs(connector.parallelLane ?? 0) > 1e-6) {
+    const spacing = connector.parallelLaneSpacing ?? 18;
+    const laneOffset = (connector.parallelLane ?? 0) * spacing;
+    if (Math.abs(end[0] - start[0]) >= Math.abs(end[1] - start[1])) {
+      const middleY = (start[1] + end[1]) / 2 + laneOffset;
+      const path: [number, number][] = [start, [start[0], middleY], [end[0], middleY], end];
+      return path.filter((point, index) => index === 0 || Math.hypot(point[0] - path[index - 1][0], point[1] - path[index - 1][1]) > 1e-8);
+    }
+    const middleX = (start[0] + end[0]) / 2 + laneOffset;
+    const path: [number, number][] = [start, [middleX, start[1]], [middleX, end[1]], end];
+    return path.filter((point, index) => index === 0 || Math.hypot(point[0] - path[index - 1][0], point[1] - path[index - 1][1]) > 1e-8);
+  }
   if (routeKind === 'curved') {
     const anchors: [number, number][] = [start, ...connector.waypoints, end];
     if (anchors.length === 2) {
@@ -67,6 +130,9 @@ export function fitConnectorLabel(
   value: string,
   measure: (text: string) => number = text => [...text].reduce((sum, character) => sum + (character.codePointAt(0)! > 0x2fff ? 12 : /[ilI.,'`:;!|]/.test(character) ? 3.6 : /[MW@#%&]/.test(character) ? 10 : 7), 0),
 ): string {
+  if (value.includes('\n')) {
+    return value.split('\n').map(line => fitConnectorLabel(line, measure)).join('\n');
+  }
   const source = [...value.trim()];
   if (!source.length) return '';
   const truncated = source.length > CONNECTOR_LABEL_MAX_CHARS;
@@ -80,6 +146,31 @@ export function fitConnectorLabel(
   return visible;
 }
 
+/** The displayed string remains owned by its connector; State and Activity notation stay distinct. */
+export function connectorDisplayLabel(connector: Pick<ConnectorShapeObject, 'shapeId' | 'label' | 'stateTransition' | 'activityFlow' | 'usecaseExtend'>): string {
+  if (connector.shapeId === 'uml.include') return '«include»';
+  if (connector.shapeId === 'uml.extend') {
+    const lines = ['«extend»'];
+    if (connector.usecaseExtend?.condition?.trim()) {
+      lines.push(`condition: [${connector.usecaseExtend.condition.trim()}]`);
+    }
+    if (connector.usecaseExtend?.extensionPoint?.trim()) {
+      lines.push(`extension point: ${connector.usecaseExtend.extensionPoint.trim()}`);
+    }
+    return lines.join('\n');
+  }
+  if (connector.shapeId === 'uml-usage') return '«use»';
+  if (connector.shapeId === 'uml.state-transition' && connector.stateTransition) {
+    const { trigger = '', guard = '', effect = '' } = connector.stateTransition;
+    const prefix = [trigger.trim(), guard.trim() ? `[${guard.trim()}]` : ''].filter(Boolean).join(' ');
+    return `${prefix}${effect.trim() ? `${prefix ? ' ' : ''}/ ${effect.trim()}` : ''}`.trim();
+  }
+  if ((connector.shapeId === 'uml.activity-flow' || connector.shapeId === 'uml.object-flow')
+    && typeof connector.activityFlow?.guard === 'string' && connector.activityFlow.guard.trim())
+    return `[${connector.activityFlow.guard.trim()}]`;
+  return connector.label ?? '';
+}
+
 export interface ConnectorLabelLayoutOptions {
   startMarker?: EndpointMarker;
   endMarker?: EndpointMarker;
@@ -88,6 +179,10 @@ export interface ConnectorLabelLayoutOptions {
   strokeWidth?: number;
   labelWidth: number;
   labelHeight?: number;
+  /** Persisted route-relative location in permille; omitted means the automatically balanced point. */
+  labelPosition?: number;
+  /** Signed world-unit offset perpendicular to the route. */
+  labelOffset?: number;
 }
 export interface ConnectorLabelLayout {
   x: number;
@@ -97,6 +192,7 @@ export interface ConnectorLabelLayout {
   distance: number;
   totalLength: number;
   tangent: [number, number];
+  offset: number;
 }
 
 /** Approximate the drawn marker envelope from the same minimum-size/stroke rules used by Canvas. */
@@ -133,10 +229,40 @@ function pointAtRouteDistance(route: readonly [number, number][], distance: numb
   return { x: last[0], y: last[1], tangent: [(last[0] - previous[0]) / length, (last[1] - previous[1]) / length] as [number, number] };
 }
 
+function applyLabelNormalOffset(point: { x: number; y: number; tangent: [number, number] }, offset: number) {
+  const bounded = Number.isFinite(offset) ? Math.max(-2000, Math.min(2000, offset)) : 0;
+  const normal: [number, number] = [-point.tangent[1], point.tangent[0]];
+  return { x: point.x + normal[0] * bounded, y: point.y + normal[1] * bounded, offset: bounded };
+}
+
+export function defaultConnectorCenterOffset(
+  tangent: readonly [number, number],
+  labelWidth: number,
+  labelHeight: number,
+  strokeWidth = 1.5,
+  gap = 6,
+): number {
+  const halfW = labelWidth / 2;
+  const halfH = labelHeight / 2;
+  // Normal vector is [-tangent[1], tangent[0]].
+  // Project the label's half-box onto the normal axis:
+  const projectedHalf = Math.abs(tangent[1]) * halfW + Math.abs(tangent[0]) * halfH;
+  const clearance = projectedHalf + strokeWidth / 2 + gap;
+
+  // If the segment is not strictly vertical, offset upwards in screen coords (-y)
+  // Normal y-component is tangent[0]. For normal[1] * offset < 0, offset must have opposite sign of tangent[0].
+  if (Math.abs(tangent[0]) >= 0.15) {
+    return (tangent[0] >= 0 ? -1 : 1) * clearance;
+  }
+  // For vertical segments, offset to the right in screen coords (+x)
+  // Normal x-component is -tangent[1]. For normal[0] * offset > 0, offset must have opposite sign of tangent[1].
+  return (tangent[1] >= 0 ? -1 : 1) * clearance;
+}
+
 /**
  * Route-aware, screen-horizontal label location. Candidate positions are arc-length samples
- * scored against the real start/end marker envelopes, so long labels avoid arrowheads whenever
- * the route has enough room; the canvas keeps endpoint markers above the plate as a final guard.
+ * scored against the real start/end marker envelopes; route-relative position and normal offset
+ * remain persistent through connector movement, waypoints, and rerouting.
  */
 export function connectorLabelLayout(routeInput: readonly [number, number][], options: ConnectorLabelLayoutOptions): ConnectorLabelLayout {
   const route = routeInput.filter((point, index) => index === 0 || Math.hypot(point[0] - routeInput[index - 1][0], point[1] - routeInput[index - 1][1]) > 1e-8);
@@ -145,7 +271,21 @@ export function connectorLabelLayout(routeInput: readonly [number, number][], op
   const totalLength = segmentLengths.reduce((sum, length) => sum + length, 0);
   const width = Math.max(0, Math.min(CONNECTOR_LABEL_MAX_WIDTH, options.labelWidth)) + CONNECTOR_LABEL_PADDING_X * 2;
   const height = Math.max(1, options.labelHeight ?? CONNECTOR_LABEL_HEIGHT) + CONNECTOR_LABEL_PADDING_Y * 2;
-  if (route.length < 2 || totalLength <= 1e-8) return { x: fallback[0], y: fallback[1], width, height, distance: 0, totalLength, tangent: [1, 0] };
+  const resolveOffset = (tangent: readonly [number, number]) => {
+    if (Number.isFinite(options.labelOffset)) {
+      return Math.max(-2000, Math.min(2000, options.labelOffset!));
+    }
+    return defaultConnectorCenterOffset(tangent, width, height, options.strokeWidth ?? 1.5);
+  };
+  if (route.length < 2 || totalLength <= 1e-8) {
+    const positioned = applyLabelNormalOffset({ x: fallback[0], y: fallback[1], tangent: [1, 0] }, resolveOffset([1, 0]));
+    return { ...positioned, width, height, distance: 0, totalLength, tangent: [1, 0] };
+  }
+  if (Number.isFinite(options.labelPosition)) {
+    const distance = totalLength * Math.max(0, Math.min(1000, options.labelPosition!)) / 1000;
+    const point = pointAtRouteDistance(route, distance), positioned = applyLabelNormalOffset(point, resolveOffset(point.tangent));
+    return { ...positioned, width, height, distance, totalLength, tangent: point.tangent };
+  }
   const startClearance = connectorMarkerOccupancy(options.startMarker, options.sourceCardinality, options.strokeWidth) + 3;
   const endClearance = connectorMarkerOccupancy(options.endMarker, options.targetCardinality, options.strokeWidth) + 3;
   const candidates = [0.5, 0.42, 0.58, 0.34, 0.66, 0.25, 0.75, 0.16, 0.84]
@@ -157,7 +297,42 @@ export function connectorLabelLayout(routeInput: readonly [number, number][], op
     const score = Math.min(distance - startClearance - projectedHalfExtent, totalLength - distance - endClearance - projectedHalfExtent);
     if (score > bestScore) { best = point; bestDistance = distance; bestScore = score; }
   }
-  return { x: best.x, y: best.y, width, height, distance: bestDistance, totalLength, tangent: best.tangent };
+  const positioned = applyLabelNormalOffset(best, resolveOffset(best.tangent));
+  return { ...positioned, width, height, distance: bestDistance, totalLength, tangent: best.tangent };
+}
+
+export interface ConnectorLabelPlacement { labelPosition: number; labelOffset: number; }
+
+/** Store a label drag as route-relative distance plus signed normal offset. */
+export function connectorLabelPlacementAtPoint(routeInput: readonly [number, number][], point: [number, number]): ConnectorLabelPlacement | undefined {
+  const route = routeInput.filter((candidate, index) => index === 0 || Math.hypot(candidate[0] - routeInput[index - 1][0], candidate[1] - routeInput[index - 1][1]) > 1e-8);
+  if (route.length < 2) return undefined;
+  const lengths = route.slice(1).map((candidate, index) => Math.hypot(candidate[0] - route[index][0], candidate[1] - route[index][1]));
+  const total = lengths.reduce((sum, length) => sum + length, 0);
+  if (total <= 1e-8) return undefined;
+  let bestDistance = 0, bestError = Infinity, bestOffset = 0, traversed = 0;
+  for (let index = 1; index < route.length; index++) {
+    const a = route[index - 1], b = route[index], length = lengths[index - 1];
+    if (length <= 1e-8) continue;
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const fraction = Math.max(0, Math.min(1, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (length * length)));
+    const x = a[0] + dx * fraction, y = a[1] + dy * fraction;
+    const error = (point[0] - x) ** 2 + (point[1] - y) ** 2;
+    if (error < bestError) {
+      bestError = error; bestDistance = traversed + fraction * length;
+      bestOffset = ((point[0] - x) * -dy + (point[1] - y) * dx) / length;
+    }
+    traversed += length;
+  }
+  return {
+    labelPosition: Math.round(Math.max(0, Math.min(1000, bestDistance / total * 1000))),
+    labelOffset: Math.round(Math.max(-2000, Math.min(2000, bestOffset))),
+  };
+}
+
+/** Backward-compatible fraction-only helper for callers that do not use normal offsets. */
+export function connectorLabelPositionAtPoint(routeInput: readonly [number, number][], point: [number, number]): number | undefined {
+  return connectorLabelPlacementAtPoint(routeInput, point)?.labelPosition;
 }
 
 export interface ConnectorPreviewPath { commands: PathCommand[]; fill: 'none' | 'currentColor' | 'surface'; }

@@ -465,10 +465,29 @@ button:disabled { cursor: not-allowed; }
 .shape-property-section { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--aw-border); }
 .shape-property-section h4 { margin: 0; }
 .shape-property-section p { margin: -3px 0 0; color: var(--aw-muted); font-size: 11px; }
+.sequence-operand-field { display: flex; gap: 5px; min-width: 0; }
+.sequence-operand-field input { flex: 1 1 auto; }
+.sequence-operand-field button { display: grid; flex: 0 0 30px; place-items: center; min-height: 30px; padding: 0; color: var(--aw-muted-strong); background: #fff; border: 1px solid var(--aw-border); border-radius: 7px; cursor: pointer; }
+.shape-property-diagnostic { display: grid; gap: 3px; margin: 0 !important; padding: 7px 8px; border: 1px solid transparent; border-radius: 7px; font-size: 11px; line-height: 1.4; }
+.shape-property-diagnostic strong { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.shape-property-diagnostic.incomplete { color: #92400e; background: #fffbeb; border-color: #fde68a; }
+.shape-property-diagnostic.invalid { color: #991b1b; background: #fef2f2; border-color: #fecaca; }
 .shape-property-column { display: flex; align-items: flex-start; gap: 5px; }
 .shape-property-column-fields { display: grid; flex: 1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 5px; }
 .shape-property-column-fields select { grid-column: 1 / -1; }
 .shape-property-column-fields input, .shape-property-column-fields select { min-height: 30px; padding: 5px 7px; font-size: 11px; }
+.uml-classifier-compartment { display: flex; flex-direction: column; gap: 8px; padding: 8px; background: var(--aw-surface-soft); border: 1px solid var(--aw-border); border-radius: 9px; }
+.uml-classifier-compartment-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--aw-ink); font-size: 12px; }
+.uml-classifier-member { display: flex; flex-direction: column; gap: 8px; padding: 8px; background: #fff; border: 1px solid var(--aw-border); border-radius: 8px; }
+.uml-classifier-member-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--aw-muted-strong); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.uml-classifier-member-actions { display: flex; gap: 4px; }
+.uml-classifier-member-actions button { display: grid; place-items: center; width: 27px; height: 27px; padding: 0; color: var(--aw-ink-soft); background: #fff; border: 1px solid var(--aw-border); border-radius: 6px; cursor: pointer; }
+.uml-classifier-member-actions button:disabled { opacity: .42; cursor: not-allowed; }
+.uml-classifier-member-actions button:hover:not(:disabled) { background: var(--aw-surface-soft); }
+.uml-classifier-flags { display: flex; flex-wrap: wrap; gap: 12px; }
+.uml-classifier-flags label { display: inline-flex; align-items: center; gap: 6px; min-height: 26px; color: var(--aw-ink-soft); font-size: 11px; }
+.uml-classifier-flags input { accent-color: #e2a523; }
+.uml-classifier-empty { padding: 6px 8px; background: #fff; border: 1px dashed var(--aw-border); border-radius: 7px; }
 .shape-property-add, .shape-property-remove-waypoint {
   min-height: 31px;
   padding: 6px 9px;
@@ -881,27 +900,7 @@ button:disabled { cursor: not-allowed; }
   font: 550 10px/1 'Inter', 'Segoe UI', sans-serif;
 }
 .code-language-control select:focus-visible,
-.code-editor-fit-height:focus-visible,
 .code-editor-done:focus-visible { outline: 2px solid #F2A310; outline-offset: 1px; }
-.code-editor-fit-height {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  height: 25px;
-  padding: 0 7px;
-  color: #aeb9c8;
-  background: #202a37;
-  border: 1px solid #394658;
-  border-radius: 5px;
-  font: 550 10px/1 'Inter', 'Segoe UI', sans-serif;
-  cursor: pointer;
-}
-.code-editor-fit-height[aria-pressed="true"] {
-  color: #d7e7ff;
-  background: rgba(59, 130, 246, .16);
-  border-color: rgba(59, 130, 246, .58);
-}
 .code-editor-done {
   display: inline-flex;
   flex: 0 0 auto;

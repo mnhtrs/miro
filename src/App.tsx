@@ -12,9 +12,12 @@ import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/Can
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
 import { listShapePickerDefinitions, getShapeDefinition, getShapeDefinitionForLegacyType, getShapePickerLabel } from './engine/shapes/registry';
 import { geometryCommandsToSvg, shapePreviewGeometry } from './engine/shapes/geometry';
-import { buildConnectorPreviewGeometry } from './engine/shapes/connectors';
+import { buildConnectorPreviewGeometry, connectorDisplayLabel } from './engine/shapes/connectors';
 import { SHAPE_CATEGORIES } from './engine/shapes/types';
-import type { Cardinality, EndpointMarker, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle } from './engine/shapes/types';
+import type { Cardinality, DiagramShape, EndpointMarker, SequenceFragmentData, SequenceFragmentOperator, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle, UMLClassifierData, UMLClassifierMember, UMLDiagramFamily, UMLExtensionPoint, UMLInstanceData, UMLInstanceValue, UMLSubjectBoundaryData, UMLUseCaseData, UMLVisibility } from './engine/shapes/types';
+import { diagramCapabilitiesFor, familyForDefinition, UML_FAMILY_LABELS, umlFamilyForCategory } from './engine/shapes/diagramContext';
+import type { DiagramGraphDiagnostic } from './engine/shapes/diagramContext';
+import { createClassifierMember, formatOperationParameters, parseOperationParameters } from './engine/shapes/classifier';
 import { searchShapeDefinitions } from './engine/shapes/search';
 import { solid3DLocalAxisSpans, solid3DLocalDimensions, solid3DScaleFromBounds, solid3DSizeSemantics, type Solid3DGeometry, type Solid3DScale } from './engine/shapes/solid3d';
 import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
@@ -45,6 +48,17 @@ function shapeRotation(shape: AnyShape): number {
 }
 
 function shapeFontSize(shape: AnyShape): number {
+  if (shape.type === 'diagram') {
+    const definition = getShapeDefinition(shape.shapeId);
+    const defW = definition?.width ?? 160;
+    const defH = definition?.height ?? 85;
+    const dimensionRatio = Math.sqrt((shape.w / defW) * (shape.h / defH));
+    const fontScale = Number.isFinite(shape.embeddedTextScale) && (shape.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, shape.embeddedTextScale!))
+      : Math.max(0.3, Math.min(16, dimensionRatio));
+    const baseFs = 'fs' in shape && typeof shape.fs === 'number' ? shape.fs : 14;
+    return Math.max(11, Math.round(baseFs * fontScale));
+  }
   return 'fs' in shape && typeof shape.fs === 'number' ? shape.fs : 14;
 }
 
@@ -129,7 +143,11 @@ function ShapePreview({ definition, size = 24 }: { definition: ShapeDefinition; 
   const defaultDash = definition.defaultParams?.lineStyle === 'dashed' ? '2 1.6' : definition.defaultParams?.lineStyle === 'dotted' ? '1 1.7' : undefined;
   return <svg width={size} height={size} viewBox="-1 -1 30 24" fill="none" aria-hidden="true">
     {!definition.solid3d && <path d={outline} fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round" strokeLinecap="round" strokeDasharray={defaultDash} />}
-    {intrinsicFills.map((path, index) => <path key={`intrinsic-${index}`} d={path} fill="currentColor" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />)}
+    {intrinsicFills.map((path, index) => {
+      const surface = geometry.intrinsicFillColors[index] === 'surface';
+      return <path key={`intrinsic-${index}`} d={path} fill={surface ? 'var(--aw-paper, #fff)' : 'currentColor'}
+        stroke={surface ? 'none' : 'currentColor'} strokeWidth="1.1" strokeLinejoin="round" />;
+    })}
     {decorations.map((path, index) => {
       const style = geometry.decorationStyles[index];
       const dash = style === 'dashed' ? '2 1.6' : style === 'dotted' ? '1 1.7' : style === 'solid' ? undefined : defaultDash;
@@ -337,6 +355,8 @@ export default function App() {
   const [editName, setEditName] = useState(false);
   const [selIds, setSelIds] = useState<string[]>([]);
   const [selectedShape, setSelectedShape] = useState<AnyShape | null>(null);
+  const [graphDiagnostics, setGraphDiagnostics] = useState<DiagramGraphDiagnostic[]>([]);
+  const [semanticEditNotice, setSemanticEditNotice] = useState<string | null>(null);
   const [shapePropertiesOpen, setShapePropertiesOpen] = useState(false);
   const shapePropertiesPanelRef = useRef<HTMLElement>(null);
   const shapePropertiesTriggerRef = useRef<HTMLButtonElement>(null);
@@ -345,6 +365,10 @@ export default function App() {
   const [editShape, setEditShape] = useState<AnyShape | null>(null);
   const editShapeRef = useRef<AnyShape | null>(null);
   const editTextRef = useRef('');
+  const editLanguageRef = useRef<CodeLanguage>(DEFAULT_CODE_LANGUAGE);
+  const editSessionCounterRef = useRef(0);
+  const activeEditSessionRef = useRef(0);
+  const committedEditSessionRef = useRef<number | null>(null);
   const internalSetEditShape = (s: AnyShape | null) => {
     setEditShape(s);
     editShapeRef.current = s;
@@ -359,6 +383,27 @@ export default function App() {
   const [editClick, setEditClick] = useState({ x: 0, y: 0 });
   const [canvasMetrics, setCanvasMetrics] = useState({ w: 0, h: 0, left: 0, top: 0 });
   const textFocusShapeIdRef = useRef<string | null>(null);
+  const editingLocalBoundsRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  const editingClassifierContextRef = useRef<{
+    shapeId: string;
+    target: 'header' | 'member' | 'empty-compartment';
+    compartmentId?: string;
+    compartmentKind?: 'attributes' | 'operations' | 'literals' | 'values';
+    memberId?: string;
+    memberIndex?: number;
+    fontSize: number;
+    textAlign: 'left' | 'center';
+  } | null>(null);
+  const editingErContextRef = useRef<{
+    shapeId: string;
+    target: 'header' | 'column';
+    columnIndex?: number;
+    fontSize?: number;
+  } | null>(null);
+  const editingUsecaseExtContextRef = useRef<{
+    shapeId: string;
+    target: 'header' | 'extension-points';
+  } | null>(null);
 
   useLayoutEffect(() => {
     const measureCanvas = () => {
@@ -414,19 +459,21 @@ export default function App() {
   const [shapeSearch, setShapeSearch] = useState('');
   const [lastSelectTool, setLastSelectTool] = useState<ToolType>('select');
 
-  const setTool = useCallback((t: ToolType, keepOpen: boolean = false) => {
+  const setTool = useCallback((t: ToolType, keepOpen: boolean = false, contextCategory?: ShapeCategory) => {
     setToolSt(t);
     // When manually selecting a tool, close any other open groups
     if (!keepOpen) setOpenGroup(null);
+    const shapeTool = SHAPE_TOOLS.find(item => item.id === t);
+    if (shapeTool) engRef.current?.setDiagramContext(umlFamilyForCategory(contextCategory ?? shapeTool.definition.category ?? shapeCategory));
     engRef.current?.setTool(t);
     if (['text', 'math', 'code'].includes(t)) setLastTextTool(t);
-    if (SHAPE_TOOLS.some(s => s.id === t)) setLastShapeTool(t);
+    if (shapeTool) setLastShapeTool(t);
     if (['select', 'lasso-select'].includes(t)) setLastSelectTool(t);
-  }, []);
+  }, [shapeCategory]);
 
-  const choosePopoverTool = (t: ToolType) => {
+  const choosePopoverTool = (t: ToolType, contextCategory?: ShapeCategory) => {
     const group = openGroup;
-    setTool(t);
+    setTool(t, false, contextCategory);
     if (group) popoverAnchorRefs.current[group]?.querySelector('button')?.focus();
   };
 
@@ -616,6 +663,7 @@ export default function App() {
     cv.height = wrap.clientHeight;
 
     const eng = new CanvasEngine(cv, yShapes);
+    eng.setDiagramContext(umlFamilyForCategory(shapeCategory));
     // The style-sync effect may already have run while board restoration was pending.
     // Apply the current UI values at construction so new shapes use Antiwhite defaults.
     eng.style = { ...engineStyleRef.current };
@@ -624,21 +672,38 @@ export default function App() {
     eng.onSel = ids => {
       setSelIds(ids);
       setSelectedShape(ids.length === 1 ? eng.getShape(ids[0]) : null);
+      setSemanticEditNotice(null);
       if (ids.length !== 1) setShapePropertiesOpen(false);
     };
+    eng.onGraphUpdate = diagnostics => setGraphDiagnostics(diagnostics);
+    setGraphDiagnostics(eng.getDiagramGraphDiagnostics());
     eng.onCursor = setCursor;
     eng.onCameraChange = (c) => { setCam(c); setZoom(c.zoom); };
     eng.onZoom = (z) => { setZoom(z); setCam(prev => ({ ...prev, zoom: z })); };
-    eng.onTool = t => setToolSt(t);
+    eng.onTool = t => {
+      setToolSt(t);
+      if (t === 'select' || t === 'lasso-select') setLastSelectTool(t);
+    };
 
     eng.onCam = cam => {
       const editingShape = editShapeRef.current;
       if (!editingShape || !isPositionedShape(editingShape)) return;
       const sp = eng.worldToClient(editingShape.x, editingShape.y);
-      setEditBox(prev => ({
-        ...prev, l: sp.x, t: sp.y,
-        w: editingShape.w * cam.zoom, h: editingShape.h * cam.zoom,
-      }));
+      const local = editingLocalBoundsRef.current;
+      if (local) {
+        setEditBox(prev => ({
+          ...prev,
+          l: sp.x + local.x * cam.zoom,
+          t: sp.y + local.y * cam.zoom,
+          w: local.w * cam.zoom,
+          h: local.h * cam.zoom,
+        }));
+      } else {
+        setEditBox(prev => ({
+          ...prev, l: sp.x, t: sp.y,
+          w: editingShape.w * cam.zoom, h: editingShape.h * cam.zoom,
+        }));
+      }
     };
 
     eng.onShapeUpdate = shape => {
@@ -649,32 +714,202 @@ export default function App() {
         editTextRef.current = updatedText;
         if (shape.type !== 'math') setEditText(current => current === updatedText ? current : updatedText);
       }
-      if (shape.type === 'code') setEditLanguage(normalizeCodeLanguage(shape.language));
+      if (shape.type === 'code') {
+        const language = normalizeCodeLanguage(shape.language);
+        editLanguageRef.current = language;
+        setEditLanguage(language);
+      }
       if (isPositionedShape(shape)) {
         const sp = eng.worldToClient(shape.x, shape.y);
-        setEditBox({ l: sp.x, t: sp.y, w: shape.w * eng.cam.zoom, h: shape.h * eng.cam.zoom });
+        const local = editingLocalBoundsRef.current;
+        if (local) {
+          setEditBox(prev => ({
+            ...prev,
+            l: sp.x + local.x * eng.cam.zoom,
+            t: sp.y + local.y * eng.cam.zoom,
+            w: local.w * eng.cam.zoom,
+            h: local.h * eng.cam.zoom,
+          }));
+        } else {
+          setEditBox({ l: sp.x, t: sp.y, w: shape.w * eng.cam.zoom, h: shape.h * eng.cam.zoom });
+        }
       }
       internalSetEditShape(shape);
     };
 
     eng.onEditText = (shape: AnyShape, cx: number, cy: number) => {
       if (!isPositionedShape(shape)) return;
+      activeEditSessionRef.current = ++editSessionCounterRef.current;
+      committedEditSessionRef.current = null;
+      textFocusShapeIdRef.current = null;
+      editingClassifierContextRef.current = null;
+      editingErContextRef.current = null;
+      editingUsecaseExtContextRef.current = null;
       eng.setEditingId(shape.id);
       const sp = eng.worldToClient(shape.x, shape.y);
-      const text = 'text' in shape && typeof shape.text === 'string' ? shape.text : '';
+      let text = 'text' in shape && typeof shape.text === 'string' ? shape.text : '';
 
-      // Precision positioning handled by FormulaEditor's world-coordinate internal logic.
-      // We pass the raw sp coordinates here as the anchor.
+      let localBounds = { x: 0, y: 0, w: shape.w, h: shape.h };
+      let boxL = sp.x;
+      let boxT = sp.y;
+      let boxW = shape.w * eng.cam.zoom;
+      let boxH = shape.h * eng.cam.zoom;
+
+      if (shape.type === 'diagram') {
+        const diagram = shape as DiagramShape;
+        const def = getShapeDefinition(diagram.shapeId);
+        if (def?.id === 'uml.actor') {
+          const glyphH = shape.h * 0.68;
+          localBounds = { x: 4, y: glyphH + 4, w: shape.w - 8, h: shape.h - glyphH - 6 };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          text = shape.text || 'Actor';
+        } else if (def?.id === 'uml.use-case-ext') {
+          const wPt = eng.clientToWorld(cx, cy);
+          const localY = wPt.y - shape.y;
+          const usecase = diagram.data?.usecase as { extensionPoints?: Array<{ name: string }> } | undefined;
+          const eps = usecase?.extensionPoints ?? [];
+          const dividerY = Math.max(shape.h * 0.35, shape.h * 0.50);
+          if (localY >= dividerY && eps.length > 0) {
+            localBounds = { x: 16, y: dividerY + 4, w: shape.w - 32, h: shape.h - dividerY - 8 };
+            boxL = sp.x + localBounds.x * eng.cam.zoom;
+            boxT = sp.y + localBounds.y * eng.cam.zoom;
+            boxW = localBounds.w * eng.cam.zoom;
+            boxH = localBounds.h * eng.cam.zoom;
+            text = eps.map(e => e.name).join('\n');
+            editingUsecaseExtContextRef.current = { shapeId: shape.id, target: 'extension-points' };
+            eng.setEditingClassifierContext({ shapeId: shape.id, target: 'usecase-ext' });
+          } else {
+            localBounds = { x: 16, y: 8, w: shape.w - 32, h: dividerY - 12 };
+            boxL = sp.x + localBounds.x * eng.cam.zoom;
+            boxT = sp.y + localBounds.y * eng.cam.zoom;
+            boxW = localBounds.w * eng.cam.zoom;
+            boxH = localBounds.h * eng.cam.zoom;
+            text = shape.text || 'Use Case';
+            editingUsecaseExtContextRef.current = { shapeId: shape.id, target: 'header' };
+            eng.setEditingClassifierContext({ shapeId: shape.id, target: 'header' });
+          }
+        } else if (def?.id === 'uml.system-boundary') {
+          const scale = Number.isFinite(diagram.embeddedTextScale) ? diagram.embeddedTextScale! : 1;
+          const headerH = Math.min(shape.h * 0.25, Math.max(32, 32 * Math.min(2.5, scale)));
+          localBounds = { x: 14, y: 8, w: shape.w - 28, h: headerH };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          text = shape.text || 'System';
+        } else if (def?.id === 'erd.er-table' || def?.id === 'erd.table') {
+          const hit = eng.getErTableHit(shape.id, cx, cy);
+          if (hit) {
+            boxL = hit.clientBounds.l;
+            boxT = hit.clientBounds.t;
+            boxW = hit.clientBounds.w;
+            boxH = hit.clientBounds.h;
+            localBounds = hit.localBounds;
+            editingErContextRef.current = {
+              shapeId: shape.id,
+              target: hit.target,
+              columnIndex: hit.columnIndex,
+              fontSize: hit.fontSize,
+            };
+            eng.setEditingClassifierContext({
+              shapeId: shape.id,
+              target: hit.target === 'header' ? 'header' : 'member',
+              columnIndex: hit.columnIndex,
+            });
+            text = hit.initialText;
+          }
+        } else if (def?.id === 'uml.class' || def?.id === 'uml.abstract-class' || def?.id === 'uml.interface'
+          || def?.id === 'uml.enumeration' || def?.id === 'uml.object') {
+          const hit = eng.getClassifierHit(shape.id, cx, cy);
+          if (hit) {
+            boxL = hit.clientBounds.l;
+            boxT = hit.clientBounds.t;
+            boxW = hit.clientBounds.w;
+            boxH = hit.clientBounds.h;
+            localBounds = hit.localBounds;
+            editingClassifierContextRef.current = {
+              shapeId: shape.id,
+              target: hit.target,
+              compartmentId: hit.compartmentId,
+              compartmentKind: hit.compartmentKind,
+              memberId: hit.memberId,
+              memberIndex: hit.memberIndex,
+              fontSize: hit.fontSize,
+              textAlign: hit.textAlign,
+            };
+            eng.setEditingClassifierContext({
+              shapeId: shape.id,
+              target: hit.target,
+              memberId: hit.memberId,
+            });
+            text = hit.initialText;
+          } else {
+            const scale = Number.isFinite(diagram.embeddedTextScale) && (diagram.embeddedTextScale ?? 0) > 0
+              ? Math.max(0.25, Math.min(16, diagram.embeddedTextScale!))
+              : Math.sqrt((shape.w / Math.max(1, def.width)) * (shape.h / Math.max(1, def.height)));
+            const stereotype = typeof shape.params?.stereotype === 'string' ? shape.params.stereotype : '';
+            const titleLine = Math.max(18, 14 * scale * 1.35);
+            const stereotypeLine = stereotype ? Math.max(16, 12 * scale * 1.2) : 0;
+            const headerH = Math.min(shape.h * 0.48, Math.max(38, 16 * scale + titleLine + stereotypeLine));
+            localBounds = { x: 8, y: 0, w: shape.w - 16, h: headerH };
+            boxT = sp.y;
+            boxH = headerH * eng.cam.zoom;
+            boxL = sp.x + 8 * eng.cam.zoom;
+            boxW = (shape.w - 16) * eng.cam.zoom;
+            editingClassifierContextRef.current = {
+              shapeId: shape.id,
+              target: 'header',
+              fontSize: 14 * scale,
+              textAlign: 'center',
+            };
+            eng.setEditingClassifierContext({
+              shapeId: shape.id,
+              target: 'header',
+            });
+          }
+        } else if (def?.id === 'uml.package' || def?.id === 'uml.module') {
+          const tabH = Math.min(shape.h * 0.35, 28);
+          localBounds = { x: 8, y: 4, w: Math.min(shape.w * 0.6, 90), h: tabH };
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxH = tabH * eng.cam.zoom;
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          text = shape.text || 'Package';
+        } else if (def?.id === 'uml.note') {
+          localBounds = { x: 8, y: 8, w: shape.w - 20, h: shape.h - 16 };
+          boxT = sp.y + 8 * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+          boxL = sp.x + 8 * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+        }
+      }
+
+      editingLocalBoundsRef.current = localBounds;
       setEditBox({
-        l: sp.x, t: sp.y,
-        w: shape.w * eng.cam.zoom,
-        h: shape.h * eng.cam.zoom,
+        l: boxL, t: boxT,
+        w: boxW,
+        h: boxH,
       });
       setEditClick({ x: cx, y: cy });
       internalSetEditShape(shape);
       editTextRef.current = text;
       setEditText(text);
-      setEditLanguage(normalizeCodeLanguage(shape.type === 'code' ? shape.language : undefined));
+      const language = normalizeCodeLanguage(shape.type === 'code' ? shape.language : undefined);
+      editLanguageRef.current = language;
+      setEditLanguage(language);
+    };
+
+    eng.onEditSemantic = shape => {
+      setSelectedShape(shape);
+      setShapePropertiesOpen(true);
+      // The panel is portaled and mounts after state commit. Focus an editor owned by the
+      // selected semantic object, never the generic whole-object text editor.
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>('#shape-properties-panel [data-semantic-edit-target]')?.focus();
+      }));
     };
 
     // Global click listener to close popovers when hitting board/outside
@@ -731,6 +966,11 @@ export default function App() {
     };
   }, [boardReady]);
 
+  // sync diagram family context when shape category changes without destroying engine
+  useEffect(() => {
+    engRef.current?.setDiagramContext(umlFamilyForCategory(shapeCategory));
+  }, [shapeCategory]);
+
   // sync style options
   useEffect(() => {
     const eng = engRef.current; if (!eng) return;
@@ -747,10 +987,20 @@ export default function App() {
     if (!editShape || !isPositionedShape(editShape) || !engRef.current) return;
     const eng = engRef.current;
     const sp = eng.worldToClient(editShape.x, editShape.y);
-    const sw = editShape.w * eng.cam.zoom;
-    const sh = editShape.h * eng.cam.zoom;
-    setEditBox({ l: sp.x, t: sp.y, w: sw, h: sh });
-  }, [zoom, editShape]);
+    const local = editingLocalBoundsRef.current;
+    if (local) {
+      setEditBox({
+        l: sp.x + local.x * eng.cam.zoom,
+        t: sp.y + local.y * eng.cam.zoom,
+        w: local.w * eng.cam.zoom,
+        h: local.h * eng.cam.zoom,
+      });
+    } else {
+      const sw = editShape.w * eng.cam.zoom;
+      const sh = editShape.h * eng.cam.zoom;
+      setEditBox({ l: sp.x, t: sp.y, w: sw, h: sh });
+    }
+  }, [zoom]);
 
   const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string) => {
     editTextRef.current = source;
@@ -772,35 +1022,158 @@ export default function App() {
   // Math Auto-Replace đã được chuyển sang FormulaEditor component.
 
   const commitEdit = useCallback((formulaSource?: string, lastValidPreview?: string) => {
-    if (!editShape) return;
+    const shape = editShapeRef.current;
     const eng = engRef.current;
-    if (!eng) return;
+    const session = activeEditSessionRef.current;
+    if (!shape || !eng || !session || committedEditSessionRef.current === session) return;
+    // Blur, Escape, Done, and editor teardown can race. One editor session owns one logical commit.
+    committedEditSessionRef.current = session;
+    const committedText = shape.type === 'math' ? (formulaSource ?? editTextRef.current) : editTextRef.current;
+    const classifierContext = editingClassifierContextRef.current;
+    const erContext = editingErContextRef.current;
+    const usecaseExtContext = editingUsecaseExtContextRef.current;
 
-    const committedText = editShape.type === 'math' ? (formulaSource ?? editTextRef.current) : editText;
-    eng.setEditingId(null);
-    if (editShape.type === 'math') {
-      const storedPreview = getLastValidFormulaPreview() ?? editShape.text ?? '';
+    if (classifierContext && shape.id === classifierContext.shapeId) {
+      if (classifierContext.target === 'header') {
+        eng.updateText(shape.id, committedText);
+      } else if (classifierContext.target === 'member' && classifierContext.memberId) {
+        if (!committedText.trim()) {
+          eng.removeClassifierMember(shape.id, classifierContext.memberId);
+        } else {
+          eng.updateClassifierMember(shape.id, classifierContext.memberId, committedText);
+        }
+      } else if (classifierContext.target === 'empty-compartment' && classifierContext.compartmentKind) {
+        if (committedText.trim()) {
+          eng.addClassifierMember(shape.id, classifierContext.compartmentKind, committedText);
+        }
+      }
+      editingClassifierContextRef.current = null;
+    } else if (erContext && shape.id === erContext.shapeId) {
+      if (erContext.target === 'header') {
+        eng.updateText(shape.id, committedText);
+      } else if (erContext.target === 'column' && erContext.columnIndex !== undefined) {
+        eng.updateErTableColumn(shape.id, erContext.columnIndex, committedText);
+      }
+      editingErContextRef.current = null;
+    } else if (usecaseExtContext && shape.id === usecaseExtContext.shapeId) {
+      if (usecaseExtContext.target === 'header') {
+        eng.updateText(shape.id, committedText);
+      } else if (usecaseExtContext.target === 'extension-points') {
+        eng.updateUseCaseExtensionPoints(shape.id, committedText);
+      }
+      editingUsecaseExtContextRef.current = null;
+    } else if (shape.type === 'math') {
+      const storedPreview = getLastValidFormulaPreview() || shape.previewText || '';
       const previewText = lastValidPreview ?? storedPreview;
-      if (!committedText.trim() && !previewText.trim()) eng.deleteShape(editShape.id);
-      else eng.updateFormula(editShape.id, committedText, previewText);
-    } else if (committedText.trim() === '' && !isFixedShapeLabel(editShape)) {
-      eng.deleteShape(editShape.id);
-    } else if (editShape.type === 'code') {
-      eng.updateCode(editShape.id, committedText, editLanguage);
+      if (!committedText.trim() && !previewText.trim()) eng.deleteShape(shape.id);
+      else eng.updateFormula(shape.id, committedText, previewText);
+    } else if (committedText.trim() === '' && !isFixedShapeLabel(shape)) {
+      eng.deleteShape(shape.id);
+    } else if (shape.type === 'code') {
+      const current = eng.getShape(shape.id);
+      const language = current?.type === 'code' ? normalizeCodeLanguage(current.language) : editLanguageRef.current;
+      eng.updateCode(shape.id, committedText, language);
     } else {
-      eng.updateText(editShape.id, committedText);
+      eng.updateText(shape.id, committedText);
     }
+    // Commit the model while the engine still suppresses its DOM preview, then release that
+    // ownership in the same turn that tears down the React editor. Only the committed preview
+    // remains as the final board representation.
+    editingLocalBoundsRef.current = null;
+    editingClassifierContextRef.current = null;
+    editingErContextRef.current = null;
+    editingUsecaseExtContextRef.current = null;
+    eng.setEditingClassifierContext(null);
     internalSetEditShape(null);
-  }, [editShape, editText, editLanguage, getLastValidFormulaPreview]);
+    textFocusShapeIdRef.current = null;
+    eng.setEditingId(null);
+  }, [getLastValidFormulaPreview]);
 
-  // keyboard shortcuts
+  const commitAndAdvanceClassifierMember = useCallback(() => {
+    const shape = editShapeRef.current;
+    const eng = engRef.current;
+    const classifierContext = editingClassifierContextRef.current;
+    if (!shape || !eng || !classifierContext || classifierContext.target === 'header') {
+      commitEdit();
+      return;
+    }
+
+    const currentText = editTextRef.current;
+    const kind = classifierContext.compartmentKind ?? 'attributes';
+    let anchorMemberId = classifierContext.memberId;
+
+    if (classifierContext.target === 'member' && classifierContext.memberId) {
+      if (!currentText.trim()) {
+        eng.removeClassifierMember(shape.id, classifierContext.memberId);
+        anchorMemberId = undefined;
+      } else {
+        eng.updateClassifierMember(shape.id, classifierContext.memberId, currentText);
+      }
+    } else if (classifierContext.target === 'empty-compartment') {
+      if (currentText.trim()) {
+        anchorMemberId = eng.addClassifierMember(shape.id, kind, currentText) ?? undefined;
+      }
+    }
+
+    const placeholder = kind === 'operations' ? '+ method()' : kind === 'literals' ? 'LITERAL' : '+ attribute : String';
+    const newMemberId = eng.addClassifierMember(shape.id, kind, placeholder, anchorMemberId);
+    if (!newMemberId) {
+      commitEdit();
+      return;
+    }
+
+    const nextBounds = eng.getClassifierMemberBounds(shape.id, newMemberId);
+    if (!nextBounds) {
+      commitEdit();
+      return;
+    }
+
+    const updatedShape = eng.getShape(shape.id);
+    if (updatedShape) internalSetEditShape(updatedShape);
+
+    editingClassifierContextRef.current = {
+      shapeId: shape.id,
+      target: 'member',
+      compartmentId: classifierContext.compartmentId,
+      compartmentKind: kind,
+      memberId: newMemberId,
+      fontSize: nextBounds.fontSize,
+      textAlign: nextBounds.textAlign,
+    };
+    editingLocalBoundsRef.current = nextBounds.localBounds;
+
+    editTextRef.current = placeholder;
+    setEditText(placeholder);
+    setEditBox(nextBounds.clientBounds);
+
+    window.requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>('.board-text-editor');
+      if (textarea) {
+        textarea.focus();
+        textarea.select();
+      }
+    });
+  }, [commitEdit]);
+
+  // Keyboard context priority: native editor/form controls first, then application dialogs and
+  // toolbars, then the focused board. A text editor's native history/select-all must never reach
+  // the board's Yjs history manager.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const active = document.activeElement as HTMLElement | null;
       const tag = active?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || active?.isContentEditable) return;
-      if (active?.closest('button, a, select, [role="dialog"], [role="menu"], [role="listbox"], .board-code-preview')) return;
-      if (editShape) { if (e.key === 'Escape') commitEdit(); return; }
+      const nativeEditor = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+        || Boolean(active?.isContentEditable);
+      if (nativeEditor) return;
+
+      const editorOrControl = active?.closest('.formula-editor-panel, .math-tools-panel, .code-editor-shell, .code-editor-overlay, [role="dialog"], [role="menu"], [role="listbox"], .panel-ui, .popover, aside, header, button, a, select');
+      if (editorOrControl) return;
+      // A canvas click focuses the real canvas even when the pointer landed on a DOM-rendered
+      // object. Body focus is the application's idle board context; other parts of the app are not.
+      const boardHasFocus = !active || active === document.body || active === document.documentElement
+        || active === canvasRef.current || Boolean(wrapRef.current?.contains(active));
+      if (!boardHasFocus) return;
+      if (editShapeRef.current) { if (e.key === 'Escape') { e.preventDefault(); commitEdit(); } return; }
       const eng = engRef.current; if (!eng) return;
 
       const shortcut = getCanvasShortcutAction(e, eng.sel.size === 0);
@@ -812,8 +1185,9 @@ export default function App() {
           break;
         case 'undo': e.preventDefault(); eng.undo(); break;
         case 'redo': e.preventDefault(); eng.redo(); break;
+        case 'select-all': e.preventDefault(); eng.selectAll(); break;
         case 'duplicate': e.preventDefault(); eng.dupSel(); break;
-        case 'delete': eng.deleteSel(); break;
+        case 'delete': e.preventDefault(); eng.deleteSel(); break;
         case 'tool': setTool(shortcut.tool); break;
         case 'open-image': fileRef.current?.click(); break;
         case 'clear-selection':
@@ -823,7 +1197,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [editShape, setTool, commitEdit]);
+  }, [setTool, commitEdit]);
 
   const resizeFormula = useCallback((width: number, height: number) => {
     const id = editShapeRef.current?.id;
@@ -879,25 +1253,156 @@ export default function App() {
     ? getShapeDefinitionForLegacyType(selectedShape.type) : undefined;
   const selectedPropertyShape = selectedDiagram ?? (selectedLegacyDefinition ? selectedShape : null);
   const selectedDefinition = selectedDiagram ? getShapeDefinition(selectedDiagram.shapeId) : selectedLegacyDefinition;
+  const selectedConnectorDefinition = selectedConnector ? getShapeDefinition(selectedConnector.shapeId) : undefined;
+  const selectedContextDefinition = selectedDefinition ?? selectedConnectorDefinition;
+  const selectedContextFamilies = familyForDefinition(selectedContextDefinition);
+  const selectedContextValue = selectedDiagram?.diagramContext ?? selectedConnector?.diagramContext
+    ?? (selectedConnector ? engRef.current?.getSemanticContextForShape(selectedConnector.id) : undefined)
+    ?? (selectedContextFamilies.length === 1 ? selectedContextFamilies[0] : '');
+  const selectedCapabilities = diagramCapabilitiesFor(selectedContextDefinition, selectedContextValue || null);
+  const selectedConnectorCapabilities = selectedConnector ? selectedCapabilities.connector : undefined;
+  const selectedGraphIssues = selectedShape ? graphDiagnostics.filter(issue => issue.relatedIds.includes(selectedShape.id)) : [];
+  const selectedStyleIsApplicable = selIds.some(id => {
+    const candidate = engRef.current?.getShape(id);
+    if (!candidate) return false;
+    if (candidate.type === 'connector') {
+      const caps = diagramCapabilitiesFor(getShapeDefinition(candidate.shapeId)).style;
+      return Boolean(caps.stroke || caps.strokeWidth);
+    }
+    if (candidate.type === 'diagram') {
+      const caps = diagramCapabilitiesFor(getShapeDefinition(candidate.shapeId)).style;
+      return Boolean(caps.fill || caps.stroke || caps.strokeWidth || caps.textColor || caps.fontSize);
+    }
+    return true;
+  });
   const selectedSolidScale = selectedDiagram && selectedDefinition?.solid3d
     ? selectedDiagram.scale3d ?? selectedDefinition.defaultScale3d ?? solid3DScaleFromBounds(selectedDiagram.w, selectedDiagram.h, selectedDefinition.width,
       selectedDefinition.height, selectedDefinition.geometry as import('./engine/shapes/solid3d').Solid3DGeometry)
     : null;
   const selectedPropertyParams = selectedPropertyShape && 'params' in selectedPropertyShape ? selectedPropertyShape.params ?? {} : {};
   const selectedPropertyText = selectedPropertyShape && 'text' in selectedPropertyShape ? selectedPropertyShape.text ?? '' : '';
-  const classifierModel = selectedDiagram?.data?.classifier as { compartments?: Array<{ id?: string; label?: string; items?: string[] }> } | undefined;
+  const classifierModel = selectedDiagram?.data?.classifier as UMLClassifierData | undefined;
   const classifierCompartments = Array.isArray(classifierModel?.compartments) ? classifierModel.compartments : [];
+  const instanceModel = selectedDiagram?.data?.instance as UMLInstanceData | undefined;
+  const instanceValues = Array.isArray(instanceModel?.values) ? instanceModel.values : [];
   const tableModel = selectedDiagram?.data?.table as { columns?: Array<{ id?: string; name?: string; type?: string; key?: string }> } | undefined;
   const tableColumns = Array.isArray(tableModel?.columns) ? tableModel.columns : [];
   const columnModel = selectedDiagram?.data?.column as { name?: string; type?: string; key?: string } | undefined;
-  const updateClassifierData = (compartments: Array<{ id?: string; label?: string; items?: string[] }>, commit = false) => {
-    if (selectedDiagram && classifierModel) engRef.current?.updateDiagramData(selectedDiagram.id, { classifier: { ...classifierModel, compartments } }, commit);
+  const sequenceFragment = selectedDiagram?.shapeId === 'uml.frame'
+    ? selectedDiagram.data?.sequenceFragment as SequenceFragmentData | undefined : undefined;
+  const updateSequenceFragment = (fragment: SequenceFragmentData, commit = false) => {
+    if (selectedDiagram?.shapeId === 'uml.frame')
+      engRef.current?.updateDiagramData(selectedDiagram.id, { sequenceFragment: fragment as unknown as Record<string, unknown> }, commit);
+  };
+  const updateClassifierData = (model: UMLClassifierData, commit = false) => {
+    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { classifier: model as unknown as Record<string, unknown> }, commit);
+  };
+  const patchClassifierMember = (compartmentId: string, memberId: string, patch: Record<string, unknown>, commit = false) => {
+    if (!classifierModel) return;
+    const compartments = classifierModel.compartments.map(compartment => compartment.id !== compartmentId ? compartment : {
+      ...compartment, items: compartment.items.map(member => {
+        if (member.id !== memberId) return member;
+        const updated = { ...member, ...patch } as UMLClassifierMember;
+        delete updated.sourceText;
+        return updated;
+      }),
+    });
+    updateClassifierData({ ...classifierModel, compartments }, commit);
+  };
+  const moveClassifierMember = (compartmentId: string, memberIndex: number, delta: -1 | 1) => {
+    if (!classifierModel) return;
+    const compartments = classifierModel.compartments.map(compartment => {
+      if (compartment.id !== compartmentId) return compartment;
+      const targetIndex = memberIndex + delta;
+      if (targetIndex < 0 || targetIndex >= compartment.items.length) return compartment;
+      const items = compartment.items.slice();
+      const [member] = items.splice(memberIndex, 1);
+      items.splice(targetIndex, 0, member);
+      return { ...compartment, items };
+    });
+    updateClassifierData({ ...classifierModel, compartments }, true);
+  };
+  const addClassifierMember = (compartmentId: string) => {
+    if (!classifierModel) return;
+    const compartments = classifierModel.compartments.map(compartment => compartment.id !== compartmentId ? compartment : {
+      ...compartment, items: [...compartment.items, createClassifierMember(compartment.kind, compartment.items.length) as UMLClassifierMember],
+    });
+    updateClassifierData({ ...classifierModel, compartments }, true);
+  };
+  const updateInstanceData = (model: UMLInstanceData, commit = false) => {
+    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { instance: model as unknown as Record<string, unknown> }, commit);
+  };
+  const patchInstanceValue = (valueId: string, patch: Record<string, unknown>, commit = false) => {
+    if (!instanceModel) return;
+    const values = instanceModel.values.map(value => {
+      if (value.id !== valueId) return value;
+      const updated = { ...value, ...patch } as UMLInstanceValue;
+      delete updated.sourceText;
+      return updated;
+    });
+    updateInstanceData({ ...instanceModel, values }, commit);
+  };
+  const moveInstanceValue = (valueIndex: number, delta: -1 | 1) => {
+    if (!instanceModel) return;
+    const targetIndex = valueIndex + delta;
+    if (targetIndex < 0 || targetIndex >= instanceModel.values.length) return;
+    const values = instanceModel.values.slice();
+    const [value] = values.splice(valueIndex, 1);
+    values.splice(targetIndex, 0, value);
+    updateInstanceData({ ...instanceModel, values }, true);
+  };
+  const addInstanceValue = () => {
+    if (!instanceModel) return;
+    updateInstanceData({ ...instanceModel, values: [...instanceModel.values,
+      createClassifierMember('values', instanceModel.values.length) as UMLInstanceValue] }, true);
   };
   const updateTableData = (columns: Array<{ id?: string; name?: string; type?: string; key?: string }>, commit = false) => {
     if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { table: { ...(tableModel ?? {}), columns } }, commit);
   };
   const updateColumnData = (column: { name?: string; type?: string; key?: string }, commit = false) => {
     if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { column }, commit);
+  };
+  const usecaseModel = selectedDiagram?.data?.usecase as UMLUseCaseData | undefined;
+  const usecaseExtensionPoints = Array.isArray(usecaseModel?.extensionPoints) ? usecaseModel.extensionPoints : [];
+  const updateUseCaseData = (model: UMLUseCaseData, commit = false) => {
+    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { usecase: model as unknown as Record<string, unknown> }, commit);
+  };
+  const patchExtensionPoint = (pointId: string, patch: Partial<UMLExtensionPoint>, commit = false) => {
+    if (!usecaseModel) return;
+    const extensionPoints = (usecaseModel.extensionPoints ?? []).map(point =>
+      point.id === pointId ? { ...point, ...patch } : point
+    );
+    updateUseCaseData({ ...usecaseModel, extensionPoints }, commit);
+  };
+  const moveExtensionPoint = (pointIndex: number, delta: -1 | 1) => {
+    if (!usecaseModel) return;
+    const targetIndex = pointIndex + delta;
+    const currentPoints = usecaseModel.extensionPoints ?? [];
+    if (targetIndex < 0 || targetIndex >= currentPoints.length) return;
+    const items = currentPoints.slice();
+    const [point] = items.splice(pointIndex, 1);
+    items.splice(targetIndex, 0, point);
+    updateUseCaseData({ ...usecaseModel, extensionPoints: items }, true);
+  };
+  const addExtensionPoint = () => {
+    const current = usecaseModel ?? { version: 1, extensionPoints: [] };
+    const currentPoints = current.extensionPoints ?? [];
+    const newPoint: UMLExtensionPoint = {
+      id: `ep:${Date.now()}:${currentPoints.length + 1}`,
+      name: `point_${currentPoints.length + 1}`,
+      explanation: '',
+    };
+    updateUseCaseData({ ...current, extensionPoints: [...currentPoints, newPoint] }, true);
+  };
+  const deleteExtensionPoint = (pointId: string) => {
+    if (!usecaseModel) return;
+    const extensionPoints = (usecaseModel.extensionPoints ?? []).filter(p => p.id !== pointId);
+    updateUseCaseData({ ...usecaseModel, extensionPoints }, true);
+  };
+
+  const subjectBoundaryModel = selectedDiagram?.data?.subjectBoundary as UMLSubjectBoundaryData | undefined;
+  const updateSubjectBoundaryData = (model: UMLSubjectBoundaryData, commit = false) => {
+    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { subjectBoundary: model as unknown as Record<string, unknown> }, commit);
   };
 
   const zoomBy = (d: number) => { const e = engRef.current; if (!e) return; e.setCamera(e.cam.x, e.cam.y, Math.max(.04, Math.min(16, e.cam.zoom + d))); };
@@ -1070,7 +1575,7 @@ export default function App() {
                     {SHAPE_CATEGORIES.map(category => (
                       <button key={category} type="button" className={`shape-category-button${!shapeSearchNeedle && shapeCategory === category ? ' active' : ''}`}
                         aria-pressed={!shapeSearchNeedle && shapeCategory === category}
-                        onClick={() => { setShapeCategory(category); setShapeSearch(''); }} title={category}>
+                        onClick={() => { setShapeCategory(category); setShapeSearch(''); engRef.current?.setDiagramContext(umlFamilyForCategory(category)); }} title={category}>
                         {category}
                       </button>
                     ))}
@@ -1083,7 +1588,8 @@ export default function App() {
                       {visibleShapeTools.map(({ id, label, definition }) => (
                         <PopoverItem key={id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === id : lastShapeTool === id}
                           preview={<ShapePreview definition={definition} size={24} />} label={label}
-                          shapeId={definition.id} grid={true} solid3d={Boolean(definition.solid3d)} onClick={() => choosePopoverTool(id)} />
+                          shapeId={definition.id} grid={true} solid3d={Boolean(definition.solid3d)}
+                          onClick={() => choosePopoverTool(id, shapeSearchNeedle ? definition.category : shapeCategory)} />
                       ))}
                     </div>
                   ) : <div className="shape-library-empty">No matching shapes.</div>}
@@ -1114,6 +1620,7 @@ export default function App() {
             const eng = engRef.current; if (!eng) return;
             // Right- and middle-button gestures are camera-only, regardless of the active drawing tool.
             if (e.button === 2 || e.button === 1) {
+              canvasRef.current?.focus({ preventScroll: true });
               eng.pointerDown(e.nativeEvent);
               return;
             }
@@ -1123,6 +1630,9 @@ export default function App() {
               fileRef.current?.click();
               return;
             }
+            // The engine's DOM content overlays are siblings of the canvas and do not focus it
+            // automatically. Explicitly make board shortcuts available after any board interaction.
+            canvasRef.current?.focus({ preventScroll: true });
             const target = e.target as HTMLElement;
             const sticky = target.closest('[id^="ol_"]');
             if (sticky && (sticky as HTMLElement).scrollHeight > (sticky as HTMLElement).clientHeight) {
@@ -1184,19 +1694,13 @@ export default function App() {
                 background: editShape.type === 'sticky' ? (editShape as StickyShape).bg : editShape.type === 'code' ? '#1b2430' : 'transparent',
                 border: 'none',
               }}>
-                <div style={{
-                  position: 'absolute', inset: -4 / zoom,
-                  border: `${2.5 / zoom}px solid #3b82f6`,
-                  borderRadius: 3 / zoom, pointerEvents: 'none', zIndex: 10,
-                }}>
-                  {[-1, 0, 1].map(x => [-1, 0, 1].map(y => {
-                    if (x === 0 && y === 0) return null;
-                    const left = x === -1 ? `${-5 / zoom}px` : x === 0 ? `calc(50% - ${5 / zoom}px)` : `calc(100% - ${5 / zoom}px)`;
-                    const top = y === -1 ? `${-5 / zoom}px` : y === 0 ? `calc(50% - ${5 / zoom}px)` : `calc(100% - ${5 / zoom}px)`;
-                    return <div key={`${x}${y}`} style={{ position: 'absolute', left, top, width: 10 / zoom, height: 10 / zoom,
-                      background: '#fff', border: `${1.5 / zoom}px solid #3b82f6`, borderRadius: '50%' }} />;
-                  }))}
-                </div>
+                {(editShape.type === 'text' || editShape.type === 'sticky') && (
+                  <div style={{
+                    position: 'absolute', inset: -3 / zoom,
+                    border: `${1.5 / zoom}px solid #3b82f6`,
+                    borderRadius: 3 / zoom, pointerEvents: 'none', zIndex: 10,
+                  }} />
+                )}
 
                 {editShape.type === 'code' ? (
                   <React.Suspense fallback={<div className="code-editor-loading">Loading code editor…</div>}>
@@ -1206,16 +1710,16 @@ export default function App() {
                       language={editLanguage}
                       initialCursor={codeEditorInitialCursor}
                       fontSize={editShapeFontSize}
-                      autoHeight={editShape.autoHeight !== false}
                       onChange={value => {
+                        editTextRef.current = value;
                         setEditText(value);
-                        engRef.current?.updateCodeLive(editShape.id, value, editLanguage);
+                        engRef.current?.updateCodeLive(editShape.id, value, editLanguageRef.current);
                       }}
                       onLayout={height => engRef.current?.updateCodeLayoutLive(editShape.id, height)}
-                      onAutoHeightChange={(enabled, height) => engRef.current?.setCodeAutoHeight(editShape.id, enabled, height)}
                       onLanguageChange={language => {
+                        editLanguageRef.current = language;
                         setEditLanguage(language);
-                        engRef.current?.updateCodeLive(editShape.id, editText, language);
+                        engRef.current?.updateCodeLive(editShape.id, editTextRef.current, language);
                       }}
                       onCommit={commitEdit}
                     />
@@ -1244,30 +1748,90 @@ export default function App() {
                     value={editText}
                     onChange={event => {
                       const value = event.target.value;
+                      editTextRef.current = value;
                       setEditText(value);
                       const engine = engRef.current;
-                      engine?.updateTextLive(editShape.id, value);
-                      if (editShape.type !== 'sticky' && !isFixedShapeLabel(editShape) && engine) {
-                        const fs = shapeFontSize(editShape);
-                        const measured = measureCanvasText(value, `${fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
-                        const width = measured.w + 40;
-                        const height = measured.h + 40;
-                        setEditBox(previous => ({ ...previous, w: width * zoom, h: height * zoom }));
-                        engine.updateSize(editShape.id, width, height);
+                      if (!editingClassifierContextRef.current && !editingErContextRef.current && !editingUsecaseExtContextRef.current) {
+                        engine?.updateTextLive(editShape.id, value);
+                        if (editShape.type !== 'sticky' && !isFixedShapeLabel(editShape) && engine) {
+                          const fs = shapeFontSize(editShape);
+                          const measured = measureCanvasText(value, `${fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
+                          const width = measured.w + 40;
+                          const height = measured.h + 40;
+                          setEditBox(previous => ({ ...previous, w: width * zoom, h: height * zoom }));
+                          engine.updateSize(editShape.id, width, height);
+                        }
+                      } else if (editingClassifierContextRef.current?.target === 'header'
+                        || editingErContextRef.current?.target === 'header'
+                        || editingUsecaseExtContextRef.current?.target === 'header') {
+                        engine?.updateTextLive(editShape.id, value);
                       }
                     }}
                     onBlur={() => commitEdit()}
                     onKeyDown={event => {
                       if (event.key === 'Escape') { event.preventDefault(); commitEdit(); }
+                      if (event.key === 'Enter' && !event.shiftKey && editShape.type === 'diagram'
+                        && !['uml.note', 'uml.use-case-ext'].includes((editShape as DiagramShape).shapeId)) {
+                        event.preventDefault();
+                        if (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header') {
+                          commitAndAdvanceClassifierMember();
+                        } else {
+                          commitEdit();
+                        }
+                      }
                     }}
                     style={{
-                      width: '100%', height: '100%', background: 'transparent',
-                      fontSize: shapeFontSize(editShape), padding: 16,
-                      fontFamily: "'Inter','Segoe UI',sans-serif", color: isFixedShapeLabel(editShape) ? shapeTextColor(editShape) : editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)',
-                      caretColor: '#3b82f6', lineHeight: 1.5, boxSizing: 'border-box', resize: 'none',
-                      border: 'none', borderRadius: 0, display: 'block', whiteSpace: 'pre-wrap',
+                      width: '100%', height: '100%',
+                      background: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
+                        || (editingErContextRef.current && editingErContextRef.current.target === 'column')
+                        || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
+                        ? '#ffffff'
+                        : editShape.type === 'diagram'
+                        ? 'rgba(255, 255, 255, 0.92)'
+                        : 'transparent',
+                      fontSize: editingClassifierContextRef.current
+                        ? Math.round(editingClassifierContextRef.current.fontSize * zoom)
+                        : editingErContextRef.current?.fontSize
+                        ? Math.round(editingErContextRef.current.fontSize * zoom)
+                        : shapeFontSize(editShape),
+                      padding: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
+                        || (editingErContextRef.current && editingErContextRef.current.target === 'column')
+                        || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
+                        ? '1px 6px'
+                        : editShape.type === 'diagram' && ['uml.use-case', 'uml.use-case-ext'].includes((editShape as DiagramShape).shapeId)
+                        ? `${Math.max(6, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 12px 6px`
+                        : editShape.type === 'diagram' && ['uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'].includes((editShape as DiagramShape).shapeId)
+                        ? `${Math.max(4, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 8px 4px`
+                        : editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.actor'
+                        ? '4px 6px'
+                        : 16,
+                      fontFamily: "'Inter','Segoe UI',sans-serif",
+                      fontWeight: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
+                        || (editingErContextRef.current && editingErContextRef.current.target === 'column')
+                        ? 400
+                        : editShape.type === 'diagram' ? 600 : 'normal',
+                      fontStyle: editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.abstract-class' && (!editingClassifierContextRef.current || editingClassifierContextRef.current.target === 'header') ? 'italic' : 'normal',
+                      color: isFixedShapeLabel(editShape) ? shapeTextColor(editShape) : editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.85)',
+                      caretColor: '#2563eb', lineHeight: 1.35, boxSizing: 'border-box', resize: 'none',
+                      border: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
+                        || (editingErContextRef.current && editingErContextRef.current.target === 'column')
+                        || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
+                        ? '1.5px solid #2563eb'
+                        : editShape.type === 'diagram'
+                        ? '1.5px dashed #3b82f6'
+                        : 'none',
+                      borderRadius: 3,
+                      boxShadow: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
+                        || (editingErContextRef.current && editingErContextRef.current.target === 'column')
+                        || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
+                        ? '0 1px 4px rgba(37,99,235,0.25)' : 'none',
+                      display: 'block', whiteSpace: 'pre-wrap',
                       wordBreak: 'break-word', overflowWrap: 'break-word', overflowX: 'hidden',
-                      textAlign: isFixedShapeLabel(editShape) ? 'center' : 'left',
+                      textAlign: editingClassifierContextRef.current ? editingClassifierContextRef.current.textAlign
+                        : editingErContextRef.current && editingErContextRef.current.target === 'column' ? 'left'
+                        : editShape.type === 'diagram' && ['uml.system-boundary', 'uml.note', 'uml.package', 'uml.module'].includes((editShape as DiagramShape).shapeId)
+                        ? 'left'
+                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && ['uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'].includes((editShape as DiagramShape).shapeId)) ? 'center' : 'left',
                       overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
                     }}
                   />
@@ -1311,10 +1875,10 @@ export default function App() {
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-gray-50 text-gray-700 transition-colors">
                 <Copy size={13} /> Duplicate
               </button>
-              <button onClick={() => { const ids = [...engRef.current!.sel]; engRef.current?.updateStyle(ids, { fill, stroke, sw }); }}
+              {selectedStyleIsApplicable && <button onClick={() => { const ids = [...engRef.current!.sel]; engRef.current?.updateStyle(ids, { fill, stroke, sw }); }}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-gray-50 text-gray-700 transition-colors">
                 <Palette size={13} /> Style
-              </button>
+              </button>}
               {(selectedPropertyShape || selectedConnector) && <button ref={shapePropertiesTriggerRef} type="button"
                 aria-pressed={shapePropertiesOpen} aria-expanded={shapePropertiesOpen} aria-controls="shape-properties-panel"
                 onClick={() => setShapePropertiesOpen(open => !open)}
@@ -1341,16 +1905,98 @@ export default function App() {
               onPointerDown={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()}
               style={{ position: 'fixed', zIndex: 1800 }}>
               <div className="shape-properties-header">
-                <div><strong id="shape-properties-title">{selectedDefinition?.label ?? 'Connector'} properties</strong><span>{selectedDefinition?.category ?? 'Arrows & Connectors'}</span></div>
+                <div><strong id="shape-properties-title">{selectedDefinition?.label ?? selectedConnectorDefinition?.label ?? 'Object'} properties</strong><span>{selectedDefinition?.category ?? selectedConnectorDefinition?.category ?? 'Canvas object'}</span></div>
                 <button type="button" onClick={() => closeShapeProperties(true)} aria-label="Close shape properties"><X size={15} /></button>
               </div>
               <div className="shape-properties-body">
+                {(selectedDiagram || selectedConnector) && selectedContextDefinition?.semantic?.notation === 'uml' && <>
+                  <section className="shape-property-section">
+                    <h4>Diagram context</h4>
+                    <label className="shape-property-field"><span>Interpret this object in</span>
+                      <select aria-label="Diagram context" value={selectedContextValue}
+                        onChange={event => {
+                          const ok = engRef.current?.updateDiagramContext(selectedShape!.id, (event.target.value || null) as UMLDiagramFamily | null);
+                          setSemanticEditNotice(ok ? null : 'Context change was rejected because it conflicts with the object role or current graph.');
+                        }}>
+                        <option value="">Automatic</option>
+                        {selectedContextFamilies.map(family => <option key={family} value={family}>{UML_FAMILY_LABELS[family]}</option>)}
+                      </select>
+                    </label>
+                  </section>
+                  {semanticEditNotice && <p role="status" className="shape-property-diagnostic invalid">{semanticEditNotice}</p>}
+                  {selectedGraphIssues.length > 0 && <section className="shape-property-section" aria-label="Graph diagnostics">
+                    <h4>Graph diagnostics</h4>
+                    {selectedGraphIssues.map(issue => <p key={`${issue.id}:${issue.code}`} className={`shape-property-diagnostic ${issue.severity}`}>
+                      <strong>{issue.severity === 'invalid' ? 'Invalid' : 'Incomplete'}{issue.family ? ` · ${UML_FAMILY_LABELS[issue.family]}` : ''}</strong>
+                      <span>{issue.message}</span>
+                    </p>)}
+                  </section>}
+                </>}
                 {selectedPropertyShape && selectedDefinition && <>
-                  <label className="shape-property-field"><span>Name / label</span>
-                    <input value={selectedPropertyText} aria-label="Shape name or label"
+                  {selectedCapabilities.text.editable === true && <label className="shape-property-field"><span>Name / label</span>
+                    <input value={selectedPropertyText} aria-label="Shape name or label" data-semantic-edit-target
                       onChange={event => engRef.current?.updateTextLive(selectedPropertyShape.id, event.target.value)}
                       onBlur={event => engRef.current?.updateText(selectedPropertyShape.id, event.target.value)} />
-                  </label>
+                  </label>}
+
+                  {selectedDiagram && (selectedDefinition.semantic?.behavioralNodeRoles?.length ?? 0) > 1 && <section className="shape-property-section">
+                    <h4>Behavioral role</h4>
+                    <label className="shape-property-field"><span>Interpret this shared UML glyph as</span>
+                      <select aria-label="Behavioral role" value={selectedDiagram.behavioralRole ?? selectedDefinition.semantic?.defaultBehavioralNodeRole ?? ''}
+                        onChange={event => {
+                          const accepted = engRef.current?.updateDiagramBehavioralRole(selectedDiagram.id, event.target.value as import('./engine/shapes/types').BehavioralNodeRole);
+                          setSemanticEditNotice(accepted ? null : 'Role change was rejected because it would violate the current graph topology.');
+                        }}>
+                        {selectedDefinition.semantic!.behavioralNodeRoles!.map(role => <option key={role} value={role}>
+                          {role === 'decision' ? 'Decision' : role === 'merge' ? 'Merge' : role === 'fork' ? 'Fork' : role === 'join' ? 'Join' : role === 'choice' ? 'Choice' : 'Junction'}
+                        </option>)}
+                      </select>
+                    </label>
+                  </section>}
+
+                  {selectedDiagram?.shapeId === 'uml.frame' && sequenceFragment && <section className="shape-property-section" data-sequence-fragment-editor>
+                    <h4>Interaction fragment</h4>
+                    <label className="shape-property-field"><span>Operator</span>
+                      <select aria-label="Sequence fragment operator" value={sequenceFragment.operator}
+                        onChange={event => {
+                          const operator = event.target.value as SequenceFragmentOperator;
+                          const multiOperand = operator === 'alt' || operator === 'par';
+                          const operands = sequenceFragment.operands.slice(0, multiOperand ? 16 : 1);
+                          while (operands.length < (multiOperand ? 2 : 1)) {
+                            operands.push({ id: `operand:${selectedDiagram.id}:${Date.now()}:${operands.length + 1}`,
+                              order: operands.length, guard: '' });
+                          }
+                          updateSequenceFragment({ ...sequenceFragment, operator, operands }, true);
+                        }}>
+                        <option value="alt">alt — alternatives</option>
+                        <option value="opt">opt — optional</option>
+                        <option value="loop">loop — repetition</option>
+                        <option value="par">par — parallel operands</option>
+                      </select>
+                    </label>
+                    <p>Operands own the guards and message occurrences in each region. Resizing the frame does not scale its contents.</p>
+                    {sequenceFragment.operands.map((operand, index) => <label className="shape-property-field" key={operand.id}>
+                      <span>{sequenceFragment.operator === 'loop' ? 'Loop condition' : sequenceFragment.operator === 'opt' ? 'Optional condition' : `Operand ${index + 1} guard`}</span>
+                      <div className="sequence-operand-field">
+                        <input aria-label={`Fragment operand ${index + 1} guard`} data-semantic-edit-target value={operand.guard}
+                          placeholder="condition (optional)"
+                          onChange={event => updateSequenceFragment({ ...sequenceFragment, operands: sequenceFragment.operands.map(item =>
+                            item.id === operand.id ? { ...item, guard: event.target.value } : item) }, false)}
+                          onBlur={event => updateSequenceFragment({ ...sequenceFragment, operands: sequenceFragment.operands.map(item =>
+                            item.id === operand.id ? { ...item, guard: event.currentTarget.value } : item) }, true)} />
+                        {(sequenceFragment.operator === 'alt' || sequenceFragment.operator === 'par') && sequenceFragment.operands.length > 2
+                          && <button type="button" aria-label={`Remove fragment operand ${index + 1}`} title="Remove operand"
+                            onClick={() => updateSequenceFragment({ ...sequenceFragment,
+                              operands: sequenceFragment.operands.filter(item => item.id !== operand.id) }, true)}><X size={13} /></button>}
+                      </div>
+                    </label>)}
+                    {(sequenceFragment.operator === 'alt' || sequenceFragment.operator === 'par')
+                      && <button type="button" className="shape-property-add" disabled={sequenceFragment.operands.length >= 16}
+                        onClick={() => updateSequenceFragment({ ...sequenceFragment, operands: [...sequenceFragment.operands,
+                          { id: `operand:${selectedDiagram.id}:${Date.now()}`, order: sequenceFragment.operands.length, guard: '' }] }, true)}>
+                        Add operand
+                      </button>}
+                  </section>}
 
                   {(selectedDefinition.parameterMetadata ?? []).some(parameter => parameter.status === 'user-editable' && parameter.control)
                     && <section className="shape-property-section shape-parameter-section" data-shape-parameter-editor>
@@ -1376,15 +2022,122 @@ export default function App() {
                       engRef.current?.updateShapeScale3d(selectedDiagram.id, { [axis]: scaleValue }, commit);
                     }} />}
 
-                  {selectedDefinition.dataCapabilities?.includes('classifier') && classifierCompartments.length > 0 && <section className="shape-property-section">
-                    <h4>Classifier compartments</h4>
-                    {classifierCompartments.map((compartment, index) => <label className="shape-property-field" key={compartment.id ?? index}>
-                      <span>{compartment.label ?? `Compartment ${index + 1}`} · one item per line</span>
-                      <textarea value={(compartment.items ?? []).join('\n')} rows={3}
-                        onChange={event => updateClassifierData(classifierCompartments.map((item, itemIndex) => itemIndex === index
-                          ? { ...item, items: event.target.value.split('\n').slice(0, 20) } : item), false)}
-                        onBlur={() => updateClassifierData(classifierCompartments, true)} />
-                    </label>)}
+                  {selectedDefinition.dataCapabilities?.includes('classifier') && classifierModel && <section className="shape-property-section uml-classifier-editor" data-uml-classifier-editor>
+                    <h4>Structured classifier members</h4>
+                    <p>Each row has a stable identity. Edit, reorder, add, or remove members without replacing the other rows.</p>
+                    {classifierCompartments.map(compartment => <div className="uml-classifier-compartment" key={compartment.id}>
+                      <div className="uml-classifier-compartment-heading">
+                        <strong>{compartment.label}</strong>
+                        <button type="button" className="shape-property-add" onClick={() => addClassifierMember(compartment.id)}>
+                          Add {compartment.kind === 'operations' ? 'operation' : compartment.kind === 'literals' ? 'literal' : 'attribute'}
+                        </button>
+                      </div>
+                      {!compartment.items.length && <p className="uml-classifier-empty">No {compartment.label.toLowerCase()} yet.</p>}
+                      {compartment.items.map((member, memberIndex) => {
+                        const rowLabel = member.kind === 'operation' ? 'operation' : member.kind === 'literal' ? 'literal' : 'attribute';
+                        const patch = (values: Record<string, unknown>, commit = false) =>
+                          patchClassifierMember(compartment.id, member.id, values, commit);
+                        return <article className="uml-classifier-member" key={member.id} data-classifier-member-id={member.id}>
+                          <div className="uml-classifier-member-heading">
+                            <span>{rowLabel} {memberIndex + 1}</span>
+                            <div className="uml-classifier-member-actions">
+                              <button type="button" disabled={memberIndex === 0} aria-label={`Move ${rowLabel} ${memberIndex + 1} up`}
+                                title="Move up" onClick={() => moveClassifierMember(compartment.id, memberIndex, -1)}>↑</button>
+                              <button type="button" disabled={memberIndex === compartment.items.length - 1} aria-label={`Move ${rowLabel} ${memberIndex + 1} down`}
+                                title="Move down" onClick={() => moveClassifierMember(compartment.id, memberIndex, 1)}>↓</button>
+                              <button type="button" aria-label={`Delete ${rowLabel} ${memberIndex + 1}`} title="Delete row"
+                                onClick={() => updateClassifierData({ ...classifierModel, compartments: classifierModel.compartments.map(item => item.id === compartment.id
+                                  ? { ...item, items: item.items.filter(candidate => candidate.id !== member.id) } : item) }, true)}><X size={13} /></button>
+                            </div>
+                          </div>
+                          <label className="shape-property-field"><span>{member.kind === 'literal' ? 'Literal name' : member.kind === 'operation' ? 'Operation name' : 'Attribute name'}</span>
+                            <input aria-label={`${rowLabel} ${memberIndex + 1} name`} value={member.name}
+                              onChange={event => patch({ name: event.target.value })} onBlur={event => patch({ name: event.currentTarget.value }, true)} />
+                          </label>
+                          {(member.kind === 'attribute' || member.kind === 'operation') && <>
+                            <label className="shape-property-field"><span>Visibility</span>
+                              <select aria-label={`${rowLabel} ${memberIndex + 1} visibility`} value={member.visibility ?? ''}
+                                onChange={event => patch({ visibility: (event.target.value || undefined) as UMLVisibility | undefined }, true)}>
+                                <option value="">Unspecified</option><option value="public">Public (+)</option><option value="protected">Protected (#)</option>
+                                <option value="package">Package (~)</option><option value="private">Private (-)</option>
+                              </select>
+                            </label>
+                          </>}
+                          {member.kind === 'attribute' && <>
+                            <div className="shape-property-grid-two">
+                              <label className="shape-property-field"><span>Type</span>
+                                <input aria-label={`Attribute ${memberIndex + 1} type`} value={member.type ?? ''}
+                                  onChange={event => patch({ type: event.target.value })} onBlur={event => patch({ type: event.currentTarget.value }, true)} />
+                              </label>
+                              <label className="shape-property-field"><span>Default value</span>
+                                <input aria-label={`Attribute ${memberIndex + 1} default value`} value={member.defaultValue ?? ''}
+                                  onChange={event => patch({ defaultValue: event.target.value })} onBlur={event => patch({ defaultValue: event.currentTarget.value }, true)} />
+                              </label>
+                            </div>
+                            <div className="uml-classifier-flags">
+                              <label><input type="checkbox" aria-label={`Attribute ${memberIndex + 1} is derived`} checked={member.derived === true}
+                                onChange={event => patch({ derived: event.target.checked }, true)} /><span>Derived</span></label>
+                              <label><input type="checkbox" aria-label={`Attribute ${memberIndex + 1} is static`} checked={member.static === true}
+                                onChange={event => patch({ static: event.target.checked }, true)} /><span>Static</span></label>
+                            </div>
+                          </>}
+                          {member.kind === 'operation' && <>
+                            <label className="shape-property-field"><span>Parameters · name : Type = default</span>
+                              <input aria-label={`Operation ${memberIndex + 1} parameters`} value={formatOperationParameters(member.parameters)}
+                                onChange={event => patch({ parameters: parseOperationParameters(event.target.value, member.parameters) })}
+                                onBlur={event => patch({ parameters: parseOperationParameters(event.currentTarget.value, member.parameters) }, true)} />
+                            </label>
+                            <label className="shape-property-field"><span>Return type</span>
+                              <input aria-label={`Operation ${memberIndex + 1} return type`} value={member.returnType ?? ''}
+                                onChange={event => patch({ returnType: event.target.value })} onBlur={event => patch({ returnType: event.currentTarget.value }, true)} />
+                            </label>
+                            <div className="uml-classifier-flags">
+                              <label><input type="checkbox" aria-label={`Operation ${memberIndex + 1} is abstract`} checked={member.abstract === true}
+                                onChange={event => patch({ abstract: event.target.checked }, true)} /><span>Abstract</span></label>
+                              <label><input type="checkbox" aria-label={`Operation ${memberIndex + 1} is static`} checked={member.static === true}
+                                onChange={event => patch({ static: event.target.checked }, true)} /><span>Static</span></label>
+                            </div>
+                          </>}
+                        </article>;
+                      })}
+                    </div>)}
+                  </section>}
+
+                  {selectedDefinition.dataCapabilities?.includes('instance') && instanceModel && <section className="shape-property-section uml-instance-editor" data-uml-instance-editor>
+                    <h4>Object slots</h4>
+                    <p>Object values are instance slots, not Class attributes.</p>
+                    {!instanceValues.length && <p className="uml-classifier-empty">No slot values yet.</p>}
+                    {instanceValues.map((value, valueIndex) => <article className="uml-classifier-member" key={value.id} data-instance-value-id={value.id}>
+                      <div className="uml-classifier-member-heading">
+                        <span>Slot {valueIndex + 1}</span>
+                        <div className="uml-classifier-member-actions">
+                          <button type="button" disabled={valueIndex === 0} aria-label={`Move slot ${valueIndex + 1} up`}
+                            title="Move up" onClick={() => moveInstanceValue(valueIndex, -1)}>↑</button>
+                          <button type="button" disabled={valueIndex === instanceValues.length - 1} aria-label={`Move slot ${valueIndex + 1} down`}
+                            title="Move down" onClick={() => moveInstanceValue(valueIndex, 1)}>↓</button>
+                          <button type="button" aria-label={`Delete slot ${valueIndex + 1}`} title="Delete row"
+                            onClick={() => updateInstanceData({ ...instanceModel, values: instanceValues.filter(item => item.id !== value.id) }, true)}><X size={13} /></button>
+                        </div>
+                      </div>
+                      <label className="shape-property-field"><span>Slot name</span>
+                        <input aria-label={`Slot ${valueIndex + 1} name`} value={value.name}
+                          onChange={event => patchInstanceValue(value.id, { name: event.target.value })}
+                          onBlur={event => patchInstanceValue(value.id, { name: event.currentTarget.value }, true)} />
+                      </label>
+                      <div className="shape-property-grid-two">
+                        <label className="shape-property-field"><span>Type</span>
+                          <input aria-label={`Slot ${valueIndex + 1} type`} value={value.type ?? ''}
+                            onChange={event => patchInstanceValue(value.id, { type: event.target.value })}
+                            onBlur={event => patchInstanceValue(value.id, { type: event.currentTarget.value }, true)} />
+                        </label>
+                        <label className="shape-property-field"><span>Value</span>
+                          <input aria-label={`Slot ${valueIndex + 1} value`} value={value.value ?? ''}
+                            onChange={event => patchInstanceValue(value.id, { value: event.target.value })}
+                            onBlur={event => patchInstanceValue(value.id, { value: event.currentTarget.value }, true)} />
+                        </label>
+                      </div>
+                    </article>)}
+                    <button type="button" className="shape-property-add" onClick={addInstanceValue}>Add slot</button>
                   </section>}
 
                   {selectedDefinition.dataCapabilities?.includes('column') && columnModel && <section className="shape-property-section">
@@ -1428,17 +2181,172 @@ export default function App() {
                     }], true)}>Add column</button>
                   </section>}
 
+                  {(selectedDiagram?.shapeId === 'uml.use-case' || selectedDiagram?.shapeId === 'uml.use-case-ext') && <section className="shape-property-section uml-usecase-editor" data-uml-usecase-editor>
+                    <h4>Extension Points</h4>
+                    <p>Extension points define locations where the behavior of this use case can be extended (UML 2.5).</p>
+                    {!usecaseExtensionPoints.length && <p className="uml-classifier-empty">No extension points defined.</p>}
+                    {usecaseExtensionPoints.map((point, index) => (
+                      <article className="uml-classifier-member" key={point.id} data-extension-point-id={point.id}>
+                        <div className="uml-classifier-member-heading">
+                          <span>Point {index + 1}</span>
+                          <div className="uml-classifier-member-actions">
+                            <button type="button" disabled={index === 0} aria-label={`Move extension point ${index + 1} up`}
+                              title="Move up" onClick={() => moveExtensionPoint(index, -1)}>↑</button>
+                            <button type="button" disabled={index === usecaseExtensionPoints.length - 1} aria-label={`Move extension point ${index + 1} down`}
+                              title="Move down" onClick={() => moveExtensionPoint(index, 1)}>↓</button>
+                            <button type="button" aria-label={`Delete extension point ${index + 1}`} title="Delete point"
+                              onClick={() => deleteExtensionPoint(point.id)}><X size={13} /></button>
+                          </div>
+                        </div>
+                        <label className="shape-property-field">
+                          <span>Point name</span>
+                          <input aria-label={`Extension point ${index + 1} name`} value={point.name}
+                            placeholder="e.g. VIP Checkout"
+                            onChange={event => patchExtensionPoint(point.id, { name: event.target.value })}
+                            onBlur={event => patchExtensionPoint(point.id, { name: event.currentTarget.value }, true)} />
+                        </label>
+                        <label className="shape-property-field">
+                          <span>Explanation / condition (optional)</span>
+                          <input aria-label={`Extension point ${index + 1} explanation`} value={point.explanation ?? ''}
+                            placeholder="e.g. triggered on priority customer"
+                            onChange={event => patchExtensionPoint(point.id, { explanation: event.target.value })}
+                            onBlur={event => patchExtensionPoint(point.id, { explanation: event.currentTarget.value }, true)} />
+                        </label>
+                      </article>
+                    ))}
+                    <button type="button" className="shape-property-add" onClick={addExtensionPoint}>Add extension point</button>
+                  </section>}
+
+                  {selectedDiagram?.shapeId === 'uml.system-boundary' && <section className="shape-property-section" data-uml-boundary-editor>
+                    <h4>Subject Boundary</h4>
+                    <p>UML 2.5 subject boundary stereotype («system», «subsystem», «service», etc.).</p>
+                    <label className="shape-property-field">
+                      <span>Stereotype</span>
+                      <input aria-label="Subject stereotype"
+                        value={subjectBoundaryModel?.stereotype ?? (selectedDiagram.params?.stereotype as string) ?? '«system»'}
+                        placeholder="«system», «subsystem», «component»"
+                        onChange={event => {
+                          const val = event.target.value;
+                          updateSubjectBoundaryData({ version: 1, stereotype: val }, false);
+                          engRef.current?.updateShapeParameters(selectedDiagram.id, { stereotype: val }, false);
+                        }}
+                        onBlur={event => {
+                          const val = event.currentTarget.value;
+                          updateSubjectBoundaryData({ version: 1, stereotype: val }, true);
+                          engRef.current?.updateShapeParameters(selectedDiagram.id, { stereotype: val }, true);
+                        }}
+                      />
+                    </label>
+                  </section>}
+
                 </>}
 
                 {selectedConnector && <>
-                  <label className="shape-property-field"><span>Connector label</span><input value={selectedConnector.label ?? ''} placeholder="Relationship or flow label"
+                  {selectedConnector.shapeId === 'uml.extend' && <section className="shape-property-section" data-usecase-extend-editor>
+                    <h4>«extend» relationship details</h4>
+                    <p>Extension condition and target extension point per UML 2.5.</p>
+                    <label className="shape-property-field">
+                      <span>Extension condition (optional)</span>
+                      <input
+                        aria-label="Extend condition"
+                        value={selectedConnector.usecaseExtend?.condition ?? ''}
+                        placeholder="e.g. cart total > $100"
+                        onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, {
+                          usecaseExtend: {
+                            version: 1,
+                            condition: event.target.value,
+                            extensionPoint: selectedConnector.usecaseExtend?.extensionPoint ?? '',
+                          }
+                        }, false)}
+                        onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, {
+                          usecaseExtend: {
+                            version: 1,
+                            condition: event.currentTarget.value,
+                            extensionPoint: selectedConnector.usecaseExtend?.extensionPoint ?? '',
+                          }
+                        }, true)}
+                      />
+                    </label>
+                    <label className="shape-property-field">
+                      <span>Target extension point name</span>
+                      <input
+                        aria-label="Target extension point"
+                        value={selectedConnector.usecaseExtend?.extensionPoint ?? ''}
+                        placeholder="e.g. VIP checkout"
+                        onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, {
+                          usecaseExtend: {
+                            version: 1,
+                            condition: selectedConnector.usecaseExtend?.condition ?? '',
+                            extensionPoint: event.target.value,
+                          }
+                        }, false)}
+                        onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, {
+                          usecaseExtend: {
+                            version: 1,
+                            condition: selectedConnector.usecaseExtend?.condition ?? '',
+                            extensionPoint: event.currentTarget.value,
+                          }
+                        }, true)}
+                      />
+                    </label>
+                  </section>}
+                  {selectedConnectorCapabilities?.labelMode === 'structured' && selectedConnector.stateTransition && <section className="shape-property-section">
+                    <h4>Structured connector label</h4>
+                    <p>The rendered label is derived from these canonical parts.</p>
+                    {(['trigger', 'guard', 'effect'] as const).map(part => <label className="shape-property-field" key={part}>
+                      <span>{part === 'trigger' ? 'Trigger' : part === 'guard' ? 'Guard' : 'Effect'}</span>
+                      <input aria-label={`Transition ${part}`} data-semantic-edit-target value={selectedConnector.stateTransition?.[part] ?? ''}
+                        placeholder={part === 'guard' ? 'condition' : part === 'effect' ? 'action' : 'event'}
+                        onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, {
+                          stateTransition: { ...selectedConnector.stateTransition, [part]: event.target.value },
+                        }, false)}
+                        onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, {
+                          stateTransition: { ...selectedConnector.stateTransition, [part]: event.target.value },
+                        }, true)} />
+                    </label>)}
+                  </section>}
+                  {selectedConnectorCapabilities?.labelMode === 'plain' && <label className="shape-property-field"><span>Connector label</span><input aria-label="Connector label" data-semantic-edit-target value={selectedConnector.label ?? ''} placeholder="Relationship or flow label"
                     onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { label: event.target.value }, false)}
-                    onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { label: event.target.value }, true)} /></label>
-                  <label className="shape-property-field"><span>Line style</span><select value={selectedConnector.lineStyle}
+                    onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { label: event.target.value }, true)} /></label>}
+                  {selectedConnectorCapabilities?.labelMode === 'fixed' && <div className="shape-property-section">
+                    <h4>Canonical label</h4><p>{connectorDisplayLabel(selectedConnector)}</p>
+                  </div>}
+                  {selectedConnectorCapabilities?.directionText && <p className="shape-property-direction" data-connector-direction>
+                    {selectedConnectorCapabilities.directionText}
+                  </p>}
+                  {(selectedConnectorCapabilities?.sourceLabelEditable || selectedConnectorCapabilities?.targetLabelEditable
+                    || selectedConnectorCapabilities?.multiplicityEditable) && <section className="shape-property-section" data-uml-relationship-labels>
+                    <h4>Relationship end labels</h4>
+                    {selectedConnectorCapabilities.sourceLabelEditable && <label className="shape-property-field">
+                      <span>{selectedConnectorCapabilities.sourceRoleLabel ?? 'Source-end label'}</span>
+                      <input aria-label="Source-end role label" data-semantic-edit-target value={selectedConnector.sourceLabel ?? ''}
+                        onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabel: event.target.value }, false)}
+                        onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabel: event.currentTarget.value }, true)} />
+                    </label>}
+                    {selectedConnectorCapabilities.targetLabelEditable && <label className="shape-property-field">
+                      <span>{selectedConnectorCapabilities.targetRoleLabel ?? 'Target-end label'}</span>
+                      <input aria-label="Target-end role label" data-semantic-edit-target value={selectedConnector.targetLabel ?? ''}
+                        onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabel: event.target.value }, false)}
+                        onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabel: event.currentTarget.value }, true)} />
+                    </label>}
+                    {selectedConnectorCapabilities.multiplicityEditable && <div className="shape-property-grid-two">
+                      <label className="shape-property-field"><span>Source multiplicity · exact text</span>
+                        <input aria-label="Source multiplicity" value={selectedConnector.sourceMultiplicity ?? ''} placeholder="e.g. 0..1, 1..*, n"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceMultiplicity: event.target.value }, false)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceMultiplicity: event.currentTarget.value }, true)} />
+                      </label>
+                      <label className="shape-property-field"><span>Target multiplicity · exact text</span>
+                        <input aria-label="Target multiplicity" value={selectedConnector.targetMultiplicity ?? ''} placeholder="e.g. 0..1, 1..*, n"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetMultiplicity: event.target.value }, false)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetMultiplicity: event.currentTarget.value }, true)} />
+                      </label>
+                    </div>}
+                  </section>}
+                  {selectedConnectorCapabilities?.lineStyleEditable && <label className="shape-property-field"><span>Line style</span><select value={selectedConnector.lineStyle}
                     onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { lineStyle: event.target.value as StrokeStyle })}>
                     <option value="solid">Solid</option><option value="dashed">Dashed</option><option value="dotted">Dotted</option>
-                  </select></label>
-                  <div className="shape-property-grid-two">
+                  </select></label>}
+                  {selectedConnectorCapabilities?.markersEditable && <div className="shape-property-grid-two">
                     <label className="shape-property-field"><span>Start marker</span><select value={selectedConnector.startMarker}
                       onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { startMarker: event.target.value as EndpointMarker })}>
                       <option value="none">None</option><option value="arrow">Arrow</option><option value="openArrow">Open arrow</option><option value="hollowTriangle">Hollow triangle</option>
@@ -1449,8 +2357,8 @@ export default function App() {
                       <option value="none">None</option><option value="arrow">Arrow</option><option value="openArrow">Open arrow</option><option value="hollowTriangle">Hollow triangle</option>
                       <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
                     </select></label>
-                  </div>
-                  <div className="shape-property-grid-two">
+                  </div>}
+                  {selectedConnectorCapabilities?.cardinalityEditable && <div className="shape-property-grid-two">
                     <label className="shape-property-field"><span>Source cardinality</span><select value={selectedConnector.sourceCardinality ?? ''}
                       onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceCardinality: (event.target.value || undefined) as Cardinality | undefined })}>
                       <option value="">Not set</option><option value="one">One</option><option value="zero-or-one">Zero or one</option><option value="many">Many</option><option value="one-or-many">One or many</option><option value="zero-or-many">Zero or many</option>
@@ -1459,17 +2367,69 @@ export default function App() {
                       onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetCardinality: (event.target.value || undefined) as Cardinality | undefined })}>
                       <option value="">Not set</option><option value="one">One</option><option value="zero-or-one">Zero or one</option><option value="many">Many</option><option value="one-or-many">One or many</option><option value="zero-or-many">Zero or many</option>
                     </select></label>
-                  </div>
-                  <section className="shape-property-section">
+                  </div>}
+                  {selectedConnectorCapabilities?.labelPositionEditable && <section className="shape-property-section" data-route-label-positions>
+                    <h4>Route-relative label placement</h4>
+                    {selectedConnectorCapabilities.labelMode !== 'none' && <>
+                      <label className="shape-property-field"><span>Center label · {selectedConnector.labelPosition ?? 500}‰</span>
+                        <input type="range" min={0} max={1000} value={selectedConnector.labelPosition ?? 500} aria-label="Center label position along route"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { labelPosition: +event.target.value }, false)}
+                          onPointerUp={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { labelPosition: +event.currentTarget.value }, true)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { labelPosition: +event.currentTarget.value }, true)} />
+                      </label>
+                      <label className="shape-property-field"><span>Center label offset · {selectedConnector.labelOffset ?? 0} px</span>
+                        <input type="range" min={-80} max={80} value={selectedConnector.labelOffset ?? 0} aria-label="Center label offset from route"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { labelOffset: +event.target.value }, false)}
+                          onPointerUp={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { labelOffset: +event.currentTarget.value }, true)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { labelOffset: +event.currentTarget.value }, true)} />
+                      </label>
+                    </>}
+                    {selectedConnectorCapabilities.sourceLabelEditable && <>
+                      <label className="shape-property-field"><span>Source-end label position · {selectedConnector.sourceLabelPosition ?? 180}‰</span>
+                        <input type="range" min={0} max={1000} value={selectedConnector.sourceLabelPosition ?? 180} aria-label="Source-end label position along route"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabelPosition: +event.target.value }, false)}
+                          onPointerUp={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabelPosition: +event.currentTarget.value }, true)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabelPosition: +event.currentTarget.value }, true)} />
+                      </label>
+                      <label className="shape-property-field"><span>Source-end label offset · {selectedConnector.sourceLabelOffset ?? 12} px</span>
+                        <input type="range" min={-80} max={80} value={selectedConnector.sourceLabelOffset ?? 12} aria-label="Source-end label offset from route"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabelOffset: +event.target.value }, false)}
+                          onPointerUp={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabelOffset: +event.currentTarget.value }, true)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceLabelOffset: +event.currentTarget.value }, true)} />
+                      </label>
+                    </>}
+                    {selectedConnectorCapabilities.targetLabelEditable && <>
+                      <label className="shape-property-field"><span>Target-end label position · {selectedConnector.targetLabelPosition ?? 820}‰</span>
+                        <input type="range" min={0} max={1000} value={selectedConnector.targetLabelPosition ?? 820} aria-label="Target-end label position along route"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabelPosition: +event.target.value }, false)}
+                          onPointerUp={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabelPosition: +event.currentTarget.value }, true)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabelPosition: +event.currentTarget.value }, true)} />
+                      </label>
+                      <label className="shape-property-field"><span>Target-end label offset · {selectedConnector.targetLabelOffset ?? 12} px</span>
+                        <input type="range" min={-80} max={80} value={selectedConnector.targetLabelOffset ?? 12} aria-label="Target-end label offset from route"
+                          onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabelOffset: +event.target.value }, false)}
+                          onPointerUp={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabelOffset: +event.currentTarget.value }, true)}
+                          onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetLabelOffset: +event.currentTarget.value }, true)} />
+                      </label>
+                    </>}
+                    <p>Each editable label also has an independent canvas handle.</p>
+                  </section>}
+                  {selectedConnectorCapabilities?.routeEditable && <section className="shape-property-section">
                     <h4>Connector route</h4>
                     <p>{selectedConnector.waypoints.length} waypoint{selectedConnector.waypoints.length === 1 ? '' : 's'} · drag route handles to edit</p>
                     <button type="button" className="shape-property-add" onClick={() => {
-                      const route = getConnectorRoute(selectedConnector), midpoint = route[Math.floor(route.length / 2)] ?? [selectedConnector.x1, selectedConnector.y1];
-                      engRef.current?.addConnectorWaypoint(selectedConnector.id, midpoint[0], midpoint[1]);
+                      const route = getConnectorRoute(selectedConnector);
+                      const segment = route.slice(1).map((end, index) => {
+                        const start = route[index];
+                        return { start, end, length: Math.hypot(end[0] - start[0], end[1] - start[1]) };
+                      }).sort((left, right) => right.length - left.length)[0];
+                      if (!segment || segment.length < 1) return;
+                      engRef.current?.addConnectorWaypoint(selectedConnector.id,
+                        (segment.start[0] + segment.end[0]) / 2, (segment.start[1] + segment.end[1]) / 2);
                     }}>Add waypoint</button>
                     {selectedConnector.waypoints.map((_, index) => <button key={index} type="button" className="shape-property-remove-waypoint"
                       onClick={() => engRef.current?.removeConnectorWaypoint(selectedConnector.id, index)}>Remove waypoint {index + 1}</button>)}
-                  </section>
+                  </section>}
                 </>}
               </div>
             </aside>,
