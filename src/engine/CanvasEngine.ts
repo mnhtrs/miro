@@ -2,7 +2,7 @@ import { getStroke } from 'perfect-freehand';
 import * as Y from 'yjs';
 import RBush from 'rbush';
 import { parseTelex } from '../formula/parser';
-import { renderFormulaStatic } from '../formula/renderer';
+import { renderFormulaToHTML } from '../formula/renderer';
 import { CODE_LANGUAGES, DEFAULT_CODE_LANGUAGE, normalizeCodeLanguage, type CodeLanguage } from '../code/languages';
 import { CanvasCodePreviewCache } from '../code/canvasHighlight';
 import { initialCodeBlockHeight } from '../code/layout';
@@ -77,7 +77,7 @@ export interface StarShape    extends BoxShape  { type:'star';     fill:string; 
 export interface CalloutShape extends BoxShape  { type:'callout'; fill:string; stroke:string; sw:number; }
 export interface PolygonShape extends BoxShape { type:'pentagon'|'hexagon'|'parallelogram'|'trapezoid'|'right-triangle'; fill:string; stroke:string; sw:number; }
 export interface ArrowShape   extends BaseShape { type:'arrow';    x1:number;y1:number;x2:number;y2:number; color:string; sw:number; }
-export interface StickyShape  extends BoxShape  { type:'sticky';   text:string; bg:string; fs:number; }
+export interface StickyShape  extends BoxShape  { type:'sticky';   text:string; bg:string; fs:number; createdAt?: string; }
 export interface TextShape    extends BoxShape  { type:'text'|'math'|'code'; text:string; color:string; fs:number; language?: CodeLanguage; previewText?: string; autoHeight?: boolean; }
 export interface ImageShape   extends BoxShape  { type:'image';    src:string; naturalW:number; naturalH:number; }
 export type DiagramShape = DiagramShapeObject;
@@ -576,6 +576,24 @@ export class CanvasEngine {
       return;
     }
 
+    // If an object is actively being edited, clicking empty board keeps it selected and returns to select tool
+    if (this.editingId) {
+      const activeEditingId = this.editingId;
+      const rawHit = this.hitShape(w.x, w.y);
+      if (!rawHit) {
+        this.sel.clear();
+        this.sel.add(activeEditingId);
+        this.onSel?.([activeEditingId]);
+        if (this.tool !== 'select') {
+          if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+          this.tool = 'select';
+          this.onTool?.('select');
+        }
+        this.dirty = true;
+        return;
+      }
+    }
+
     // --- 1. HIT TEST for existing objects ---
     let hit: AnyShape | null = null;
 
@@ -709,11 +727,16 @@ export class CanvasEngine {
         id, type: 'sticky',
         x, y, w: 240, h: 240, fs: 14,
         bg: this.style.stickyBg, text: '',
+        createdAt: formatStickyTimestamp(),
         minX:x, minY:y, maxX:x+240, maxY:y+240
       };
       this.put(s);
+      this.sel.clear();
       this.sel.add(id); this.onSel?.([id]);
       this.saveH();
+      if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+      this.tool = 'select';
+      this.onTool?.('select');
       setTimeout(() => this.onEditText?.(s, e.clientX, e.clientY), 30);
       return;
     }
@@ -737,8 +760,12 @@ export class CanvasEngine {
         ...(textTool === 'math' ? { previewText: '' } : {}),
       };
       this.put(s);
+      this.sel.clear();
       this.sel.add(id); this.onSel?.([id]);
       this.saveH();
+      if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+      this.tool = 'select';
+      this.onTool?.('select');
       setTimeout(() => this.onEditText?.(s, e.clientX, e.clientY), 30);
       return;
     }
@@ -1733,7 +1760,7 @@ export class CanvasEngine {
     return true;
   }
 
-  private hitShape(wx: number, wy: number): AnyShape|null {
+  public hitShape(wx: number, wy: number): AnyShape|null {
     const P = 8/this.cam.zoom;
     const hits = this.rtree.search({minX:wx-P, minY:wy-P, maxX:wx+P, maxY:wy+P}) as AnyShape[];
     const point = { x: wx, y: wy };
@@ -2682,7 +2709,7 @@ export class CanvasEngine {
     this.penMode = mode;
   }
 
-  setTool(t: ToolType) {
+  setTool(t: ToolType, preserveSelection: boolean = false) {
     // Hidden catalogue entries stay resolvable for old saved shapes, but cannot be armed as a
     // new drawing tool through stale local state, shortcuts, or programmatic callers.
     if (getShapeDefinitionByToolId(t)?.pickerVisible === false) t = 'select';
@@ -2700,7 +2727,9 @@ export class CanvasEngine {
     this.connectorSourceFeedback = null;
     this.hoveredSolidControl = null;
     if (t !== 'eraser') this.eraserCursorPoint = null;
-    this.sel.clear(); this.onSel?.([]);
+    if (!preserveSelection) {
+      this.sel.clear(); this.onSel?.([]);
+    }
     this.dirty = true;
     this.onCursor?.(this.cursorForTool());
   }
@@ -2708,11 +2737,7 @@ export class CanvasEngine {
   public clearSelection() {
     this.sel.clear();
     this.onSel?.([]);
-    if (this.previousCreationTool) {
-      const restore = this.previousCreationTool;
-      this.tool = restore;
-      this.onTool?.(restore);
-    }
+    this.previousCreationTool = null;
     this.dirty = true;
   }
 
@@ -5773,7 +5798,8 @@ export class CanvasEngine {
       const previewText = s.type === 'math' ? s.previewText ?? '' : '';
       const language = s.type === 'code' ? s.language ?? '' : '';
       const source = s.type === 'image' ? s.src : '';
-      stateSignature += `${s.id}:${text}:${previewText}:${language}:${s.w}:${s.h}:${s.x}:${s.y}:${s.rotation ?? 0}:${source}:sel${this.sel.has(s.id)}|`;
+      const stickyTime = s.type === 'sticky' ? (s as StickyShape).createdAt ?? '' : '';
+      stateSignature += `${s.id}:${text}:${previewText}:${language}:${s.w}:${s.h}:${s.x}:${s.y}:${s.rotation ?? 0}:${source}:${stickyTime}:sel${this.sel.has(s.id)}|`;
     });
     stateSignature += `editing:${this.editingId}`;
 
@@ -5786,7 +5812,10 @@ export class CanvasEngine {
           overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; pointer-events:auto;"><img src="${s.src}" style="width:100%; height:100%; display:block; pointer-events:none;" /></div>`;
         } else if (s.type === 'sticky') {
           content = s.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-          overlayHtml += `<div id="ol_${s.id}" class="board-sticky-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; color:rgba(15,15,15,0.8); padding:16px; box-sizing:border-box; overflow-y:auto; overflow-x:hidden; white-space:pre-wrap; word-break:break-word; border-radius:3px; background:${s.bg}; box-shadow:0 4px 16px rgba(0,0,0,0.1); pointer-events:auto;"><div style="position:absolute; top:0; right:0; width:14px; height:14px; background:rgba(0,0,0,0.08); clip-path:polygon(100% 0, 0 0, 100% 100%);"></div>${content}</div>`;
+          const timestamp = (s as StickyShape).createdAt;
+          const timeHtml = timestamp ? `<div class="board-sticky-timestamp" style="font-size:10.5px; opacity:0.65; margin-bottom:4px; font-variant-numeric:tabular-nums; line-height:1.2; user-select:none; display:flex; align-items:center; gap:4px; font-weight:550; color:rgba(15,23,42,0.85);"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.75; flex-shrink:0;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg><span>${timestamp}</span></div>` : '';
+          const padding = timestamp ? '12px 16px 14px 16px' : '14px 16px 14px 16px';
+          overlayHtml += `<div id="ol_${s.id}" class="board-sticky-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; border-radius:4px; background:${s.bg}; box-shadow:0 4px 16px rgba(0,0,0,0.1); pointer-events:auto; overflow:hidden;"><div class="sticky-dog-ear" style="position:absolute; top:0; right:0; width:16px; height:16px; background:rgba(0,0,0,0.10); clip-path:polygon(100% 0, 0 0, 100% 100%); z-index:5; pointer-events:none;"></div><div class="board-sticky-scroll-content" style="width:100%; height:100%; overflow-y:auto; overflow-x:hidden; padding:${padding}; box-sizing:border-box; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; line-height:1.35; color:rgba(15,15,15,0.88); white-space:pre-wrap; word-break:break-word;">${timeHtml}${content}</div></div>`;
         } else if (s.type === 'math') {
           const source = s.text;
           const storedPreview = s.previewText;
@@ -5795,13 +5824,13 @@ export class CanvasEngine {
           const stalePreview = hasValidPreview && previewSource !== source;
           try {
             const ast = parseTelex(previewSource);
-            content = renderFormulaStatic(ast, (s.fs || 14));
+            content = renderFormulaToHTML(ast, (s.fs || 14));
           } catch {
             content = '<span class="fm-render-error" role="status">Formula could not be parsed; source is preserved.</span>';
           }
           const status = stalePreview ? '<span class="fm-preview-stale" role="status" aria-label="Showing the last valid formula preview">Last valid preview</span>' : '';
           const boxWidth = Math.max(48, Number(s.w) || 0), boxHeight = Math.max(36, Number(s.h) || 0);
-          overlayHtml += `<div id="ol_${s.id}" class="board-math-preview" aria-label="Rendered mathematical formula${stalePreview ? '; showing the last valid preview while the draft is invalid' : ''}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${boxWidth}px; height:${boxHeight}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${(s.fs||14)}px; color:#000; padding:16px; box-sizing:border-box; overflow:visible; background:transparent; border-radius:4px; pointer-events:auto;">${content}${status}</div>`;
+          overlayHtml += `<div id="ol_${s.id}" class="board-math-preview" aria-label="Rendered mathematical formula${stalePreview ? '; showing the last valid preview while the draft is invalid' : ''}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${boxWidth}px; height:${boxHeight}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${(s.fs||14)}px; color:#000; padding:16px; box-sizing:border-box; overflow:visible; background:transparent; border-radius:4px; pointer-events:auto; display:flex; align-items:center; justify-content:center;">${content}${status}</div>`;
         } else if (s.type === 'code') {
           const language = normalizeCodeLanguage(s.language);
           const languageLabel = CODE_LANGUAGES.find(option => option.value === language)?.label ?? language;
@@ -5812,7 +5841,7 @@ export class CanvasEngine {
           overlayHtml += `<div id="ol_${s.id}" class="board-code-preview" role="region" tabindex="0" data-language="${language}" data-highlight-engine="${engine}" aria-label="${languageLabel} syntax-highlighted code preview; source spacing and line breaks are preserved${fallbackLabel}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${(s.fs||14)}px; font-family:'JetBrains Mono','SFMono-Regular',Consolas,monospace; line-height:1.5; color:#d4d4d4; box-sizing:border-box; overflow:auto; background:#1b2430; border-radius:6px; border:1px solid #344253; pointer-events:auto; overscroll-behavior:contain;"><div class="board-code-lines">${rows}</div></div>`;
         } else if (s.type === 'text') {
           content = s.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-          overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; color:${s.color || '#1e293b'}; padding:16px; box-sizing:border-box; overflow:hidden; white-space:pre-wrap; word-break:break-word; pointer-events:auto;">${content}</div>`;
+          overlayHtml += `<div id="ol_${s.id}" class="board-text-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; line-height:1.35; color:${s.color || '#1e293b'}; padding:8px 12px; box-sizing:border-box; overflow:hidden; white-space:pre-wrap; word-break:break-word; pointer-events:auto;">${content}</div>`;
         }
 
         if (this.sel.has(s.id)) {
@@ -7816,6 +7845,21 @@ function eraserSegmentTouchesShape(
 }
 
 export { normalizeDragBox };
+
+const STICKY_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const STICKY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export function formatStickyTimestamp(date: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const dayOfWeek = STICKY_DAYS[date.getDay()];
+  const d = pad(date.getDate());
+  const monthName = STICKY_MONTHS[date.getMonth()];
+  const y = date.getFullYear();
+  const h = pad(date.getHours());
+  const min = pad(date.getMinutes());
+  const s = pad(date.getSeconds());
+  return `${dayOfWeek}, ${d} ${monthName} ${y} - ${h}:${min}:${s}`;
+}
 
 function uid() { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 

@@ -1,6 +1,6 @@
 // Responsive, independently collapsible palette for KaTeX symbols and editable structures.
 import * as React from 'react';
-import { Calculator, ChevronDown } from 'lucide-react';
+import { Calculator, ChevronDown, X } from 'lucide-react';
 import { MATH_STRUCTURE_CATALOG, type MathStructureDefinition, type MathToolCategory } from './catalog';
 import { SYMBOL_GROUPS } from './symbols';
 import { parseTelex } from './parser';
@@ -58,6 +58,8 @@ interface MathToolsPanelProps {
   onInsertStructure: (type: string) => void;
   onLoadStructuredGrid: () => StructuredGridDraft | null;
   onInsertStructuredGrid: (draft: StructuredGridDraft) => void;
+  onClose?: () => void;
+  onDragDelta?: (dx: number, dy: number) => void;
   zoom?: number;
   width?: number;
   maxHeight?: number;
@@ -134,7 +136,9 @@ const DelimiterPaletteButton = React.memo(function DelimiterPaletteButton({ opti
 });
 
 function MathToolsPanel({
-  onInsertSymbol, onInsertStructure, onLoadStructuredGrid, onInsertStructuredGrid, zoom = 1, width = 400, maxHeight,
+  onInsertSymbol, onInsertStructure, onLoadStructuredGrid, onInsertStructuredGrid,
+  onClose, onDragDelta,
+  zoom = 1, width = 400, maxHeight,
   initialExpandedSections = DEFAULT_PALETTE_EXPANDED,
 }: MathToolsPanelProps) {
   const [pos, setPos] = React.useState({ x: 0, y: 0 });
@@ -168,20 +172,14 @@ function MathToolsPanel({
   React.useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
       if (!isDragging) return;
-      let dx = event.clientX - lastMouse.current.x;
-      let dy = event.clientY - lastMouse.current.y;
-      const panelRect = panelRef.current?.getBoundingClientRect();
-      const workspaceRect = panelRef.current?.closest('.canvas-workspace')?.getBoundingClientRect();
-      if (panelRect && workspaceRect) {
-        const minX = workspaceRect.left + 8 - panelRect.left;
-        const maxX = workspaceRect.right - 8 - panelRect.right;
-        const minY = workspaceRect.top + 8 - panelRect.top;
-        const maxY = workspaceRect.bottom - 8 - panelRect.bottom;
-        dx = Math.max(minX, Math.min(dx, maxX));
-        dy = Math.max(minY, Math.min(dy, maxY));
-      }
-      setPos(current => ({ x: current.x + dx / zoom, y: current.y + dy / zoom }));
+      const dx = event.clientX - lastMouse.current.x;
+      const dy = event.clientY - lastMouse.current.y;
       lastMouse.current = { x: event.clientX, y: event.clientY };
+      if (onDragDelta) {
+        onDragDelta(dx, dy);
+      } else {
+        setPos(current => ({ x: current.x + dx / zoom, y: current.y + dy / zoom }));
+      }
     };
     const onMouseUp = () => setIsDragging(false);
     if (isDragging) {
@@ -192,7 +190,7 @@ function MathToolsPanel({
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [isDragging, zoom]);
+  }, [isDragging, zoom, onDragDelta]);
 
   React.useLayoutEffect(() => {
     const target = pendingGridCellFocus.current;
@@ -294,12 +292,31 @@ function MathToolsPanel({
 
   return (
     <div ref={panelRef} className="math-tools-panel" role="group" aria-label="Formula symbols and structures" tabIndex={-1}
-      style={{ width, maxHeight, position: 'relative', transform: `translate(${pos.x}px, ${pos.y}px)` }}
+      style={{ width, maxHeight, position: 'relative', transform: onDragDelta ? undefined : `translate(${pos.x}px, ${pos.y}px)` }}
       onPointerDown={event => event.stopPropagation()}
       onMouseDown={event => event.stopPropagation()}>
       <div className="math-tools-header" onMouseDown={onHeaderMouseDown}>
-        <Calculator size={14} className="icon" aria-hidden="true" />
-        <span className="title">Math Tools</span>
+        <div className="math-tools-header-left">
+          <Calculator size={15} className="icon" aria-hidden="true" />
+          <span className="title">Math Tools</span>
+        </div>
+        {onClose && (
+          <button
+            type="button"
+            className="math-tools-close-btn"
+            onClick={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              onClose();
+            }}
+            onMouseDown={event => event.stopPropagation()}
+            title="Đóng bảng công thức (thu gọn vào Math Formula)"
+            aria-label="Đóng bảng công thức"
+          >
+            <X size={14} aria-hidden="true" />
+            <span>Đóng</span>
+          </button>
+        )}
       </div>
 
       <div className="math-tools-body">

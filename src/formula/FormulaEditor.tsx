@@ -7,6 +7,7 @@ import { renderFormulaToHTML } from './renderer';
 import { parseRenderableFormula, resolveInitialFormulaPreview } from './validation';
 import { createRow, createPlaceholder, createText } from './ast';
 import { structureById } from './catalog';
+import { PanelRightClose, PanelRightOpen } from 'lucide-react';
 import MathToolsPanel from './MathToolsPanel';
 import FormulaSourceEditor, { type FormulaSourceEditorHandle } from './FormulaSourceEditor';
 import { LatestPreviewGate } from './latestPreview';
@@ -76,8 +77,58 @@ export default function FormulaEditor({
   const [sourceContentHeight, setSourceContentHeight] = useState(60);
   const [toolsMaxHeight, setToolsMaxHeight] = useState<number | undefined>(undefined);
   const [workspaceSize, setWorkspaceSize] = useState({ w: view.w, h: view.h });
-  const [panelPosition, setPanelPosition] = useState({ editorX: 0, editorY: 0, toolsX: 0, toolsY: 0 });
+
+  const safeZoom = Math.max(0.01, zoom);
+  const availableView = {
+    w: workspaceSize.w > 0 ? workspaceSize.w : view.w,
+    h: workspaceSize.h > 0 ? workspaceSize.h : view.h,
+  };
+  const screenX = (worldX - cam.x) * zoom + availableView.w / 2;
+  const screenY = (worldY - cam.y) * zoom + availableView.h / 2;
+  const editorWidth = Math.max(1, Math.min(520, Math.max(1, availableView.w - 24) / safeZoom));
+  const toolsWidth = Math.max(1, Math.min(360, availableView.w - 16));
+
+  const [panelPosition, setPanelPosition] = useState(() => {
+    const margin = 8;
+    const clamp = (value: number, max: number) => Math.min(Math.max(value, margin), Math.max(margin, max - margin));
+    const initW = view.w > 0 ? view.w : 1200;
+    const initH = view.h > 0 ? view.h : 800;
+    const edW = Math.max(1, Math.min(520, Math.max(1, initW - 24) / safeZoom));
+    const scX = (worldX - cam.x) * zoom + initW / 2;
+    const scY = (worldY - cam.y) * zoom + initH / 2;
+    return {
+      editorX: clamp(scX, initW - edW),
+      editorY: clamp(scY, initH - 120),
+    };
+  });
+
+  const [toolsPos, setToolsPos] = useState<{ x: number; y: number }>(() => {
+    const initW = view.w > 0 ? view.w : 1200;
+    const initH = view.h > 0 ? view.h : 800;
+    const edW = Math.max(1, Math.min(520, Math.max(1, initW - 24) / safeZoom));
+    const tW = Math.max(1, Math.min(360, initW - 16));
+    const scX = (worldX - cam.x) * zoom + initW / 2;
+    const scY = (worldY - cam.y) * zoom + initH / 2;
+    const margin = 8;
+    const clamp = (value: number, max: number) => Math.min(Math.max(value, margin), Math.max(margin, max - margin));
+    const edX = clamp(scX, initW - edW);
+    const edY = clamp(scY, initH - 120);
+
+    if (initW - (edX + edW) >= tW + 16) {
+      return { x: edX + edW + 16, y: Math.max(16, Math.min(edY, initH - 450)) };
+    }
+    if (edX >= tW + 16) {
+      return { x: Math.max(16, edX - tW - 16), y: Math.max(16, Math.min(edY, initH - 450)) };
+    }
+    // If horizontally tight, pick whichever side has more room and offset
+    if (initW - (edX + edW) >= edX) {
+      return { x: Math.max(16, initW - tW - 16), y: Math.max(16, Math.min(edY, initH - 450)) };
+    }
+    return { x: 16, y: Math.max(16, Math.min(edY, initH - 450)) };
+  });
+
   const [isDragging, setIsDragging] = useState(false);
+  const [showTools, setShowTools] = useState(true);
 
   const sourceEditorRef = useRef<FormulaSourceEditorHandle>(null);
   const structuredGridRangeRef = useRef<{ start: number; end: number; source: string } | null>(null);
@@ -101,16 +152,6 @@ export default function FormulaEditor({
     onASTChangeRef.current = onASTChange;
   }, [onTextChange, onCommit, onResize, onASTChange]);
 
-  const safeZoom = Math.max(0.01, zoom);
-  const availableView = {
-    w: workspaceSize.w > 0 ? workspaceSize.w : view.w,
-    h: workspaceSize.h > 0 ? workspaceSize.h : view.h,
-  };
-  const screenX = (worldX - cam.x) * zoom + availableView.w / 2;
-  const screenY = (worldY - cam.y) * zoom + availableView.h / 2;
-  const editorWidth = Math.max(1, Math.min(560, Math.max(1, availableView.w - 24) / safeZoom));
-  // Leave room beside the editor on wide workspaces, but let the palette use most of narrow viewports.
-  const toolsWidth = Math.max(1, Math.min(640, availableView.w - 16, 300 + availableView.w * 0.42));
   const maxPanelHeight = Math.max(1, (availableView.h - 16) / safeZoom);
   const sourceChromeHeight = EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT +
     (sourceError ? SOURCE_ERROR_HEIGHT : 0) + EDITOR_BORDER_ALLOWANCE;
@@ -375,84 +416,85 @@ export default function FormulaEditor({
     requestSourceMode(true);
   }, [requestSourceMode]);
 
+  const openToolsSafe = useCallback(() => {
+    setShowTools(true);
+    const workspace = editorPanelRef.current?.parentElement;
+    const editor = editorPanelRef.current;
+    const wsW = workspace ? workspace.getBoundingClientRect().width : availableView.w;
+    const wsH = workspace ? workspace.getBoundingClientRect().height : availableView.h;
+    const edRect = editor ? editor.getBoundingClientRect() : null;
+    const wsRect = workspace ? workspace.getBoundingClientRect() : null;
+    const edX = edRect && wsRect ? edRect.left - wsRect.left : panelPosition.editorX;
+    const edY = edRect && wsRect ? edRect.top - wsRect.top : panelPosition.editorY;
+    const edW = edRect ? edRect.width : editorWidth;
+    const tW = toolsWidth;
+
+    let targetX = 16;
+    let targetY = 16;
+    if (wsW - (edX + edW) >= tW + 16) {
+      targetX = edX + edW + 16;
+      targetY = Math.max(16, Math.min(edY, wsH - 450));
+    } else if (edX >= tW + 16) {
+      targetX = Math.max(16, edX - tW - 16);
+      targetY = Math.max(16, Math.min(edY, wsH - 450));
+    } else if (wsW - (edX + edW) >= edX) {
+      targetX = Math.max(16, wsW - tW - 16);
+      targetY = Math.max(16, Math.min(edY, wsH - 450));
+    } else {
+      targetX = 16;
+      targetY = Math.max(16, Math.min(edY, wsH - 450));
+    }
+    setToolsPos({ x: targetX, y: targetY });
+    setToolsMaxHeight(Math.max(220, wsH - 40));
+  }, [availableView.w, availableView.h, panelPosition.editorX, panelPosition.editorY, editorWidth, toolsWidth]);
+
+  const handleToolsDragDelta = useCallback((dx: number, dy: number) => {
+    setToolsPos(curr => {
+      const maxX = Math.max(16, availableView.w - toolsWidth - 8);
+      const maxY = Math.max(16, availableView.h - 52);
+      return {
+        x: Math.min(Math.max(8, curr.x + dx), maxX),
+        y: Math.min(Math.max(8, curr.y + dy), maxY),
+      };
+    });
+  }, [availableView.w, availableView.h, toolsWidth]);
+
   const repositionPanels = useCallback(() => {
     const editor = editorPanelRef.current;
-    const tools = toolsContainerRef.current;
     const workspace = editor?.parentElement;
-    if (!editor || !tools || !workspace) return;
+    if (!editor || !workspace) return;
     const workspaceRect = workspace.getBoundingClientRect();
     const editorRect = editor.getBoundingClientRect();
-    const toolsWrapperRect = tools.getBoundingClientRect();
-    const toolsSurface = tools.querySelector('.math-tools-panel') as HTMLDivElement | null;
-    const toolsRect = toolsSurface?.getBoundingClientRect() ?? toolsWrapperRect;
-    const toolsOffsetX = toolsRect.left - toolsWrapperRect.left;
-    const toolsOffsetY = toolsRect.top - toolsWrapperRect.top;
     const margin = 8;
-    const gap = 8;
     const clamp = (value: number, max: number) => Math.min(Math.max(value, margin), Math.max(margin, max - margin));
 
+    // The Formula Editor is the primary focus; it can move freely across the entire workspace height & width
     const editorX = clamp(screenX, workspaceRect.width - editorRect.width);
-    let editorY = clamp(screenY, workspaceRect.height - editorRect.height);
-    const maxToolsX = workspaceRect.width - toolsRect.width;
-    const maxToolsY = workspaceRect.height - toolsRect.height;
-    const leftX = editorX - toolsRect.width - gap;
-    const rightFits = editorX + editorRect.width + gap + toolsRect.width <= workspaceRect.width - margin;
-    const leftFits = leftX >= margin;
-    const stackHeightLimit = Math.max(1, workspaceRect.height - margin * 2 - editorRect.height - gap);
-    const requestedToolsMaxHeight = !rightFits && !leftFits ? stackHeightLimit : undefined;
-    setToolsMaxHeight(current => current === requestedToolsMaxHeight ||
-      (current !== undefined && requestedToolsMaxHeight !== undefined && Math.abs(current - requestedToolsMaxHeight) < 0.5)
-      ? current : requestedToolsMaxHeight);
+    const editorY = clamp(screenY, workspaceRect.height - editorRect.height);
 
-    let toolsX = editorX + editorRect.width + gap;
-    let toolsY = editorY;
-
-    if (toolsX + toolsRect.width > workspaceRect.width - margin) {
-      if (leftX >= margin) {
-        toolsX = leftX;
-      } else {
-        toolsX = clamp(editorX, maxToolsX);
-        const stackedHeight = editorRect.height + gap + toolsRect.height;
-        if (stackedHeight <= workspaceRect.height - margin * 2) {
-          const clampRange = (value: number, min: number, max: number) => Math.min(Math.max(value, min), Math.max(min, max));
-          const belowEditorY = clampRange(screenY, margin, workspaceRect.height - margin - stackedHeight);
-          const aboveEditorY = clampRange(screenY, margin + toolsRect.height + gap, workspaceRect.height - editorRect.height - margin);
-          if (Math.abs(belowEditorY - screenY) <= Math.abs(aboveEditorY - screenY)) {
-            editorY = belowEditorY;
-            toolsY = editorY + editorRect.height + gap;
-          } else {
-            editorY = aboveEditorY;
-            toolsY = editorY - toolsRect.height - gap;
-          }
-        } else {
-          toolsY = clamp(editorY + editorRect.height + gap, maxToolsY);
-        }
-      }
-    }
-
-    toolsX = clamp(toolsX, maxToolsX);
-    toolsY = clamp(toolsY, maxToolsY);
-    const toolsWrapperX = toolsX - toolsOffsetX;
-    const toolsWrapperY = toolsY - toolsOffsetY;
     setPanelPosition(current => {
-      if (Math.abs(current.editorX - editorX) < 0.5 && Math.abs(current.editorY - editorY) < 0.5 &&
-          Math.abs(current.toolsX - toolsWrapperX) < 0.5 && Math.abs(current.toolsY - toolsWrapperY) < 0.5) return current;
-      return { editorX, editorY, toolsX: toolsWrapperX, toolsY: toolsWrapperY };
+      if (Math.abs(current.editorX - editorX) < 0.5 && Math.abs(current.editorY - editorY) < 0.5) return current;
+      return { editorX, editorY };
     });
   }, [screenX, screenY]);
+
+  // Initialize Math Tools position safely when first shown
+  useLayoutEffect(() => {
+    if (showTools && !toolsPos) {
+      openToolsSafe();
+    }
+  }, [showTools, toolsPos, openToolsSafe]);
 
   useLayoutEffect(() => {
     const frame = window.requestAnimationFrame(repositionPanels);
     return () => window.cancelAnimationFrame(frame);
-  }, [repositionPanels, editorWidth, toolsWidth, maxPanelHeight, toolsMaxHeight, mode, sourceContentHeight, sourceError]);
+  }, [repositionPanels, editorWidth, maxPanelHeight, mode, sourceContentHeight, sourceError]);
 
   useLayoutEffect(() => {
     const editor = editorPanelRef.current;
-    const tools = toolsContainerRef.current?.querySelector('.math-tools-panel');
-    if (!editor || !tools || typeof ResizeObserver === 'undefined') return;
+    if (!editor || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => repositionPanels());
     observer.observe(editor);
-    observer.observe(tools);
     return () => observer.disconnect();
   }, [repositionPanels]);
 
@@ -518,6 +560,23 @@ export default function FormulaEditor({
             <button type="button" aria-pressed={mode === 'rendered'} onClick={showRenderedEquation}>Rendered</button>
             <button type="button" aria-pressed={mode === 'source'} onClick={() => requestSourceMode(true)}>Edit LaTeX</button>
           </div>
+          <button
+            type="button"
+            className={`formula-editor-tools-toggle ${showTools ? 'is-active' : ''}`}
+            onClick={() => {
+              if (showTools) {
+                setShowTools(false);
+              } else {
+                openToolsSafe();
+              }
+            }}
+            title={showTools ? 'Thu gọn bảng công thức (Math Tools)' : 'Mở bảng công thức (Math Tools)'}
+            aria-label={showTools ? 'Thu gọn bảng công thức' : 'Mở bảng công thức'}
+            aria-expanded={showTools}
+          >
+            {showTools ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
+            <span>Công thức</span>
+          </button>
           <button type="button" className="formula-editor-done" onClick={commitDraft} aria-label="Finish editing formula" title="Finish editing">
             Done
           </button>
@@ -556,29 +615,33 @@ export default function FormulaEditor({
         </div>
       </div>
 
-      <div
-        ref={toolsContainerRef}
-        className="math-tools-pinned-container"
-        style={{
-          position: 'absolute',
-          left: panelPosition.toolsX,
-          top: panelPosition.toolsY,
-          zIndex: 1000,
-          pointerEvents: 'none',
-        }}
-      >
-        <div style={{ pointerEvents: 'auto' }}>
-          <MathToolsPanel
-            onInsertSymbol={insertSymbol}
-            onInsertStructure={insertStructure}
-            onLoadStructuredGrid={loadStructuredGrid}
-            onInsertStructuredGrid={insertStructuredGrid}
-            width={toolsWidth}
-            maxHeight={toolsMaxHeight}
-            zoom={1}
-          />
+      {showTools && (
+        <div
+          ref={toolsContainerRef}
+          className="math-tools-pinned-container"
+          style={{
+            position: 'absolute',
+            left: toolsPos.x,
+            top: toolsPos.y,
+            zIndex: 1000,
+            pointerEvents: 'none',
+          }}
+        >
+          <div style={{ pointerEvents: 'auto' }}>
+            <MathToolsPanel
+              onInsertSymbol={insertSymbol}
+              onInsertStructure={insertStructure}
+              onLoadStructuredGrid={loadStructuredGrid}
+              onInsertStructuredGrid={insertStructuredGrid}
+              onClose={() => setShowTools(false)}
+              onDragDelta={handleToolsDragDelta}
+              width={toolsWidth}
+              maxHeight={toolsMaxHeight}
+              zoom={1}
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Offscreen KaTeX measurement is used only to fit the rendered board shape, never shown as an editor preview. */}
       <div

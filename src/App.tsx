@@ -1,12 +1,12 @@
 import * as React from 'react';
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import {
   MousePointer2, PenLine, Eraser, StickyNote, Type, Sparkles,
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
   Copy, Trash2, Palette, X, ChevronDown, Check, Search,
-  Code, Calculator
+  Code, Calculator, LassoSelect, Star, Clock
 } from 'lucide-react';
 import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
@@ -22,7 +22,7 @@ import { searchShapeDefinitions } from './engine/shapes/search';
 import { solid3DLocalAxisSpans, solid3DLocalDimensions, solid3DScaleFromBounds, solid3DSizeSemantics, type Solid3DGeometry, type Solid3DScale } from './engine/shapes/solid3d';
 import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
-  continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, yShapes,
+  continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, subscribeBoardRuntimeStatus, yShapes,
 } from './store/useBoardStore';
 import BoardStatusBanner from './store/BoardStatusBanner';
 import FormulaEditor from './formula/FormulaEditor';
@@ -105,7 +105,7 @@ const HUD_UTILITY_TOOLS: ReadonlyArray<{ label: string; Icon: LucideIcon }> = [
 
 const SELECT_TOOLS: { id: ToolType; Icon: LucideIcon; label: string }[] = [
   { id: 'select', Icon: MousePointer2, label: 'Select' },
-  { id: 'lasso-select', Icon: MousePointer2, label: 'Lasso Select' }, // Reuse icon for now
+  { id: 'lasso-select', Icon: LassoSelect, label: 'Lasso Select' },
 ];
 
 const TEXT_TOOLS: { id: ToolType; Icon: LucideIcon; label: string }[] = [
@@ -311,12 +311,41 @@ function PopoverItem({ active, onClick, Icon, preview, label, grid, shapeId, sol
   );
 }
 
-function SideBtn({ label, active, expanded, buttonRef, onClick, children }: { label: string; active?: boolean; expanded?: boolean; buttonRef?: React.Ref<HTMLButtonElement>; onClick: (e: React.MouseEvent) => void; children: React.ReactNode }) {
+function SideBtn({
+  label,
+  shortcut,
+  active,
+  expanded,
+  hasSubmenu,
+  buttonRef,
+  onClick,
+  children
+}: {
+  label: string;
+  shortcut?: string;
+  active?: boolean;
+  expanded?: boolean;
+  hasSubmenu?: boolean;
+  buttonRef?: React.Ref<HTMLButtonElement>;
+  onClick: (e: React.MouseEvent) => void;
+  children: React.ReactNode;
+}) {
   return (
     <button ref={buttonRef} type="button" onClick={onClick} aria-label={label} title={label} aria-pressed={active} aria-expanded={expanded}
-      className="side-btn">
-      {children}
-      <span className="side-tooltip" aria-hidden="true">{label}</span>
+      className={`side-btn${active ? ' active' : ''}`}>
+      {active && <span className="side-active-bar" aria-hidden="true" />}
+      <span className="side-btn-content">{children}</span>
+      {hasSubmenu && (
+        <span className="side-submenu-indicator" aria-hidden="true">
+          <svg width="5" height="5" viewBox="0 0 5 5" fill="none">
+            <path d="M0.8 4.2L4.2 4.2L4.2 0.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </span>
+      )}
+      <span className="side-tooltip" aria-hidden="true">
+        <span className="side-tooltip-text">{label}</span>
+        {shortcut && <kbd className="side-tooltip-kbd">{shortcut}</kbd>}
+      </span>
     </button>
   );
 }
@@ -376,6 +405,8 @@ export default function App() {
   };
 
   const [editText, setEditText] = useState('');
+  const boardRuntimeStatus = useSyncExternalStore(subscribeBoardRuntimeStatus, getBoardRuntimeStatus, getBoardRuntimeStatus);
+  const justCommittedShapeRef = useRef<{ id: string; time: number } | null>(null);
   const [boardReady, setBoardReady] = useState(false);
   const [boardRestoreError, setBoardRestoreError] = useState<string | null>(null);
   const [editLanguage, setEditLanguage] = useState<CodeLanguage>(DEFAULT_CODE_LANGUAGE);
@@ -460,17 +491,33 @@ export default function App() {
   const [shapeCategory, setShapeCategory] = useState<ShapeCategory>('Basic');
   const [shapeSearch, setShapeSearch] = useState('');
   const [lastSelectTool, setLastSelectTool] = useState<ToolType>('select');
+  const [isFavorite, setIsFavorite] = useState(false);
+  const previousCreationToolRef = useRef<ToolType | null>(null);
+  const isSwitchingToolRef = useRef(false);
 
-  const setTool = useCallback((t: ToolType, keepOpen: boolean = false, contextCategory?: ShapeCategory) => {
-    setToolSt(t);
-    // When manually selecting a tool, close any other open groups
-    if (!keepOpen) setOpenGroup(null);
-    const shapeTool = SHAPE_TOOLS.find(item => item.id === t);
-    if (shapeTool) engRef.current?.setDiagramContext(umlFamilyForCategory(contextCategory ?? shapeTool.definition.category ?? shapeCategory));
-    engRef.current?.setTool(t);
-    if (['text', 'math', 'code'].includes(t)) setLastTextTool(t);
-    if (shapeTool) setLastShapeTool(t);
-    if (['select', 'lasso-select'].includes(t)) setLastSelectTool(t);
+  const setTool = useCallback((t: ToolType, keepOpen: boolean = false, contextCategory?: ShapeCategory, preserveSelection: boolean = false, isAutoSwitch: boolean = false) => {
+    isSwitchingToolRef.current = true;
+    try {
+      setToolSt(t);
+      // When manually selecting a tool, close any other open groups
+      if (!keepOpen) setOpenGroup(null);
+      const shapeTool = SHAPE_TOOLS.find(item => item.id === t);
+      if (shapeTool) engRef.current?.setDiagramContext(umlFamilyForCategory(contextCategory ?? shapeTool.definition.category ?? shapeCategory));
+      engRef.current?.setTool(t, preserveSelection);
+      if (['text', 'math', 'code'].includes(t)) setLastTextTool(t);
+      if (shapeTool) setLastShapeTool(t);
+      if (['select', 'lasso-select'].includes(t)) setLastSelectTool(t);
+
+      if (!isAutoSwitch) {
+        if (['select', 'lasso-select', 'eraser', 'hand'].includes(t)) {
+          previousCreationToolRef.current = null;
+        } else {
+          previousCreationToolRef.current = t;
+        }
+      }
+    } finally {
+      isSwitchingToolRef.current = false;
+    }
   }, [shapeCategory]);
 
   const choosePopoverTool = (t: ToolType, contextCategory?: ShapeCategory) => {
@@ -676,6 +723,12 @@ export default function App() {
       setSelectedShape(ids.length === 1 ? eng.getShape(ids[0]) : null);
       setSemanticEditNotice(null);
       if (ids.length !== 1) setShapePropertiesOpen(false);
+
+      if (!isSwitchingToolRef.current && ids.length === 0 && previousCreationToolRef.current) {
+        const restore = previousCreationToolRef.current;
+        previousCreationToolRef.current = null;
+        setTool(restore, false, undefined, false, false);
+      }
     };
     eng.onGraphUpdate = diagnostics => setGraphDiagnostics(diagnostics);
     setGraphDiagnostics(eng.getDiagramGraphDiagnostics());
@@ -1103,9 +1156,10 @@ export default function App() {
     } else if (shape.type === 'math') {
       const storedPreview = getLastValidFormulaPreview() || shape.previewText || '';
       const previewText = lastValidPreview ?? storedPreview;
-      if (!committedText.trim() && !previewText.trim()) eng.deleteShape(shape.id);
-      else eng.updateFormula(shape.id, committedText, previewText);
-    } else if (committedText.trim() === '' && !isFixedShapeLabel(shape)) {
+      const finalSource = committedText.trim() ? committedText : '\\square';
+      const finalPreview = previewText.trim() ? previewText : '\\square';
+      eng.updateFormula(shape.id, finalSource, finalPreview);
+    } else if (committedText.trim() === '' && !isFixedShapeLabel(shape) && shape.type !== 'sticky') {
       eng.deleteShape(shape.id);
     } else if (shape.type === 'code') {
       const current = eng.getShape(shape.id);
@@ -1114,6 +1168,9 @@ export default function App() {
     } else {
       eng.updateText(shape.id, committedText);
     }
+    const committedId = shape.id;
+    justCommittedShapeRef.current = { id: committedId, time: performance.now() };
+
     // Commit the model while the engine still suppresses its DOM preview, then release that
     // ownership in the same turn that tears down the React editor. Only the committed preview
     // remains as the final board representation.
@@ -1125,6 +1182,19 @@ export default function App() {
     internalSetEditShape(null);
     textFocusShapeIdRef.current = null;
     eng.setEditingId(null);
+
+    // Keep the finished shape in selected preview state, and switch tool to select
+    const finalShape = eng.getShape(committedId);
+    if (finalShape) {
+      if (eng.tool !== 'select') {
+        eng.setTool('select', true);
+        setTool('select', false, undefined, true, true);
+      }
+      eng.sel.clear();
+      eng.sel.add(committedId);
+      eng.onSel?.([committedId]);
+      setSelectedShape(finalShape);
+    }
   }, [getLastValidFormulaPreview]);
 
   const commitAndAdvanceClassifierMember = useCallback(() => {
@@ -1455,15 +1525,36 @@ export default function App() {
       '--aw-cursor-move': HIGH_CONTRAST_CURSORS.move,
     } as React.CSSProperties}>
 
-      {/* ══ TOPBAR ══════════════════════════════════════════════════════════ */}
+      {/* ══ TOPBAR (MIRO INSPIRED) ══════════════════════════════════════════ */}
       <header className="app-header">
         <div className="header-brand">
-          <svg className="brand-mark" width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
-            <rect width="28" height="28" rx="7" fill="#F2A310" />
-            <path d="M7 20l7-12 7 12h-2.5l-1.5-3h-6l-1.5 3H7zm4-5h6l-3-6-3 6z" fill="#111" />
-          </svg>
-          <span className="header-brand-label">antiwhite</span>
+          <div className="brand-logo-container">
+            <svg className="brand-mark" width="30" height="30" viewBox="0 0 64 64" fill="none" aria-label="Antiwhite logo">
+              <defs>
+                <linearGradient id="hdrAwBg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stopColor="#E0F7FA"/>
+                  <stop offset="100%" stopColor="#BAE6FD"/>
+                </linearGradient>
+                <filter id="hdrAwWShadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" floodColor="#0f172a" floodOpacity="0.38"/>
+                </filter>
+                <filter id="hdrAwAShadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="1" stdDeviation="1" floodColor="#991b1b" floodOpacity="0.25"/>
+                </filter>
+              </defs>
+              <circle cx="32" cy="32" r="29.5" fill="url(#hdrAwBg)" stroke="#38BDF8" strokeWidth="2.5"/>
+              <circle cx="32" cy="32" r="27" fill="none" stroke="#0EA5E9" strokeWidth="0.75" strokeOpacity="0.35"/>
+              <path d="M32 10.5L48.5 51.5H39.8L35.7 40H28.3L24.2 51.5H15.5L32 10.5ZM32 23.5L29.6 33.2H34.4L32 23.5Z" 
+                    fill="#DC2626" fillRule="evenodd" filter="url(#hdrAwAShadow)"/>
+              <path d="M19.5 31.5L25.8 49L32 35.5L38.2 49L44.5 31.5" 
+                    stroke="#FFFFFF" strokeWidth="4.8" strokeLinecap="round" strokeLinejoin="round" filter="url(#hdrAwWShadow)"/>
+            </svg>
+          </div>
+          <div className="header-brand-info">
+            <span className="header-brand-label">Antiwhite</span>
+          </div>
         </div>
+
         <span className="header-divider" aria-hidden="true" />
 
         <div className="header-board">
@@ -1478,40 +1569,60 @@ export default function App() {
               autoFocus />
           ) : (
             <button onClick={() => { setEditName(true); setTimeout(() => nameRef.current?.select(), 15); }}
-              className="header-board-name">
+              className="header-board-name group" title="Click to rename board">
               <span className="header-board-title">{boardName}</span>
-              <ChevronDown size={14} aria-hidden="true" />
+              <ChevronDown size={13} className="header-board-chevron" aria-hidden="true" />
             </button>
           )}
+
+          <button type="button" onClick={() => setIsFavorite(v => !v)}
+            className={`header-star-btn${isFavorite ? ' active' : ''}`}
+            title={isFavorite ? 'Remove from favorites' : 'Mark as favorite'}
+            aria-label="Star board">
+            <Star size={14} className={isFavorite ? 'fill-amber-400 text-amber-500' : 'text-gray-400'} />
+          </button>
+
+          <div className="header-sync-status" title="All changes saved locally &amp; synced">
+            <span className="header-sync-dot" />
+            <span className="header-sync-text">Saved</span>
+          </div>
         </div>
 
         <div className="header-spacer" />
-        <div className="header-presence" role="img" aria-label="Sample collaborator avatars; collaboration is not connected">
-          <span className="presence-label">Sample</span>
+
+        <div className="header-presence" role="img" aria-label="Collaborators presence">
           <div className="presence-avatars" aria-hidden="true">
-            {['#6366f1', '#22c55e', '#f97316'].map((c, i) => (
-              <div key={i} className="presence-avatar" style={{ background: c, zIndex: 3 - i }}>{String.fromCharCode(65 + i)}</div>
-            ))}
+            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #6366f1, #4338ca)', zIndex: 3 }} title="Alex Rivera (Active)">AR</div>
+            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #10b981, #059669)', zIndex: 2 }} title="Sarah Chen (Active)">SC</div>
+            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #f59e0b, #d97706)', zIndex: 1 }} title="David Kim (Active)">DK</div>
           </div>
+          <span className="presence-badge">+2</span>
         </div>
+
         <span className="header-action-divider" aria-hidden="true" />
+
         <div className="header-actions">
           <button type="button" disabled title="Presentation is not available yet" aria-label="Present (not available yet)"
             className="header-action header-action-secondary">
-            <Play size={14} strokeWidth={2.25} className="fill-current" /><span className="header-action-label">Present</span>
+            <Play size={13} strokeWidth={2.4} className="fill-current" />
+            <span className="header-action-label">Present</span>
           </button>
           <button type="button" disabled title="Sharing is not available yet" aria-label="Share (not available yet)"
-            className="header-action header-action-primary">
-            <Share2 size={14} strokeWidth={2.25} /><span className="header-action-label">Share</span>
+            className="header-action header-action-share">
+            <Share2 size={13} strokeWidth={2.4} />
+            <span className="header-action-label">Share</span>
           </button>
-          <div className="header-user-avatar" aria-hidden="true">U</div>
+          <div className="header-user-avatar" title="Your Profile (Online)" aria-hidden="true">
+            <span>U</span>
+            <span className="header-user-online-dot" />
+          </div>
         </div>
       </header>
 
       {/* ══ BODY ════════════════════════════════════════════════════════════ */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
 
-        {/* SIDEBAR */}
+        {/* SIDEBAR (MIRO FLOATING/DOCKED TOOL RAIL WITH LARGER ICONS) */}
         <aside onKeyDown={e => {
           if (!openGroup) return;
           if (e.key === 'Escape') {
@@ -1527,12 +1638,12 @@ export default function App() {
           <div className="tool-stack">
             {/* SELECT GROUP */}
             <div ref={el => { popoverAnchorRefs.current.select = el }} className="tool-group">
-              <SideBtn label="Select Tools" active={['select', 'lasso-select'].includes(tool)} expanded={openGroup === 'select'}
+              <SideBtn label="Select Tools" shortcut="V" active={['select', 'lasso-select'].includes(tool)} expanded={openGroup === 'select'} hasSubmenu
                 onClick={() => { const next = openGroup === 'select' ? null : 'select'; setOpenGroup(next); if (next) setTool(lastSelectTool, true); }}>
                 {(() => {
                   const active = ['select', 'lasso-select'].includes(tool) ? tool : lastSelectTool;
                   const entry = SELECT_TOOLS.find(t => t.id === active);
-                  return entry ? <entry.Icon size={17} /> : <MousePointer2 size={17} />;
+                  return entry ? <entry.Icon size={23} strokeWidth={2} /> : <MousePointer2 size={23} strokeWidth={2} />;
                 })()}
               </SideBtn>
               {openGroup === 'select' && (
@@ -1547,10 +1658,12 @@ export default function App() {
             </div>
 
             <div className="tool-divider" aria-hidden="true" />
+
+            {/* PEN GROUP */}
             <div ref={el => { popoverAnchorRefs.current.pen = el }} className="tool-group">
-              <SideBtn label="Pen modes" active={tool === 'pen'} expanded={openGroup === 'pen'}
+              <SideBtn label="Pen &amp; Smart Drawing" shortcut="P" active={tool === 'pen'} expanded={openGroup === 'pen'} hasSubmenu
                 onClick={() => { const next = openGroup === 'pen' ? null : 'pen'; setOpenGroup(next); if (next) setTool('pen', true); }}>
-                {penMode === 'smart' ? <Sparkles size={17} /> : <PenLine size={17} />}
+                {penMode === 'smart' ? <Sparkles size={23} strokeWidth={2} /> : <PenLine size={23} strokeWidth={2} />}
               </SideBtn>
               {openGroup === 'pen' && (
                 <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Pen drawing modes" onKeyDown={handlePopoverNavigation}
@@ -1561,19 +1674,28 @@ export default function App() {
                 </div>
               )}
             </div>
-            <SideBtn label="Eraser" active={tool === 'eraser'} onClick={() => setTool('eraser')}><Eraser size={17} /></SideBtn>
+
+            {/* ERASER */}
+            <SideBtn label="Eraser" shortcut="E" active={tool === 'eraser'} onClick={() => setTool('eraser')}>
+              <Eraser size={23} strokeWidth={2} />
+            </SideBtn>
+
             <div className="tool-divider" aria-hidden="true" />
-            <SideBtn label="Sticky (S)" active={tool === 'sticky'} onClick={() => setTool('sticky')}><StickyNote size={17} /></SideBtn>
+
+            {/* STICKY */}
+            <SideBtn label="Sticky Note" shortcut="S" active={tool === 'sticky'} onClick={() => setTool('sticky')}>
+              <StickyNote size={23} strokeWidth={2} />
+            </SideBtn>
 
             {/* TEXT GROUP */}
             <div ref={el => { popoverAnchorRefs.current.text = el }} className="tool-group">
-              <SideBtn label="Text Tools" active={['text', 'math', 'code'].includes(tool)} expanded={openGroup === 'text'}
+              <SideBtn label="Text, Math &amp; Code" shortcut="T" active={['text', 'math', 'code'].includes(tool)} expanded={openGroup === 'text'} hasSubmenu
                 onClick={() => { const next = openGroup === 'text' ? null : 'text'; setOpenGroup(next); if (next) setTool(lastTextTool, true); }}>
                 {(() => {
                   const active = ['text', 'math', 'code'].includes(tool) ? tool : lastTextTool;
-                  if (active === 'math') return <Calculator size={17} />;
-                  if (active === 'code') return <Code size={17} />;
-                  return <Type size={17} />;
+                  if (active === 'math') return <Calculator size={23} strokeWidth={2} />;
+                  if (active === 'code') return <Code size={23} strokeWidth={2} />;
+                  return <Type size={23} strokeWidth={2.2} />;
                 })()}
               </SideBtn>
               {openGroup === 'text' && (
@@ -1589,12 +1711,12 @@ export default function App() {
 
             {/* SHAPES GROUP */}
             <div ref={el => { popoverAnchorRefs.current.shapes = el }} className="tool-group">
-              <SideBtn label="Shapes" active={SHAPE_TOOLS.some(s => s.id === tool)} expanded={openGroup === 'shapes'}
+              <SideBtn label="Shapes &amp; UML" shortcut="O" active={SHAPE_TOOLS.some(s => s.id === tool)} expanded={openGroup === 'shapes'} hasSubmenu
                 onClick={() => { const next = openGroup === 'shapes' ? null : 'shapes'; setOpenGroup(next); if (next) setTool(lastShapeTool, true); }}>
                 {(() => {
                   const active = SHAPE_TOOLS.some(s => s.id === tool) ? tool : lastShapeTool;
                   const entry = SHAPE_TOOLS.find(s => s.id === active) ?? SHAPE_TOOLS[0];
-                  return <ShapePreview definition={entry.definition} size={21} />;
+                  return <ShapePreview definition={entry.definition} size={25} />;
                 })()}
               </SideBtn>
               {openGroup === 'shapes' && (
@@ -1636,19 +1758,23 @@ export default function App() {
             </div>
 
             <div className="tool-divider" aria-hidden="true" />
-            <SideBtn label="Image (I)" onClick={onImageToolClick}>
-              <ImageIcon size={17} />
+            <SideBtn label="Upload Image" shortcut="I" onClick={onImageToolClick}>
+              <ImageIcon size={23} strokeWidth={2} />
             </SideBtn>
           </div>
           <div className="tool-stack tool-stack-bottom">
             <div className="tool-divider" aria-hidden="true" />
-            <SideBtn label="Colors & Styles" active={panelOpen} expanded={panelOpen} buttonRef={panelTriggerRef} onClick={() => setPanelOpen(v => !v)}>
-              <div className="w-5 h-5 rounded-full border-2 border-white/30 overflow-hidden">
-                <div className="w-full h-full rounded-full" style={{ background: penColor }} />
+            <SideBtn label="Colors &amp; Styles" active={panelOpen} expanded={panelOpen} buttonRef={panelTriggerRef} onClick={() => setPanelOpen(v => !v)}>
+              <div className="sidebar-palette-swatch" style={{ borderColor: panelOpen ? '#4262FF' : 'rgba(0, 0, 0, 0.14)' }}>
+                <div className="sidebar-palette-fill" style={{ background: penColor }} />
               </div>
             </SideBtn>
-            <SideBtn label="Undo (Ctrl+Z)" onClick={() => engRef.current?.undo()}><Undo2 size={16} strokeWidth={1.8} /></SideBtn>
-            <SideBtn label="Redo (Ctrl+Y)" onClick={() => engRef.current?.redo()}><Redo2 size={16} strokeWidth={1.8} /></SideBtn>
+            <SideBtn label="Undo" shortcut="Ctrl+Z" onClick={() => engRef.current?.undo()}>
+              <Undo2 size={21} strokeWidth={2} />
+            </SideBtn>
+            <SideBtn label="Redo" shortcut="Ctrl+Y" onClick={() => engRef.current?.redo()}>
+              <Redo2 size={21} strokeWidth={2} />
+            </SideBtn>
           </div>
         </aside>
 
@@ -1674,6 +1800,48 @@ export default function App() {
               fileRef.current?.click();
               return;
             }
+
+            // Check if this pointerdown just triggered a commit from blur / window capture on an active editor
+            const justCommitted = justCommittedShapeRef.current;
+            if (justCommitted && performance.now() - justCommitted.time < 220) {
+              const w = eng.clientToWorld(e.clientX, e.clientY);
+              const hit = eng.hitShape(w.x, w.y);
+              justCommittedShapeRef.current = null;
+              if (!hit || hit.id === justCommitted.id) {
+                // Click on empty board: swallow to preserve the finished shape's selected state!
+                e.stopPropagation();
+                e.preventDefault();
+                return;
+              }
+            }
+
+            // If an object is actively being edited and user clicks on canvas:
+            if (editShapeRef.current) {
+              const editingId = editShapeRef.current.id;
+              const w = eng.clientToWorld(e.clientX, e.clientY);
+              const hit = eng.hitShape(w.x, w.y);
+              if (!hit || hit.id === editingId) {
+                commitEdit();
+                if (eng.tool !== 'select') {
+                  eng.setTool('select', true);
+                  setTool('select', false, undefined, true, true);
+                }
+                eng.sel.clear();
+                eng.sel.add(editingId);
+                eng.onSel?.([editingId]);
+                setSelectedShape(eng.getShape(editingId) ?? null);
+                e.stopPropagation();
+                e.preventDefault();
+                return;
+              } else {
+                commitEdit();
+                if (eng.tool !== 'select') {
+                  eng.setTool('select', true);
+                  setTool('select', false, undefined, true, true);
+                }
+              }
+            }
+
             // The engine's DOM content overlays are siblings of the canvas and do not focus it
             // automatically. Explicitly make board shortcuts available after any board interaction.
             canvasRef.current?.focus({ preventScroll: true });
@@ -1728,17 +1896,27 @@ export default function App() {
               onDoubleClick={event => event.stopPropagation()}
               onWheel={event => event.stopPropagation()}
               onContextMenu={event => event.stopPropagation()}>
-              <div className="relative group/editbox" style={{
+              <div className={`relative group/editbox ${editShape.type === 'sticky' ? 'is-sticky-box' : ''}`} style={{
                 width: editBox.w / zoom,
                 height: editBox.h / zoom,
                 boxSizing: 'border-box',
-                boxShadow: editShape.type === 'sticky' ? '0 12px 48px rgba(0,0,0,0.18)' : editShape.type === 'code' ? '0 12px 64px rgba(0,0,0,0.45)' : 'none',
-                borderRadius: editShape.type === 'sticky' ? 3 : editShape.type === 'code' ? 6 : 4,
-                overflow: 'visible',
+                boxShadow: editShape.type === 'sticky' ? '0 0 0 1px #2563eb, 0 12px 48px rgba(0,0,0,0.18)' : editShape.type === 'code' ? '0 12px 64px rgba(0,0,0,0.45)' : 'none',
+                borderRadius: editShape.type === 'sticky' ? 4 : editShape.type === 'code' ? 6 : 4,
+                overflow: 'hidden',
+                display: editShape.type === 'sticky' ? 'flex' : 'block',
+                flexDirection: editShape.type === 'sticky' ? 'column' : undefined,
                 background: editShape.type === 'sticky' ? (editShape as StickyShape).bg : editShape.type === 'code' ? '#1b2430' : 'transparent',
-                border: 'none',
+                border: editShape.type === 'sticky' ? '2px solid #2563eb' : 'none',
               }}>
-                {(editShape.type === 'text' || editShape.type === 'sticky') && (
+                {editShape.type === 'sticky' && (
+                  <div className="sticky-dog-ear" style={{
+                    position: 'absolute', top: 0, right: 0, width: 16, height: 16,
+                    background: 'rgba(0,0,0,0.10)', clipPath: 'polygon(100% 0, 0 0, 100% 100%)',
+                    zIndex: 5, pointerEvents: 'none',
+                  }} />
+                )}
+
+                {editShape.type === 'text' && (
                   <div style={{
                     position: 'absolute', inset: -3 / zoom,
                     border: `${1.5 / zoom}px solid #3b82f6`,
@@ -1769,8 +1947,29 @@ export default function App() {
                     />
                   </React.Suspense>
                 ) : (
-                  <textarea
-                    className="board-text-editor"
+                  <>
+                    {editShape.type === 'sticky' && (editShape as StickyShape).createdAt && (
+                      <div className="sticky-editor-timestamp" style={{
+                        padding: '12px 16px 4px',
+                        fontSize: '10.5px',
+                        opacity: 0.65,
+                        fontWeight: 550,
+                        color: 'rgba(15,23,42,0.85)',
+                        fontFamily: "'Inter',system-ui,sans-serif",
+                        fontVariantNumeric: 'tabular-nums',
+                        userSelect: 'none',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 4,
+                        lineHeight: 1.2,
+                        flexShrink: 0,
+                      }}>
+                        <Clock size={11} strokeWidth={2.2} style={{ opacity: 0.75, flexShrink: 0 }} />
+                        <span>{(editShape as StickyShape).createdAt}</span>
+                      </div>
+                    )}
+                    <textarea
+                    className={`board-text-editor ${editShape.type === 'sticky' ? 'is-sticky-editor' : ''}`}
                     aria-label={`Edit ${editShape.type} content`}
                     ref={element => {
                       if (!element || textFocusShapeIdRef.current === editShape.id) return;
@@ -1799,9 +1998,9 @@ export default function App() {
                         engine?.updateTextLive(editShape.id, value);
                         if (editShape.type !== 'sticky' && !isFixedShapeLabel(editShape) && engine) {
                           const fs = shapeFontSize(editShape);
-                          const measured = measureCanvasText(value, `${fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
-                          const width = measured.w + 40;
-                          const height = measured.h + 40;
+                          const measured = measureCanvasText(value, `${fs}px 'Inter',system-ui,sans-serif`, false, 1.35);
+                          const width = Math.max(60, measured.w + 24);
+                          const height = Math.max(28, measured.h + 16);
                           setEditBox(previous => ({ ...previous, w: width * zoom, h: height * zoom }));
                           engine.updateSize(editShape.id, width, height);
                         }
@@ -1825,7 +2024,10 @@ export default function App() {
                       }
                     }}
                     style={{
-                      width: '100%', height: '100%',
+                      width: '100%',
+                      height: '100%',
+                      flex: editShape.type === 'sticky' ? '1 1 0%' : undefined,
+                      minHeight: editShape.type === 'sticky' ? 0 : undefined,
                       background: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
@@ -1858,15 +2060,20 @@ export default function App() {
                         ? '2px 6px'
                         : editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.note'
                         ? '8px 8px'
-                        : editShape.type === 'sticky' ? 16 : 8,
-                      fontFamily: "'Inter','Segoe UI',sans-serif",
+                        : editShape.type === 'sticky'
+                        ? ((editShape as StickyShape).createdAt ? '0px 16px 14px 16px' : '14px 16px 14px 16px')
+                        : editShape.type === 'text'
+                        ? '8px 12px'
+                        : 8,
+                      fontFamily: "'Inter',system-ui,sans-serif",
                       fontWeight: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         ? 400
                         : editShape.type === 'diagram' ? 600 : 'normal',
                       fontStyle: editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.abstract-class' && (!editingClassifierContextRef.current || editingClassifierContextRef.current.target === 'header') ? 'italic' : 'normal',
-                      color: isFixedShapeLabel(editShape) ? shapeTextColor(editShape) : editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.85)',
+                      color: isFixedShapeLabel(editShape) ? shapeTextColor(editShape) : editShape.type === 'text' ? (shapeTextColor(editShape) || ('color' in editShape && typeof editShape.color === 'string' ? editShape.color : '#1e293b')) : 'rgba(0,0,0,0.88)',
                       caretColor: '#2563eb', lineHeight: 1.35, boxSizing: 'border-box', resize: 'none',
+                      outline: 'none',
                       border: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
@@ -1893,6 +2100,7 @@ export default function App() {
                       overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
                     }}
                   />
+                </>
                 )}
               </div>
             </div>
@@ -2517,6 +2725,15 @@ export default function App() {
               <span>Right-drag to pan</span><span className="hud-hint-divider" aria-hidden="true" />
               <span>Scroll to zoom at pointer</span><span className="hud-hint-divider" aria-hidden="true" />
               <span>Double-click text-like object to edit</span>
+              {boardRuntimeStatus.unsyncedRemoteChanges && (
+                <>
+                  <span className="hud-hint-divider" aria-hidden="true" />
+                  <span className="hud-syncing-pill">
+                    <span className="hud-syncing-dot" aria-hidden="true" />
+                    Syncing changes…
+                  </span>
+                </>
+              )}
             </div>
 
             <div className="zoom-controls flex items-center bg-white rounded-lg border border-gray-200 overflow-hidden">
