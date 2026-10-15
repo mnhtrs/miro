@@ -38,10 +38,8 @@ interface CodeEditorProps {
   language: CodeLanguage;
   initialCursor?: number;
   fontSize: number;
-  autoHeight: boolean;
   onChange: (value: string) => void;
   onLayout: (height: number) => void;
-  onAutoHeightChange: (enabled: boolean, fittedHeight: number) => void;
   onLanguageChange: (language: CodeLanguage) => void;
   onCommit: () => void;
 }
@@ -149,10 +147,8 @@ export default function CodeEditor({
   language,
   initialCursor,
   fontSize,
-  autoHeight,
   onChange,
   onLayout,
-  onAutoHeightChange,
   onLanguageChange,
   onCommit,
 }: CodeEditorProps) {
@@ -356,17 +352,6 @@ export default function CodeEditor({
             {CODE_LANGUAGES.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
         </label>
-        <button type="button" className="code-editor-fit-height" aria-pressed={autoHeight}
-          aria-label={autoHeight ? 'Disable automatic CodeBlock height' : 'Fit CodeBlock height to source lines'}
-          title={autoHeight ? 'Auto height is on; click to keep a manual height' : 'Fit height to the current source lines'}
-          onClick={() => {
-            const view = viewRef.current;
-            const host = hostRef.current;
-            if (!view || !host) return;
-            onAutoHeightChange(!autoHeight, readCodeEditorHeight(view, host, fontSizeRef.current));
-          }}>
-          {autoHeight ? 'Auto' : 'Fit'}
-        </button>
         <button type="button" className="code-editor-done" onClick={() => commitRef.current()} aria-label="Finish editing code" title="Finish editing">
           <Check size={14} aria-hidden="true" /><span>Done</span>
         </button>

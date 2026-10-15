@@ -2,20 +2,46 @@ import { getStroke } from 'perfect-freehand';
 import * as Y from 'yjs';
 import RBush from 'rbush';
 import { parseTelex } from '../formula/parser';
-import { renderFormulaStatic } from '../formula/renderer';
+import { renderFormulaToHTML } from '../formula/renderer';
 import { CODE_LANGUAGES, DEFAULT_CODE_LANGUAGE, normalizeCodeLanguage, type CodeLanguage } from '../code/languages';
 import { CanvasCodePreviewCache } from '../code/canvasHighlight';
 import { initialCodeBlockHeight } from '../code/layout';
 import { recognizeSmartDrawing } from './smartDrawing';
 import { getShapeDefinition, getShapeDefinitionByToolId, getShapeDefinitionForLegacyType, getShapeResizePolicy, getVisibleShapeDefinitionByToolId } from './shapes/registry';
 import type { RegisteredBoxShapeToolId, RegisteredConnectorToolId, RegisteredShapeToolId } from './shapes/registry';
-import { buildGeometryCommands, buildShapeGeometry, drawPathCommands, geometryUsesFill, structuredTableLayout } from './shapes/geometry';
-import { buildConnectorRoute, CONNECTOR_LABEL_HEIGHT, connectorLabelLayout, fitConnectorLabel } from './shapes/connectors';
+import { buildGeometryCommands, buildShapeGeometry, drawPathCommands, geometryUsesFill, structuredTableLayout, SEQUENCE_ACTOR_GLYPH_HEIGHT, SEQUENCE_ACTOR_HEADER_HEIGHT, SEQUENCE_LIFELINE_HEADER_HEIGHT, SEQUENCE_ROLE_HEADER_HEIGHT, sequenceParticipantHeaderHeight, UML_BOUNDARY_TITLE_HEIGHT } from './shapes/geometry';
+import { buildConnectorRoute, CONNECTOR_LABEL_HEIGHT, connectorDisplayLabel, connectorLabelLayout, connectorLabelPlacementAtPoint, fitConnectorLabel, parallelConnectorLabelOffset, UML_RELATIONSHIP_LANE_SPACING, UML_SEQUENCE_LANE_SPACING } from './shapes/connectors';
 import { containerAcceptsSemanticChild, connectorEndpointPairAllowed, connectorEndpointSideAllowed } from './shapes/semantics';
+import { contextForConnector, contextForDefinition, diagnoseUmlGraph, diagramCapabilitiesFor, inferUmlContexts, UML_FOUNDATION_SCHEMA_VERSION, type DiagramGraphDiagnostic } from './shapes/diagramContext';
+import { diagramTypography } from './shapes/typography';
+import {
+  addClassifierMemberToModel,
+  addInstanceValueToModel,
+  classifierKindForShape,
+  classifierLayout,
+  hitTestClassifier,
+  hitTestInstance,
+  instanceLayout,
+  normalizeUmlStructuredData,
+  parseClassifierMemberText,
+  parseInstanceValueText,
+  removeClassifierMemberFromModel,
+  removeInstanceValueFromModel,
+  updateClassifierMemberInModel,
+  updateInstanceValueInModel,
+  type ClassifierHitResult,
+  type UMLClassifierCompartmentKind,
+} from './shapes/classifier';
 import { normalizeShapeParameterPatch } from './shapes/parameters';
+import { ActivityPolicy } from './shapes/activityPolicy';
+import { StatePolicy } from './shapes/statePolicy';
+import { normalizeActivityFlowData, normalizeBehavioralDiagramData, UML_STATE_FIRST_REGION_ID, UML_STATE_ROOT_REGION_ID } from './shapes/behavioralData';
+import { compareSequenceEvents, createSequenceMessageEvent, isSequenceMessageShape, normalizeSequenceDiagramData,
+  sequenceMessageKindForShape } from './shapes/sequence';
+import { normalizeExtendRelationshipData, normalizeUseCaseDiagramData } from './shapes/usecaseData';
 import { buildSolid3DProjection, normalizeSolid3DScale, projectSolid3DAxes, projectSolid3DVector, rotateSolid3DOrientationAboutLocalAxis, solid3DCameraDepth, solid3DLocalAxisSpans, solid3DScaleFromBounds, solid3DSizeGroup, solid3DRotationFrames, SOLID3D_CANVAS_INITIAL_YAW_DEGREES, SOLID3D_POSE_VERSION, type Solid3DGeometry, type Solid3DRotationAxis, type Solid3DScale } from './shapes/solid3d';
-import { connectionPointsForBox, connectorBounds, deserializeBoardShape, deriveStructuredShapeParameters, objectPointToWorld, resizeBoxFromHandle, rotatedBoxBounds, rotatedBoxCorners, rotatePoint, unrotatePoint, worldPointToObject } from './shapes/model';
-import type { ConnectorShapeObject, DiagramShapeObject, EndpointMarker, PathCommand, ShapeDefinition, ShapeResizePolicy } from './shapes/types';
+import { connectionPointById, connectionPointsAtSequenceTime, connectionPointsForBox, connectorBounds, deserializeBoardShape, deriveStructuredShapeParameters, isDoubleClickTextEditableShape, normalizeDragBox, objectPointToWorld, persistentSequencePointId, resizeBoxFromHandle, resizeDiagramEmbeddedTextScale, rotatedBoxBounds, rotatedBoxCorners, rotatePoint, unrotatePoint, worldPointToObject } from './shapes/model';
+import type { BehavioralNodeRole, Cardinality, ConnectorShapeObject, DiagramShapeObject, EndpointIntent, EndpointMarker, EndpointSide, PathCommand, SequenceActivationData, SequenceFragmentData, SequenceLifecycleData, SequenceMessageEventData, SequenceParticipantData, ShapeConnectionPoint, ShapeDefinition, ShapeResizePolicy, UMLActivityNodeData, UMLClassifierData, UMLDiagramFamily, UMLInstanceData, UMLStatePointData, UMLStateVertexData, UMLUseCaseData } from './shapes/types';
 
 export type ToolType =
   | 'select' | 'lasso-select' | 'pen' | 'eraser'
@@ -33,7 +59,10 @@ interface BoxShape extends BaseShape {
   rotation?: number;
   shapeId?: string;
   params?: Record<string, unknown>;
+  data?: Record<string, unknown>;
   text?: string; fs?: number; textColor?: string;
+  /** Persisted only on owned legacy boxes that share the registered diagram label renderer. */
+  embeddedTextScale?: number;
   vertices?: [number, number][];
 }
 
@@ -48,7 +77,7 @@ export interface StarShape    extends BoxShape  { type:'star';     fill:string; 
 export interface CalloutShape extends BoxShape  { type:'callout'; fill:string; stroke:string; sw:number; }
 export interface PolygonShape extends BoxShape { type:'pentagon'|'hexagon'|'parallelogram'|'trapezoid'|'right-triangle'; fill:string; stroke:string; sw:number; }
 export interface ArrowShape   extends BaseShape { type:'arrow';    x1:number;y1:number;x2:number;y2:number; color:string; sw:number; }
-export interface StickyShape  extends BoxShape  { type:'sticky';   text:string; bg:string; fs:number; }
+export interface StickyShape  extends BoxShape  { type:'sticky';   text:string; bg:string; fs:number; createdAt?: string; }
 export interface TextShape    extends BoxShape  { type:'text'|'math'|'code'; text:string; color:string; fs:number; language?: CodeLanguage; previewText?: string; autoHeight?: boolean; }
 export interface ImageShape   extends BoxShape  { type:'image';    src:string; naturalW:number; naturalH:number; }
 export type DiagramShape = DiagramShapeObject;
@@ -77,17 +106,23 @@ export interface ShapeStylePatch {
 const HANDLE_CURSORS: Record<string,string> = {
   nw:'nw-resize', ne:'ne-resize', sw:'sw-resize', se:'se-resize',
   n:'n-resize',   s:'s-resize',   e:'e-resize',   w:'w-resize',
-  'line-start':'crosshair', 'line-end':'crosshair', rotate:'grab', waypoint:'move',
+  'line-start':'crosshair', 'line-end':'crosshair', rotate:'grab', waypoint:'move', 'label-position':'move',
+  'source-label-position':'move', 'target-label-position':'move',
 };
 const ERASER_RADIUS_PX = 11;
 const MAX_PEN_STROKE_WIDTH = 50;
 interface CachedDiagramGeometry {
   key: string; path?: Path2D; outline: PathCommand[]; decorations: PathCommand[][]; decorationStyles: Array<'solid' | 'dashed' | 'dotted' | undefined>;
-  intrinsicFills: PathCommand[][]; hiddenEdges: PathCommand[][]; visibleFaces: import('./shapes/solid3d').Solid3DProjection['visibleFaces']; projection?: import('./shapes/solid3d').Solid3DProjection['metadata'];
+  intrinsicFills: PathCommand[][]; intrinsicFillColors: Array<'outline' | 'surface'>; hiddenEdges: PathCommand[][];
+  visibleFaces: import('./shapes/solid3d').Solid3DProjection['visibleFaces']; projection?: import('./shapes/solid3d').Solid3DProjection['metadata'];
   decorationPaths?: Array<Path2D | undefined>; intrinsicFillPaths?: Array<Path2D | undefined>; hiddenEdgePaths?: Array<Path2D | undefined>; visibleFacePaths?: Array<Path2D | undefined>;
 }
+type ConnectorLabelKind = 'center' | 'source' | 'target' | 'source-multiplicity' | 'target-multiplicity';
 interface ConnectorLabelVisual {
-  text: string; x: number; y: number; width: number; height: number; textWidth: number;
+  kind: ConnectorLabelKind;
+  editable: boolean;
+  positionEditable: boolean;
+  text: string; x: number; y: number; width: number; height: number; textWidth: number; fontSize: number;
 }
 type SolidTransformMode = 'size' | 'rotate';
 interface SolidAxisControl {
@@ -140,6 +175,7 @@ interface ActiveSolidTransform {
   totalAngle: number;
 }
 interface ResizeRef { wx: number; wy: number; s: AnyShape; }
+interface ConnectorTargetFeedback { shapeId: string; point: { x: number; y: number }; valid: boolean; }
 type PositionedShape = Extract<AnyShape, { x: number; y: number; w: number; h: number }>;
 type DomOverlayShape = StickyShape | TextShape | ImageShape;
 
@@ -191,7 +227,14 @@ export class CanvasEngine {
 
   public  cam: Camera = { x:0, y:0, zoom:1 };
   public  tool: ToolType = 'pen';
+  private previousCreationTool: ToolType | null = null;
   public  penMode: 'normal' | 'smart' = 'normal';
+  private diagramContext: UMLDiagramFamily | null = null;
+  private graphNotifyQueued = false;
+  /** Incremental endpoint/ownership indexes keep drag and resize gestures local. */
+  private connectorIdsByEndpoint = new Map<string, Set<string>>();
+  private ownedIdsByContainer = new Map<string, Set<string>>();
+  private nextParallelOrder = 1;
   public  style: StyleOptions = {
     penColor:'#1e293b', penSize:6,
     fill:'transparent', stroke:'#1e40af', sw:2,
@@ -199,9 +242,27 @@ export class CanvasEngine {
   };
 
   public onShapeUpdate: ((s: AnyShape) => void) | null = null;
+  public onGraphUpdate: ((diagnostics: DiagramGraphDiagnostic[]) => void) | null = null;
 
   private editingId: string | null = null;
-  public setEditingId(id: string | null) { this.editingId = id; this.dirty = true; }
+  public setEditingId(id: string | null) {
+    this.editingId = id;
+    if (id === null) {
+      this.editingClassifierContext = null;
+    }
+    this.dirty = true;
+  }
+
+  private editingClassifierContext: {
+    shapeId: string;
+    target: 'header' | 'member' | 'empty-compartment' | 'usecase-ext' | 'er-title' | 'er-column';
+    memberId?: string;
+    columnIndex?: number;
+  } | null = null;
+  public setEditingClassifierContext(context: typeof this.editingClassifierContext) {
+    this.editingClassifierContext = context;
+    this.dirty = true;
+  }
 
   private raf = 0;
   private dirty = true;
@@ -237,6 +298,7 @@ export class CanvasEngine {
   private isDragging    = false;
   private dragRef       = {wx:0,wy:0};
   private dragOrigins   = new Map<string,{x:number,y:number}>();
+  private dragShapeOrigins = new Map<string, AnyShape>();
   private isResizing    = false;
   private isSizing3D    = false;
   private isRotating3D  = false;
@@ -262,6 +324,8 @@ export class CanvasEngine {
   private boxB          = {x:0,y:0};
   private isLassoing    = false;
   private lassoPts: {x:number,y:number}[] = [];
+  private connectorTargetFeedback: ConnectorTargetFeedback | null = null;
+  private connectorSourceFeedback: ConnectorTargetFeedback | null = null;
 
   // callbacks
   public onSel?:      (ids:string[]) => void;
@@ -271,10 +335,12 @@ export class CanvasEngine {
   public onContextMenu?: (x:number, y:number) => void;
   public onTextEdit?: (s:AnyShape) => void;
   public onEditText?: (s: AnyShape, cx: number, cy: number) => void;
+  public onEditSemantic?: (s: AnyShape) => void;
   public onCursor?:   (cursor:string) => void;
   public onTool?:     (tool:ToolType) => void;
 
   private undoManager!: Y.UndoManager;
+  private readonly loadMigrationOrigin = { source: 'uml-foundation-load-migration' };
   private readonly remoteRepairOrigin = { source: 'canvas-engine-remote-repair' };
   private readonly remoteDeletedKeys = new Set<string>();
   private pendingFormulaCaptureId: string | null = null;
@@ -306,6 +372,7 @@ export class CanvasEngine {
           this.detachConnectorsFrom(key, this.remoteRepairOrigin);
         }
         if (old?.type === 'diagram' && externalChange) this.detachContainedChildrenFrom(key, this.remoteRepairOrigin);
+        if (old) this.removeShapeIndexes(old);
         if (old?.type === 'code') this.codePreviewCache.forget(key);
         this.shapes.delete(key);
         this.opaqueShapes.delete(key);
@@ -314,6 +381,7 @@ export class CanvasEngine {
         const raw = this.yMap.get(key);
         const shape = deserializeBoardShape(key, raw);
         if (!shape) {
+          if (old) this.removeShapeIndexes(old);
           this.shapes.delete(key);
           this.opaqueShapes.set(key, raw);
           if (old?.type === 'code') this.codePreviewCache.forget(key);
@@ -321,9 +389,12 @@ export class CanvasEngine {
         } else {
           const typedShape = shape as unknown as AnyShape;
           this.opaqueShapes.delete(key);
+          if (old) this.removeShapeIndexes(old);
           if (old?.type === 'code' && typedShape.type !== 'code') this.codePreviewCache.forget(key);
           this.shapes.set(key, typedShape);
           this.rtree.insert(typedShape);
+          this.addShapeIndexes(typedShape);
+          if (externalChange && isConnectableShape(typedShape)) this.updateAttachedConnectors(key, this.remoteRepairOrigin);
           // Undo/redo and remote Yjs writes bypass put(); keep the selected properties panel
           // synchronized with the map value just as local engine writes do.
           if (this.sel.has(key)) this.onShapeUpdate?.(typedShape);
@@ -331,9 +402,9 @@ export class CanvasEngine {
       }
       if (key !== this.editingId) redraw = true;
     });
-    if (externalChange) this.reconcileContainerMembership(this.remoteRepairOrigin, false);
     if (selectionChanged) this.onSel?.([...this.sel]);
     if (redraw) this.dirty = true;
+    if (externalChange) this.queueGraphDiagnostics();
   };
 
   constructor(cv: HTMLCanvasElement, yMap: Y.Map<AnyShape>) {
@@ -354,8 +425,13 @@ export class CanvasEngine {
       const typedShape = shape as unknown as AnyShape;
       this.shapes.set(key, typedShape);
       this.rtree.insert(typedShape);
+      this.addShapeIndexes(typedShape);
     });
-    
+    for (const shape of this.shapes.values())
+      if (shape.type === 'connector' && Number.isFinite((shape as ConnectorShape).parallelOrder))
+        this.nextParallelOrder = Math.max(this.nextParallelOrder, Math.floor((shape as ConnectorShape).parallelOrder!) + 1);
+    this.migrateLoadedUmlRecords();
+
     // Setup overlay DOM for Math/Code
     this.overlayDiv = document.createElement('div');
     this.overlayDiv.style.position = 'absolute';
@@ -500,40 +576,106 @@ export class CanvasEngine {
       return;
     }
 
+    // If an object is actively being edited, clicking empty board keeps it selected and returns to select tool
+    if (this.editingId) {
+      const activeEditingId = this.editingId;
+      const rawHit = this.hitShape(w.x, w.y);
+      if (!rawHit) {
+        this.sel.clear();
+        this.sel.add(activeEditingId);
+        this.onSel?.([activeEditingId]);
+        if (this.tool !== 'select') {
+          if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+          this.tool = 'select';
+          this.onTool?.('select');
+        }
+        this.dirty = true;
+        return;
+      }
+    }
+
     // --- 1. HIT TEST for existing objects ---
     let hit: AnyShape | null = null;
 
-    const rawHit = this.hitShape(w.x, w.y);
-    if (rawHit) {
-      if (this.tool === 'select') {
-        hit = rawHit;
-      } else if (isTextTool(this.tool)) {
-        if (isTextTool(rawHit.type)) hit = rawHit;
-      } else if (this.tool === 'sticky') {
-        if (rawHit.type === 'sticky') hit = rawHit;
-      } else if (isConnectorTool(this.tool)) {
-        if (rawHit.type === 'connector' || rawHit.type === 'arrow' || rawHit.type === 'line') hit = rawHit;
-      } else if (isBoxShapeTool(this.tool)) {
-        if (isBoxShapeTool(rawHit.type) || rawHit.type === 'diagram' || isConnectorShape(rawHit)) hit = rawHit;
-      } else if (this.tool === 'image') {
-        if (rawHit.type === 'image') hit = rawHit;
+    // Prioritize selected shapes: clicking on/inside an already selected shape's bounds
+    // always interacts with / drags it, and NEVER draws a new shape over it!
+    if (this.sel.size > 0 && this.tool !== 'pen') {
+      for (const id of this.sel) {
+        const s = this.shapes.get(id);
+        if (s && 'minX' in s && 'maxX' in s && 'minY' in s && 'maxY' in s) {
+          const tol = 8 / this.cam.zoom;
+          if (w.x >= s.minX - tol && w.x <= s.maxX + tol && w.y >= s.minY - tol && w.y <= s.maxY + tol) {
+            hit = s;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!hit) {
+      const rawHit = this.hitShape(w.x, w.y);
+      if (rawHit) {
+        if (this.tool === 'select') {
+          hit = rawHit;
+        } else if (this.sel.has(rawHit.id)) {
+          hit = rawHit;
+        } else if (isTextTool(this.tool)) {
+          if (isTextTool(rawHit.type)) hit = rawHit;
+        } else if (this.tool === 'sticky') {
+          if (rawHit.type === 'sticky') hit = rawHit;
+        } else if (isConnectorTool(this.tool)) {
+          if (isConnectorShape(rawHit) || !isConnectableShape(rawHit)) {
+            hit = rawHit;
+          } else {
+            const definition = getShapeDefinitionByToolId(this.tool);
+            const nearbyCandidates = definition
+              ? this.connectionPointCandidates(w.x, w.y, 'preview', definition, 'source', { includeIncompatible: true, maxDistance: 24 / this.cam.zoom })
+              : [];
+            if (nearbyCandidates.length === 0) {
+              hit = rawHit;
+            }
+          }
+        } else if (isBoxShapeTool(this.tool)) {
+          const childDefinition = getVisibleShapeDefinitionByToolId(this.tool);
+          const hitDefinition = this.definitionForEndpoint(rawHit);
+          const acceptedNestedContainer = childDefinition?.kind === 'shape'
+            ? this.findAcceptedContainerAtPoint(childDefinition, w.x, w.y) : undefined;
+          const directlyAcceptsChild = rawHit.type === 'diagram' && childDefinition?.kind === 'shape'
+            && Boolean(hitDefinition && containerAcceptsSemanticChild(hitDefinition, childDefinition));
+          const placesInsideTopContainer = rawHit.type === 'diagram' && Boolean(hitDefinition?.semantic?.container)
+            && acceptedNestedContainer !== undefined && acceptedNestedContainer.id !== rawHit.id;
+          const placingSemanticChild = directlyAcceptsChild || placesInsideTopContainer;
+          if (!placingSemanticChild && (isBoxShapeTool(rawHit.type) || rawHit.type === 'diagram' || isConnectorShape(rawHit))) hit = rawHit;
+        } else if (this.tool === 'image') {
+          if (rawHit.type === 'image') hit = rawHit;
+        }
       }
     }
 
     if (hit) {
+      if (this.tool !== 'select') {
+        if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+        this.tool = 'select';
+        this.onTool?.('select');
+      }
       if (!e.shiftKey && !this.sel.has(hit.id)) { this.sel.clear(); }
       this.sel.add(hit.id);
       this.onSel?.([...this.sel]);
       this.isDragging = true;
       this.activePointerId = Number.isFinite(e.pointerId) ? e.pointerId : null;
       this.dragRef = {wx:w.x, wy:w.y};
-      this.dragOrigins.clear();
+      this.dragOrigins.clear(); this.dragShapeOrigins.clear();
+      const captureDragOrigin = (shape: AnyShape) => {
+        this.dragOrigins.set(shape.id, getXY(shape));
+        this.dragShapeOrigins.set(shape.id, structuredClone(shape));
+      };
       this.sel.forEach(id => {
         const shape = this.shapes.get(id);
         if (!shape) return;
-        this.dragOrigins.set(id, getXY(shape));
+        captureDragOrigin(shape);
         if (shape.type === 'diagram') {
-          for (const child of this.containedDescendants(id)) this.dragOrigins.set(child.id, getXY(child));
+          for (const child of this.containedDescendants(id)) captureDragOrigin(child);
+          for (const connector of this.containedConnectorDescendants(id)) captureDragOrigin(connector);
         }
       });
       this.onCursor?.('move');
@@ -543,12 +685,8 @@ export class CanvasEngine {
 
     // --- 2. DESELECT IF CLICKING BOARD ---
     if (this.sel.size > 0 && !e.shiftKey) {
-      this.sel.clear();
-      this.onSel?.([]);
-      this.dirty = true;
-      // If something was selected, clicking anywhere on the board should ONLY drop selection.
-      // E.g., drops the blue border without simultaneously acting as a new click drawing.
-      return; 
+      this.clearSelection();
+      return;
     }
 
     // --- 3. TOOL SPECIFIC LOGIC ---
@@ -589,11 +727,16 @@ export class CanvasEngine {
         id, type: 'sticky',
         x, y, w: 240, h: 240, fs: 14,
         bg: this.style.stickyBg, text: '',
+        createdAt: formatStickyTimestamp(),
         minX:x, minY:y, maxX:x+240, maxY:y+240
       };
       this.put(s);
+      this.sel.clear();
       this.sel.add(id); this.onSel?.([id]);
       this.saveH();
+      if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+      this.tool = 'select';
+      this.onTool?.('select');
       setTimeout(() => this.onEditText?.(s, e.clientX, e.clientY), 30);
       return;
     }
@@ -617,8 +760,12 @@ export class CanvasEngine {
         ...(textTool === 'math' ? { previewText: '' } : {}),
       };
       this.put(s);
+      this.sel.clear();
       this.sel.add(id); this.onSel?.([id]);
       this.saveH();
+      if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+      this.tool = 'select';
+      this.onTool?.('select');
       setTimeout(() => this.onEditText?.(s, e.clientX, e.clientY), 30);
       return;
     }
@@ -628,6 +775,8 @@ export class CanvasEngine {
       this.isDown = true;
       this.activePointerId = Number.isFinite(e.pointerId) ? e.pointerId : null;
       this.currId = uid();
+      this.connectorTargetFeedback = null;
+      this.connectorSourceFeedback = null;
       this.solidCreationGesture = null;
       this.shapeOrigin = { x: w.x, y: w.y };
       const definition = getVisibleShapeDefinitionByToolId(this.tool);
@@ -636,18 +785,32 @@ export class CanvasEngine {
         const connector: ConnectorShape = {
           id: this.currId, type: 'connector', shapeId: definition.id,
           x1: w.x, y1: w.y, x2: w.x, y2: w.y, waypoints: [],
-          color: this.style.stroke, sw: this.style.sw,
+          color: definition.defaultStroke ?? (definition.semantic?.notation === 'uml' ? '#0f172a' : this.style.stroke),
+          sw: definition.defaultStrokeWidth ?? this.style.sw,
           lineStyle: definition.connector?.lineStyle ?? 'solid',
           startMarker: definition.connector?.startMarker ?? 'none', endMarker: definition.connector?.endMarker ?? 'none',
           ...(definition.connector?.sourceCardinality ? { sourceCardinality: definition.connector.sourceCardinality } : {}),
           ...(definition.connector?.targetCardinality ? { targetCardinality: definition.connector.targetCardinality } : {}),
           ...(definition.defaultLabel !== undefined ? { label: definition.defaultLabel } : {}),
+          ...(definition.semantic?.family === 'uml.sequence-edge'
+            ? { sequenceTime: Math.round(w.y * 1000) / 1000,
+              sequenceEvent: createSequenceMessageEvent(this.currId, `sequence-event:${uid()}`, `sequence-occurrence:${uid()}`,
+                sequenceMessageKindForShape(definition.id) ?? 'synchronous', this.sequenceOrderAtVisualY(w.y), Math.round(w.y * 1000) / 1000) } : {}),
+          ...(definition.semantic?.family === 'uml.relationship-edge' || definition.semantic?.family === 'uml.usecase-dependency'
+            || definition.semantic?.family === 'uml.state-edge' || definition.semantic?.family === 'uml.activity-edge'
+            ? { parallelOrder: this.nextParallelOrder++ } : {}),
+          ...(definition.id === 'uml.state-transition' ? { stateTransition: {} } : {}),
+          ...(definition.id === 'uml.activity-flow' || definition.id === 'uml.object-flow'
+            ? { activityFlow: normalizeActivityFlowData(undefined, definition.id) } : {}),
+          ...(definition.semantic?.notation === 'uml' ? { umlSchemaVersion: UML_FOUNDATION_SCHEMA_VERSION } : {}),
+          ...(contextForDefinition(definition, this.diagramContext) ? { diagramContext: contextForDefinition(definition, this.diagramContext) } : {}),
+          sourceIntent: 'free', targetIntent: 'pending',
           ...connectorBounds({ shapeId: definition.id, x1: w.x, y1: w.y, x2: w.x, y2: w.y, waypoints: [],
             startMarker: definition.connector?.startMarker ?? 'none', endMarker: definition.connector?.endMarker ?? 'none',
             sourceCardinality: definition.connector?.sourceCardinality, targetCardinality: definition.connector?.targetCardinality,
             label: definition.defaultLabel, sw: this.style.sw }),
         };
-        this.put(connector);
+        this.latchConnectorSource(connector, w.x, w.y);
       } else if (definition.legacyType && isLegacyBoxToolType(definition.legacyType)) {
         this.put(createLegacyBoxShape(definition.legacyType, {
           id: this.currId, x: w.x, y: w.y, shapeId: definition.id,
@@ -657,6 +820,17 @@ export class CanvasEngine {
           sw: definition.defaultStrokeWidth ?? this.style.sw,
         }));
       } else {
+        const initialData = definition.defaultData ? JSON.parse(JSON.stringify(definition.defaultData)) as Record<string, unknown> : {};
+        const objectContext = contextForDefinition(definition, this.diagramContext);
+        let umlInitialData = definition.semantic?.notation === 'uml'
+          ? normalizeUmlStructuredData(definition, initialData, initialData) : initialData;
+        if (definition.semantic?.notation === 'uml')
+          umlInitialData = normalizeBehavioralDiagramData(definition, this.currId, umlInitialData,
+            objectContext, undefined, undefined);
+        const isSequenceObject = definition.semantic?.family?.startsWith('uml.sequence-') || definition.id === 'uml.frame';
+        const normalizedInitialData = isSequenceObject
+          ? normalizeSequenceDiagramData(umlInitialData, definition.id, this.currId, undefined, definition.height, w.y + definition.height / 2)
+          : Object.keys(umlInitialData).length ? umlInitialData : undefined;
         const diagram: DiagramShape = {
           id: this.currId, type: 'diagram', shapeId: definition.id,
           // A solid's board-space x/y is its true projected local origin. During the anchored
@@ -664,15 +838,19 @@ export class CanvasEngine {
           // current pointer midpoint, so the down-point stays pinned to the created extent.
           // w/h remain definition-space metadata, never a pivot or recursive resize reference.
           x: w.x, y: w.y, w: definition.solid3d ? definition.width : 0, h: definition.solid3d ? definition.height : 0, rotation: 0,
-          fill: definition.solid3d ? 'transparent' : this.style.fill, stroke: definition.defaultStroke ?? this.style.stroke,
-          sw: definition.defaultStrokeWidth ?? this.style.sw,
+          fill: definition.solid3d ? 'transparent' : (definition.defaultFill ?? (definition.semantic?.notation === 'uml' ? '#ffffff' : this.style.fill)),
+          stroke: definition.defaultStroke ?? (definition.semantic?.notation === 'uml' ? '#0f172a' : this.style.stroke),
+          sw: definition.defaultStrokeWidth ?? (definition.semantic?.notation === 'uml' ? 1.5 : this.style.sw),
           ...(definition.defaultText !== undefined ? { text: definition.defaultText } : {}),
-          fs: this.style.fontSize, textColor: '#1f2937', params: { ...(definition.defaultParams ?? {}),
+          fs: definition.semantic?.notation === 'uml' ? Math.max(12, this.style.fontSize) : this.style.fontSize,
+          textColor: '#1f2937', params: { ...(definition.defaultParams ?? {}),
             ...(definition.solid3d ? { rotationZ: SOLID3D_CANVAS_INITIAL_YAW_DEGREES } : {}) },
+          ...(definition.semantic?.notation === 'uml' ? { umlSchemaVersion: UML_FOUNDATION_SCHEMA_VERSION } : {}),
+          ...(contextForDefinition(definition, this.diagramContext) ? { diagramContext: contextForDefinition(definition, this.diagramContext) } : {}),
           ...(definition.solid3d ? { solid3dPoseVersion: SOLID3D_POSE_VERSION,
             scale3d: normalizeSolid3DScale(definition.geometry as Solid3DGeometry,
               definition.defaultScale3d ?? { x: 1, y: 1, z: 1 }) } : {}),
-          ...(definition.defaultData ? { data: JSON.parse(JSON.stringify(definition.defaultData)) as Record<string, unknown> } : {}),
+          ...(normalizedInitialData ? { data: normalizedInitialData } : {}),
           minX: w.x, minY: w.y, maxX: w.x, maxY: w.y,
         };
         this.put(diagram);
@@ -860,11 +1038,43 @@ export class CanvasEngine {
     if (this.isDragging) {
       const dx = w.x - this.dragRef.wx;
       const dy = w.y - this.dragRef.wy;
+      const lifecycleOwners = new Set<string>();
       this.dragOrigins.forEach((orig, id) => {
         const shape = this.shapes.get(id);
-        if (!shape) return;
-        this.put(moveShape(shape, orig.x + dx, orig.y + dy));
+        const origin = this.dragShapeOrigins.get(id) ?? shape;
+        if (!shape || !origin) return;
+        const isSequenceMessage = origin.type === 'connector'
+          && getShapeDefinition((origin as ConnectorShape).shapeId)?.semantic?.family === 'uml.sequence-edge';
+        let moved = isSequenceMessage && this.sel.has(id)
+          ? this.moveSequenceMessageGesture(origin as ConnectorShape, dx, dy)
+          : moveShape(origin, orig.x + dx, orig.y + dy);
+        if (moved.type === 'diagram') {
+          const definition = getShapeDefinition(moved.shapeId);
+          if (definition?.semantic?.family === 'uml.sequence-participant') lifecycleOwners.add(moved.id);
+          if (definition?.semantic?.family === 'uml.sequence-control') {
+            const owner = moved.containerId ? this.shapes.get(moved.containerId) : undefined;
+            if (owner?.type === 'diagram' && getShapeDefinition(owner.shapeId)?.semantic?.family === 'uml.sequence-participant')
+              moved = this.normalizeSequenceOwnedControl(moved as DiagramShape, owner as DiagramShape);
+            moved = this.sequenceControlWithTemporalMetadata(moved as DiagramShape, this.sel.has(id), false);
+            if (moved.shapeId === 'uml.destroy' && moved.containerId) lifecycleOwners.add(moved.containerId);
+          }
+        }
+        this.put(moved);
       });
+      for (const ownerId of lifecycleOwners) {
+        const owner = this.shapes.get(ownerId);
+        if (owner?.type === 'diagram') this.synchronizeSequenceDestruction(owner as DiagramShape);
+      }
+      // A connector and its endpoint shapes may be selected together. Re-resolve after the
+      // complete move so a later connector write cannot replace its newly moved node ports.
+      this.dragOrigins.forEach((_, id) => {
+        const moved = this.shapes.get(id);
+        if (moved && isConnectableShape(moved)) this.updateAttachedConnectors(id);
+      });
+      if ([...this.dragShapeOrigins.values()].some(origin => origin.type === 'connector'
+        && getShapeDefinition((origin as ConnectorShape).shapeId)?.semantic?.family === 'uml.sequence-edge')) {
+        this.rebalanceParallelConnectorLanes();
+      }
       return;
     }
 
@@ -935,8 +1145,9 @@ export class CanvasEngine {
     }
     if (s.type === 'connector') {
       const connector = s as ConnectorShape;
-      this.put({ ...connector, x2: w.x, y2: w.y,
-        ...connectorBounds({ ...connector, x2: w.x, y2: w.y }) });
+      const next = { ...connector, x2: w.x, y2: w.y };
+      this.put({ ...next, ...connectorBounds(next) });
+      this.updateConnectorTargetFeedback(next, w.x, w.y);
       return;
     }
 
@@ -945,7 +1156,7 @@ export class CanvasEngine {
       const definition = s.type === 'diagram' ? getShapeDefinition(s.shapeId) : getShapeDefinitionForLegacyType(s.type);
       // A registered 3D shape is never sent through the generic 2D drag-box resize path.
       if (s.type === 'diagram' && definition?.solid3d) return;
-      const box = normalizeDragBox(this.shapeOrigin, w, getShapeCreationResizePolicy(definition));
+      const box = normalizeDragBox(this.shapeOrigin, w, getShapeCreationResizePolicy(definition), definition);
       const next = { ...s, ...box };
       Object.assign(next, rotatedBoxBounds(next));
       this.put(next as AnyShape);
@@ -984,24 +1195,42 @@ export class CanvasEngine {
       return;
     }
     if (this.isDragging) {
+      if ([...this.dragShapeOrigins.values()].some(origin => origin.type === 'connector'
+        && getShapeDefinition((origin as ConnectorShape).shapeId)?.semantic?.family === 'uml.sequence-edge'))
+        this.synchronizeSequenceActivationRanges();
+      const movedIds = [...this.dragShapeOrigins.keys()];
       this.isDragging = false;
+      for (const id of movedIds) {
+        const moved = this.shapes.get(id);
+        if (moved?.type !== 'diagram') continue;
+        if (moved.shapeId === 'uml.composite-state') this.reanchorOwnedStatePoints(id, true);
+        else if (moved.shapeId === 'uml.entry-point' || moved.shapeId === 'uml.exit-point') {
+          const owner = moved.containerId ? this.shapes.get(moved.containerId) : undefined;
+          if (owner?.type === 'diagram' && owner.shapeId === 'uml.composite-state')
+            this.anchorOwnedStatePoint(moved as DiagramShape, owner as DiagramShape, this, false);
+        }
+      }
+      this.dragOrigins.clear(); this.dragShapeOrigins.clear();
       this.activePointerId = null;
       this.onCursor?.('move');
-      this.reconcileContainerMembership(this, true);
       this.saveH();
+      this.queueGraphDiagnostics();
       return;
     }
     if (this.isResizing) {
       const resizeId = this.resizeRef?.s?.id;
       const resized = resizeId ? this.shapes.get(resizeId) : undefined;
-      if (resized?.type === 'connector') this.snapConnectorShape(resized as ConnectorShape);
-      this.reconcileContainerMembership(this, true);
+      if (resized?.type === 'connector' && (this.resizeH === 'line-start' || this.resizeH === 'line-end'))
+        this.snapConnectorEndpoint(resized as ConnectorShape, this.resizeH === 'line-start' ? 'source' : 'target');
       this.isResizing = false;
       this.activePointerId = null;
       this.resizeH = '';
       this.resizeRef = null;
+      if (resized?.type === 'diagram' && resized.shapeId === 'uml.composite-state')
+        this.reanchorOwnedStatePoints(resized.id, true);
       this.onCursor?.('default');
       this.saveH();
+      this.queueGraphDiagnostics();
       return;
     }
     if (this.isBoxing) {
@@ -1033,9 +1262,14 @@ export class CanvasEngine {
         candidates.forEach(shape => {
           if (this.shapeTouchesLasso(shape, polygon, tolerance)) this.sel.add(shape.id);
         });
-        this.onSel?.([...this.sel]);
       }
       this.lassoPts = [];
+      // Lasso is a one-gesture selection tool. Return to normal selection without calling
+      // setTool(), which deliberately clears selection for explicit toolbar switches.
+      this.tool = 'select';
+      this.onTool?.('select');
+      this.onSel?.([...this.sel]);
+      this.onCursor?.(this.cursorForTool());
       this.dirty = true;
       return;
     }
@@ -1059,8 +1293,10 @@ export class CanvasEngine {
           if (this.solidCreationGesture?.id === shape.id)
             this.updateAnchoredSolidCreation(shape as DiagramShape, definition, world);
         } else {
-          const box = normalizeDragBox(this.shapeOrigin, world, getShapeCreationResizePolicy(definition));
-          const next = { ...shape, ...box };
+          const box = normalizeDragBox(this.shapeOrigin, world, getShapeCreationResizePolicy(definition), definition);
+          const defW = definition?.width ?? 120, defH = definition?.height ?? 80;
+          const dragScale = Math.max(0.25, Math.min(16, Math.sqrt((box.w / defW) * (box.h / defH))));
+          const next = { ...shape, ...box, ...(shape.type === 'diagram' ? { embeddedTextScale: dragScale } : {}) };
           Object.assign(next, rotatedBoxBounds(next));
           this.put(next as AnyShape);
         }
@@ -1078,7 +1314,7 @@ export class CanvasEngine {
           shape = this.shapes.get(this.currId);
         }
         // Click-to-create uses each registered definition's dimensions; legacy box tools keep 120×80.
-        if (this.tool !== 'pen' && shape && isPositionedShape(shape) && shape.w < 5 && shape.h < 5) {
+        if (this.tool !== 'pen' && shape && isPositionedShape(shape) && (shape.w <= 15 || shape.h <= 15)) {
           const definition = shape.type === 'diagram' ? getShapeDefinition(shape.shapeId) : getShapeDefinitionForLegacyType(shape.type);
           const width = definition?.width ?? 120;
           const height = definition?.height ?? 80;
@@ -1108,16 +1344,36 @@ export class CanvasEngine {
           }
           shape = this.shapes.get(this.currId);
         }
-        if (shape?.type === 'connector') this.snapConnectorShape(shape as ConnectorShape);
-        this.reconcileContainerMembership(this, true);
+        if (shape?.type === 'connector') {
+          this.snapConnectorEndpoint(shape as ConnectorShape, 'target');
+          shape = this.shapes.get(this.currId);
+        }
+        if (shape?.type === 'diagram') {
+          const definition = getShapeDefinition(shape.shapeId);
+          const contentDriven = definition?.dataCapabilities?.includes('classifier')
+            || definition?.dataCapabilities?.includes('instance')
+            || definition?.semantic?.family === 'uml.use-case' || definition?.semantic?.family === 'uml.actor';
+          if (contentDriven && definition) {
+            const grown = this.growDiagramTextBox(shape, shape.text ?? definition.defaultText ?? definition.label, shape.data);
+            if (grown.w !== shape.w || grown.h !== shape.h || grown.fs !== shape.fs || grown.text !== shape.text) {
+              this.put(grown); shape = this.shapes.get(shape.id) ?? grown;
+            }
+          }
+        }
+        if (shape && (shape.type === 'diagram' || shape.type === 'connector')) this.assignCreatedObjectContainer(shape);
 
         if (this.tool !== 'pen') {
           this.sel.clear();
           this.sel.add(this.currId);
           this.onSel?.([...this.sel]);
+          if (this.tool !== 'select') {
+            if (!this.previousCreationTool) this.previousCreationTool = this.tool;
+            this.tool = 'select';
+            this.onTool?.('select');
+          }
           this.dirty = true;
         } else {
-          this.sel.clear(); this.onSel?.([]);
+          this.clearSelection();
           this.dirty = true;
         }
 
@@ -1128,13 +1384,26 @@ export class CanvasEngine {
         this.mark();
       }
       this.activePointerId = null;
+      this.connectorSourceFeedback = null;
     }
   }
 
   doubleClick(e: MouseEvent) {
     const w = this.clientToWorld(e.clientX, e.clientY);
     const hit = this.hitShape(w.x, w.y);
-    if (hit && isDoubleClickTextEditableShape(hit)) this.onEditText?.(hit, e.clientX, e.clientY);
+    if (!hit) return;
+    if (isDoubleClickTextEditableShape(hit)) {
+      this.sel.clear(); this.sel.add(hit.id); this.onSel?.([hit.id]);
+      this.dirty = true;
+      this.onEditText?.(hit, e.clientX, e.clientY);
+      return;
+    }
+    if (hit.type === 'diagram' || hit.type === 'connector') {
+      this.sel.clear(); this.sel.add(hit.id); this.onSel?.([hit.id]);
+      this.dirty = true;
+      this.onEditSemantic?.(hit);
+      return;
+    }
   }
 
   public updateSize(id: string, w: number, h: number) {
@@ -1168,11 +1437,15 @@ export class CanvasEngine {
         resizedShape = { ...diagram, w, h, scale3d };
       }
     }
+    if (shape.type === 'diagram' && getShapeDefinition((shape as DiagramShape).shapeId)?.semantic?.container
+      && !this.containerResizeAllowed(shape as DiagramShape, resizedShape as DiagramShape)) return;
     const resized = withComputedShapeBounds(resizedShape);
     // Formula overlays can report a final measured layout just after committing source.
     // Keep that same-object measurement in the edit's existing undo item.
     this.put(resized, { redraw: id !== this.editingId,
       ...(this.pendingFormulaCaptureId === id ? { historyContinuationId: id } : {}) });
+    if (shape.type === 'diagram' && (shape as DiagramShape).shapeId === 'uml.composite-state' && !this.isResizing)
+      this.reanchorOwnedStatePoints(id, true);
   }
 
   public updatePos(id: string, x: number, y: number) {
@@ -1229,39 +1502,185 @@ export class CanvasEngine {
     this.undoManager.stopCapturing();
   }
 
+  private addIndexedId(index: Map<string, Set<string>>, ownerId: string | undefined, id: string) {
+    if (!ownerId) return;
+    const ids = index.get(ownerId) ?? new Set<string>();
+    ids.add(id); index.set(ownerId, ids);
+  }
+
+  private removeIndexedId(index: Map<string, Set<string>>, ownerId: string | undefined, id: string) {
+    if (!ownerId) return;
+    const ids = index.get(ownerId);
+    if (!ids) return;
+    ids.delete(id);
+    if (!ids.size) index.delete(ownerId);
+  }
+
+  private addShapeIndexes(shape: AnyShape) {
+    if ('containerId' in shape && typeof shape.containerId === 'string')
+      this.addIndexedId(this.ownedIdsByContainer, shape.containerId, shape.id);
+    if (shape.type === 'connector') {
+      this.addIndexedId(this.connectorIdsByEndpoint, shape.sourceRef?.shapeId, shape.id);
+      if (shape.targetRef?.shapeId !== shape.sourceRef?.shapeId)
+        this.addIndexedId(this.connectorIdsByEndpoint, shape.targetRef?.shapeId, shape.id);
+    }
+  }
+
+  private removeShapeIndexes(shape: AnyShape) {
+    if ('containerId' in shape && typeof shape.containerId === 'string')
+      this.removeIndexedId(this.ownedIdsByContainer, shape.containerId, shape.id);
+    if (shape.type === 'connector') {
+      this.removeIndexedId(this.connectorIdsByEndpoint, shape.sourceRef?.shapeId, shape.id);
+      if (shape.targetRef?.shapeId !== shape.sourceRef?.shapeId)
+        this.removeIndexedId(this.connectorIdsByEndpoint, shape.targetRef?.shapeId, shape.id);
+    }
+  }
+
   private put(shape: AnyShape, options: { redraw?: boolean; notify?: boolean; persist?: boolean; syncAttachments?: boolean; origin?: object; historyContinuationId?: string } = {}) {
     const isTrackedLocalWrite = options.persist !== false && (options.origin ?? this) === this;
     if (isTrackedLocalWrite) this.closePendingFormulaCapture(options.historyContinuationId);
     const s = withComputedShapeBounds(shape);
     const old = this.shapes.get(s.id);
-    if (old) this.rtree.remove(old);
+    if (old) { this.rtree.remove(old); this.removeShapeIndexes(old); }
     this.shapes.set(s.id, s);
     this.rtree.insert(s);
+    this.addShapeIndexes(s);
     if (options.persist !== false) this.transactMap(() => this.yMap.set(s.id, s), options.origin ?? this);
     if (options.redraw !== false) this.dirty = true;
     if (options.notify !== false) this.onShapeUpdate?.(s);
     if (options.syncAttachments !== false && isConnectableShape(s)) this.updateAttachedConnectors(s.id);
+    if (s.type === 'diagram') this.ensureUseCaseChildFitsBoundary(s as DiagramShape, options.origin ?? this);
+    this.queueGraphDiagnostics();
+  }
+
+  /** Commit a semantic subgraph as one Yjs transaction and one undo item. */
+  private putMany(shapes: AnyShape[], options: { redraw?: boolean; notify?: boolean; persist?: boolean; syncAttachments?: boolean; origin?: object } = {}) {
+    if (!shapes.length) return;
+    const origin = options.origin ?? this;
+    const isTrackedLocalWrite = options.persist !== false && origin === this;
+    if (isTrackedLocalWrite) this.closePendingFormulaCapture();
+    const normalized = shapes.map(withComputedShapeBounds);
+    for (const shape of normalized) {
+      const old = this.shapes.get(shape.id);
+      if (old) { this.rtree.remove(old); this.removeShapeIndexes(old); }
+      this.shapes.set(shape.id, shape);
+      this.rtree.insert(shape);
+      this.addShapeIndexes(shape);
+    }
+    if (options.persist !== false) this.transactMap(() => normalized.forEach(shape => this.yMap.set(shape.id, shape)), origin);
+    if (options.redraw !== false) this.dirty = true;
+    if (options.notify !== false) normalized.forEach(shape => this.onShapeUpdate?.(shape));
+    if (options.syncAttachments !== false) normalized.filter(isConnectableShape).forEach(shape => this.updateAttachedConnectors(shape.id));
+    normalized.filter((shape): shape is DiagramShape => shape.type === 'diagram')
+      .forEach(shape => this.ensureUseCaseChildFitsBoundary(shape, origin));
+    this.queueGraphDiagnostics();
   }
 
   private deleteShapes(ids: string[]): string[] {
-    const removed = ids.flatMap(id => {
+    const idsToRemove = new Set(ids);
+    for (const id of [...idsToRemove]) {
+      const shape = this.shapes.get(id);
+      if (shape?.type !== 'diagram' || getShapeDefinition(shape.shapeId)?.semantic?.family !== 'uml.sequence-participant') continue;
+      for (const child of this.containedDescendants(shape.id)) {
+        if (child.containerId === shape.id && getShapeDefinition(child.shapeId)?.semantic?.family === 'uml.sequence-control')
+          idsToRemove.add(child.id);
+      }
+    }
+    const removed = [...idsToRemove].flatMap(id => {
       const shape = this.shapes.get(id);
       return shape ? [{ id, shape }] : [];
     });
     if (!removed.length) return [];
+    const removedIds = new Set(removed.map(({ id }) => id));
+    const removedMessageIds = new Set(removed.flatMap(({ shape }) => shape.type === 'connector'
+      && getShapeDefinition(shape.shapeId)?.semantic?.family === 'uml.sequence-edge'
+      ? [shape.id, shape.sequenceEvent?.eventId].filter((value): value is string => Boolean(value)) : []));
+    const removedParticipantIds = new Set(removed.filter(({ shape }) => shape.type === 'diagram'
+      && getShapeDefinition(shape.shapeId)?.semantic?.family === 'uml.sequence-participant').map(({ id }) => id));
+    const removedFrameIds = new Set(removed.filter(({ shape }) => shape.type === 'diagram' && shape.shapeId === 'uml.frame')
+      .map(({ id }) => id));
+    const connectorsReleasedByFrame = new Set([...this.shapes.values()].flatMap(shape => shape.type === 'connector'
+      && (removedFrameIds.has(shape.containerId ?? '') || removedFrameIds.has(shape.sequenceEvent?.fragmentId ?? '')) ? [shape.id] : []));
+    const affectedLifelines = new Set(removed.flatMap(({ shape }) => shape.type === 'diagram'
+      && shape.shapeId === 'uml.destroy' && shape.containerId ? [shape.containerId] : []));
     this.closePendingFormulaCapture();
-    removed.forEach(({ id, shape }) => {
+    // Start deletion as its own undo unit, even when a prior live property edit and Delete occur
+    // in the same event turn. Semantic cleanup below is committed atomically with these removals.
+    this.undoManager.stopCapturing();
+
+    for (const { id, shape } of removed) {
       if (isConnectableShape(shape)) this.detachConnectorsFrom(id);
       if (shape.type === 'diagram') this.detachContainedChildrenFrom(id, this);
-    });
+    }
+
+    // A removed Sequence fragment releases its event memberships and frame ownership, but leaves
+    // the enclosed participants and messages intact as ordinary Sequence objects.
+    for (const candidate of [...this.shapes.values()]) {
+      if (candidate.type !== 'connector') continue;
+      const connector = candidate as ConnectorShape;
+      const fragment = connector.sequenceEvent?.fragmentId;
+      const frameOwner = connector.containerId;
+      if (!connectorsReleasedByFrame.has(connector.id)
+        && (!fragment || !removedFrameIds.has(fragment)) && (!frameOwner || !removedFrameIds.has(frameOwner))) continue;
+      const sequenceEvent = connector.sequenceEvent ? { ...connector.sequenceEvent } : undefined;
+      if (sequenceEvent) { delete sequenceEvent.fragmentId; delete sequenceEvent.operandId; }
+      const next = { ...connector, ...(sequenceEvent ? { sequenceEvent } : {}),
+        ...(frameOwner && removedFrameIds.has(frameOwner) ? { containerId: undefined } : {}) };
+      this.put(next, { notify: false, syncAttachments: false });
+    }
+
+    // Remove stale return/endpoint ownership links; a free/incomplete message remains editable,
+    // but no Sequence event retains a participant, message, or frame identity that was deleted.
+    for (const candidate of [...this.shapes.values()]) {
+      if (candidate.type !== 'connector' || getShapeDefinition(candidate.shapeId)?.semantic?.family !== 'uml.sequence-edge') continue;
+      const connector = candidate as ConnectorShape;
+      if (removedIds.has(connector.id) || !connector.sequenceEvent) continue;
+      const sequenceEvent = { ...connector.sequenceEvent };
+      if (sequenceEvent.returnForMessageId && removedMessageIds.has(sequenceEvent.returnForMessageId))
+        delete sequenceEvent.returnForMessageId;
+      if (sequenceEvent.sourceEndpointId && removedIds.has(sequenceEvent.sourceEndpointId))
+        delete sequenceEvent.sourceEndpointId;
+      if (sequenceEvent.targetEndpointId && removedIds.has(sequenceEvent.targetEndpointId))
+        delete sequenceEvent.targetEndpointId;
+      if (sequenceEvent.sourceParticipantId && removedParticipantIds.has(sequenceEvent.sourceParticipantId))
+        delete sequenceEvent.sourceParticipantId;
+      if (sequenceEvent.targetParticipantId && removedParticipantIds.has(sequenceEvent.targetParticipantId))
+        delete sequenceEvent.targetParticipantId;
+      const sameParticipant = Boolean(sequenceEvent.sourceParticipantId
+        && sequenceEvent.sourceParticipantId === sequenceEvent.targetParticipantId);
+      sequenceEvent.selfCall = sameParticipant || undefined;
+      if (!sameParticipant) {
+        delete sequenceEvent.targetVisualY;
+        if (sequenceEvent.kind === 'self-call') sequenceEvent.kind = 'synchronous';
+      }
+      if (JSON.stringify(sequenceEvent) !== JSON.stringify(connector.sequenceEvent))
+        this.put({ ...connector, sequenceEvent }, { notify: false, syncAttachments: false });
+    }
+    for (const { shape } of removed) if (shape.type === 'connector' && shape.shapeId === 'uml.create-message')
+      this.synchronizeSequenceCreateOwnership({ ...(shape as ConnectorShape), targetRef: undefined }, this);
+
     this.transactMap(() => removed.forEach(({ id }) => this.yMap.delete(id)));
     removed.forEach(({ id, shape }) => {
-      this.rtree.remove(shape);
+      // Detaching a deleted container/node can replace child or connector objects that are also
+      // scheduled for deletion. Remove the current indexed instance, not the pre-detach snapshot,
+      // otherwise RBush retains a renderable ghost after its ID leaves the model map.
+      const indexedShape = this.shapes.get(id);
+      this.rtree.remove(indexedShape ?? shape);
+      if (indexedShape) this.removeShapeIndexes(indexedShape);
+      else this.removeShapeIndexes(shape);
       if (shape.type === 'code') this.codePreviewCache.forget(id);
       this.shapes.delete(id);
     });
-    this.reconcileContainerMembership(this, true);
+    for (const ownerId of affectedLifelines) {
+      const owner = this.shapes.get(ownerId);
+      if (owner?.type === 'diagram') this.synchronizeSequenceDestruction(owner as DiagramShape);
+    }
+    if (removed.some(({ shape }) => shape.type === 'connector'
+      && getShapeDefinition(shape.shapeId)?.semantic?.family === 'uml.sequence-edge'))
+      this.synchronizeSequenceActivationRanges();
+    this.rebalanceParallelConnectorLanes();
     this.dirty = true;
+    this.queueGraphDiagnostics();
     return removed.map(({ id }) => id);
   }
 
@@ -1341,7 +1760,7 @@ export class CanvasEngine {
     return true;
   }
 
-  private hitShape(wx: number, wy: number): AnyShape|null {
+  public hitShape(wx: number, wy: number): AnyShape|null {
     const P = 8/this.cam.zoom;
     const hits = this.rtree.search({minX:wx-P, minY:wy-P, maxX:wx+P, maxY:wy+P}) as AnyShape[];
     const point = { x: wx, y: wy };
@@ -1354,10 +1773,9 @@ export class CanvasEngine {
         const connector = shape as ConnectorShape, route = getConnectorRoute(connector);
         if (route.slice(1).some((sample, index) => pointToSegmentDistance(point,
           { x: route[index][0], y: route[index][1] }, { x: sample[0], y: sample[1] }) <= P + connector.sw / 2)) return true;
-        const label = this.connectorLabelVisual(connector, route);
-        if (label && Math.abs(point.x - label.x) <= label.width / 2 + P
-          && Math.abs(point.y - label.y) <= label.height / 2 + P) return true;
-        return false;
+        return this.connectorLabelVisuals(connector, route).some(label =>
+          Math.abs(point.x - label.x) <= label.width / 2 + P
+          && Math.abs(point.y - label.y) <= label.height / 2 + P);
       }
       if (shape.type === 'curve') {
         const curve = shape as CurveShape;
@@ -1378,6 +1796,32 @@ export class CanvasEngine {
       }
       return true;
     });
+    const containmentDepth = (shape: AnyShape) => {
+      if (shape.type !== 'diagram') return 0;
+      let depth = 0, parentId = (shape as DiagramShape).containerId;
+      const visited = new Set<string>([shape.id]);
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        const parent = this.shapes.get(parentId);
+        if (parent?.type !== 'diagram') break;
+        depth++;
+        parentId = (parent as DiagramShape).containerId;
+      }
+      return depth;
+    };
+    // Match the painter's semantic layering: a contained child wins where its real geometry is
+    // hit, connectors/lines beat large background boxes, and smaller shapes beat large containers.
+    const hitPriority = (shape: AnyShape) => {
+      const isStrokeOnly = isConnectorShape(shape) || shape.type === 'curve' || shape.type === 'pen';
+      const depth = containmentDepth(shape);
+      let areaPenalty = 0;
+      if ('w' in shape && 'h' in shape && typeof shape.w === 'number' && typeof shape.h === 'number') {
+        const area = Math.max(1, shape.w * shape.h);
+        areaPenalty = Math.min(100, Math.log10(area) * 15);
+      }
+      return (depth * 1000) + (isStrokeOnly ? 500 : 0) - areaPenalty;
+    };
+    preciseHits.sort((a, b) => hitPriority(a) - hitPriority(b) || a.id.localeCompare(b.id));
     return preciseHits[preciseHits.length-1] ?? null;
   }
 
@@ -1440,10 +1884,11 @@ export class CanvasEngine {
       if (connector.sourceCardinality && lassoTouchesArea(polygon, circlePolygon(route[0], cardinalityRadius), 0)) return true;
       const end = route.at(-1) ?? route[0];
       if (connector.targetCardinality && lassoTouchesArea(polygon, circlePolygon(end, cardinalityRadius), 0)) return true;
-      const label = this.connectorLabelVisual(connector, route);
-      if (label && lassoTouchesArea(polygon, [[label.x - label.width / 2, label.y - label.height / 2],
-        [label.x + label.width / 2, label.y - label.height / 2], [label.x + label.width / 2, label.y + label.height / 2],
-        [label.x - label.width / 2, label.y + label.height / 2]], tolerance)) return true;
+      for (const label of this.connectorLabelVisuals(connector, route)) {
+        if (lassoTouchesArea(polygon, [[label.x - label.width / 2, label.y - label.height / 2],
+          [label.x + label.width / 2, label.y - label.height / 2], [label.x + label.width / 2, label.y + label.height / 2],
+          [label.x - label.width / 2, label.y + label.height / 2]], tolerance)) return true;
+      }
       return false;
     }
     if (shape.type === 'diagram') return this.diagramTouchesLasso(shape as DiagramShape, polygon, tolerance);
@@ -1886,7 +2331,16 @@ export class CanvasEngine {
     const value = Math.max(0.01, Math.min(64, initial[key] + scaleDelta));
     const next: Solid3DScale = { ...initial };
     gesture.sizeGroup.forEach(axis => { next[axis] = value; });
-    this.put({ ...gesture.original, scale3d: normalizeSolid3DScale(geometry, next) });
+    const scale3d = normalizeSolid3DScale(geometry, next);
+    const beforeBounds = localSolidProjectedBounds(gesture.original);
+    const afterBounds = localSolidProjectedBounds({ ...gesture.original, scale3d });
+    const beforeWidth = Math.max(1, beforeBounds.maxX - beforeBounds.minX);
+    const beforeHeight = Math.max(1, beforeBounds.maxY - beforeBounds.minY);
+    const afterWidth = Math.max(1, afterBounds.maxX - afterBounds.minX);
+    const afterHeight = Math.max(1, afterBounds.maxY - afterBounds.minY);
+    const embeddedTextScale = resizeDiagramEmbeddedTextScale({ ...gesture.original, w: beforeWidth, h: beforeHeight },
+      afterWidth, afterHeight);
+    this.put({ ...gesture.original, scale3d, embeddedTextScale });
   }
 
   private doRotateSolid3D(clientX: number, clientY: number) {
@@ -2053,15 +2507,23 @@ export class CanvasEngine {
       if (!this.sel.has(shape.id)) continue;
       if (shape.type === 'connector') {
         const connector = shape as ConnectorShape;
+        const definition = getShapeDefinition(connector.shapeId);
+        const capabilities = diagramCapabilitiesFor(definition, this.getSemanticContextForShape(connector.id));
         if (hit(connector.x1, connector.y1)) return { id: shape.id, h: 'line-start' };
         if (hit(connector.x2, connector.y2)) return { id: shape.id, h: 'line-end' };
-        for (let index = 0; index < connector.waypoints.length; index++) {
+        if (capabilities.connector?.routeEditable !== false) for (let index = 0; index < connector.waypoints.length; index++) {
           const [x, y] = connector.waypoints[index];
           if (hit(x, y)) return { id: shape.id, h: `waypoint-${index}` };
         }
-        if (hasConnectorRotationHandle(connector)) {
+        if (capabilities.transform.rotate && hasConnectorRotationHandle(connector)) {
           const rotationHandle = { x: (shape.minX + shape.maxX) / 2, y: shape.minY - 24 / this.cam.zoom };
           if (hit(rotationHandle.x, rotationHandle.y)) return { id: shape.id, h: 'rotate' };
+        }
+        for (const label of this.connectorLabelVisuals(connector)) {
+          if (!label.positionEditable || !hit(label.x, label.y)) continue;
+          const handle = label.kind === 'source' ? 'source-label-position'
+            : label.kind === 'target' ? 'target-label-position' : 'label-position';
+          return { id: shape.id, h: handle };
         }
         continue;
       }
@@ -2077,10 +2539,13 @@ export class CanvasEngine {
       const solidShape = box.type === 'diagram' && diagramDefinition?.solid3d ? box as DiagramShape : null;
       // 3D solids use local-axis SIZE/ROTATE layers; never expose generic 2D resize handles.
       if (solidShape) continue;
-      const handles = getBoxHandlePoints(box);
-      for (const [handle, x, y] of handles) if (hit(x, y)) return { id: shape.id, h: handle };
-      const [rotateX, rotateY] = getRotationHandlePoint(box, this.cam.zoom);
-      if (hit(rotateX, rotateY)) return { id: shape.id, h: 'rotate' };
+      const capabilities = diagramCapabilitiesFor(diagramDefinition);
+      for (const [handle, x, y] of getNotationResizeHandles(box, capabilities))
+        if (hit(x, y)) return { id: shape.id, h: handle };
+      if (capabilities.transform.rotate) {
+        const [rotateX, rotateY] = getRotationHandlePoint(box, this.cam.zoom);
+        if (hit(rotateX, rotateY)) return { id: shape.id, h: 'rotate' };
+      }
     }
     return null;
   }
@@ -2092,24 +2557,54 @@ export class CanvasEngine {
     if (original.type === 'connector') {
       const connector = original as ConnectorShape;
       const current = this.shapes.get(connector.id) as ConnectorShape;
-      if (this.resizeH === 'rotate') {
+      if (this.resizeH === 'label-position' || this.resizeH === 'source-label-position' || this.resizeH === 'target-label-position') {
+        const definition = getShapeDefinition(connector.shapeId);
+        const connectorCaps = diagramCapabilitiesFor(definition, this.getSemanticContextForShape(connector.id)).connector;
+        const side = this.resizeH === 'source-label-position' ? 'source'
+          : this.resizeH === 'target-label-position' ? 'target' : 'center';
+        if (connectorCaps?.labelPositionEditable !== true
+          || (side === 'source' && connectorCaps.sourceLabelEditable !== true)
+          || (side === 'target' && connectorCaps.targetLabelEditable !== true)) return;
+        const labelPlacement = connectorLabelPlacementAtPoint(getConnectorRoute(current), [wx, wy]);
+        if (!labelPlacement) return;
+        const isUmlRelationship = definition?.semantic?.family === 'uml.relationship-edge'
+          || definition?.semantic?.family === 'uml.usecase-dependency';
+        const baseOffset = labelPlacement.labelOffset - parallelConnectorLabelOffset(0, current.parallelLane, isUmlRelationship);
+        const next = side === 'source'
+          ? { ...current, sourceLabelPosition: labelPlacement.labelPosition, sourceLabelOffset: baseOffset }
+          : side === 'target'
+            ? { ...current, targetLabelPosition: labelPlacement.labelPosition, targetLabelOffset: baseOffset }
+            : { ...current, labelPosition: labelPlacement.labelPosition, labelOffset: baseOffset };
+        this.put({ ...next, ...connectorBounds(next) }, { syncAttachments: false });
+      } else if (this.resizeH === 'rotate') {
         const cx = (connector.minX + connector.maxX) / 2, cy = (connector.minY + connector.maxY) / 2;
         const a0 = Math.atan2(this.resizeRef.wy - cy, this.resizeRef.wx - cx);
         const a1 = Math.atan2(wy - cy, wx - cx), angle = (a1 - a0) * 180 / Math.PI;
         const centerX = (connector.x1 + connector.x2) / 2, centerY = (connector.y1 + connector.y2) / 2;
-        const [x1, y1] = rotatePoint(connector.x1, connector.y1, centerX, centerY, angle);
-        const [x2, y2] = rotatePoint(connector.x2, connector.y2, centerX, centerY, angle);
+        const [rotatedX1, rotatedY1] = rotatePoint(connector.x1, connector.y1, centerX, centerY, angle);
+        const [rotatedX2, rotatedY2] = rotatePoint(connector.x2, connector.y2, centerX, centerY, angle);
         const waypoints = connector.waypoints.map(([x, y]) => rotatePoint(x, y, centerX, centerY, angle));
-        const next = { ...connector, x1, y1, x2, y2, waypoints, sourceRef: undefined, targetRef: undefined };
-        this.put({ ...next, ...connectorBounds(next) });
+        const next = { ...connector,
+          x1: connector.sourceRef ? connector.x1 : rotatedX1, y1: connector.sourceRef ? connector.y1 : rotatedY1,
+          x2: connector.targetRef ? connector.x2 : rotatedX2, y2: connector.targetRef ? connector.y2 : rotatedY2,
+          waypoints };
+        this.put({ ...next, ...connectorBounds(next) }, { syncAttachments: false });
       } else if (this.resizeH === 'line-start' || this.resizeH === 'line-end') {
         const start = this.resizeH === 'line-start';
+        const side: EndpointSide = start ? 'source' : 'target';
+        const invalidEndpointRefs = { ...(current.invalidEndpointRefs ?? {}) };
+        delete invalidEndpointRefs[side];
         const next = { ...current,
           x1: connector.x1 + (start ? dx : 0), y1: connector.y1 + (start ? dy : 0),
           x2: connector.x2 + (start ? 0 : dx), y2: connector.y2 + (start ? 0 : dy),
-          ...(start ? { sourceRef: undefined } : { targetRef: undefined }),
+          ...(start ? { sourceRef: undefined, sourceIntent: 'pending' as EndpointIntent }
+            : { targetRef: undefined, targetIntent: 'pending' as EndpointIntent }),
+          invalidEndpointRefs: Object.keys(invalidEndpointRefs).length ? invalidEndpointRefs : undefined,
         };
-        this.put({ ...next, ...connectorBounds(next) });
+        const updated = { ...next, ...connectorBounds(next) };
+        this.put(updated, { syncAttachments: false });
+        this.updateConnectorTargetFeedback(updated, start ? updated.x1 : updated.x2,
+          start ? updated.y1 : updated.y2, side);
       } else if (this.resizeH.startsWith('waypoint-')) {
         const index = Number(this.resizeH.slice('waypoint-'.length));
         if (!Number.isInteger(index) || index < 0 || index >= connector.waypoints.length) return;
@@ -2131,7 +2626,10 @@ export class CanvasEngine {
     }
     if (!isPositionedShape(original)) return;
     const box = original;
+    const definition = box.type === 'diagram' ? getShapeDefinition((box as DiagramShape).shapeId) : getShapeDefinitionForLegacyType(box.type);
+    const capabilities = diagramCapabilitiesFor(definition);
     if (this.resizeH === 'rotate') {
+      if (!capabilities.transform.rotate) return;
       const centerX = box.x + box.w / 2, centerY = box.y + box.h / 2;
       const initial = Math.atan2(this.resizeRef.wy - centerY, this.resizeRef.wx - centerX);
       const nextAngle = Math.atan2(wy - centerY, wx - centerX);
@@ -2139,17 +2637,38 @@ export class CanvasEngine {
       this.put(withComputedShapeBounds({ ...box, rotation } as AnyShape));
       return;
     }
-    const minWidth = box.type === 'sticky' ? 120 : 20;
-    const minHeight = box.type === 'sticky' ? 120 : box.type === 'code' ? initialCodeBlockHeight(box.fs) : 20;
-    const definition = box.type === 'diagram' ? getShapeDefinition((box as DiagramShape).shapeId) : getShapeDefinitionForLegacyType(box.type);
+    let minWidth = box.type === 'sticky' ? 120 : 20;
+    let minHeight = box.type === 'sticky' ? 120 : box.type === 'code' ? initialCodeBlockHeight(box.fs) : 20;
+    if (box.type === 'diagram') {
+      const contentMinimum = this.diagramContentMinimumSize(box as DiagramShape);
+      if (contentMinimum) { minWidth = Math.max(minWidth, contentMinimum.width); minHeight = Math.max(minHeight, contentMinimum.height); }
+    }
+    if (!getNotationResizeHandles(box, capabilities).some(([handle]) => handle === this.resizeH)) return;
     const resizedGeometry = resizeBoxFromHandle(box, this.resizeH, { x: wx, y: wy },
-      getShapeResizePolicy(definition), minWidth, minHeight);
+      getNotationResizePolicy(definition, capabilities), minWidth, minHeight);
     if (!resizedGeometry) return;
     const autoHeightHandles = ['nw', 'ne', 'sw', 'se', 'n', 's'];
     if (box.type === 'code' && autoHeightHandles.includes(this.resizeH)) {
       this.put(withComputedShapeBounds({ ...box, ...resizedGeometry, autoHeight: false }));
     } else {
-      this.put(withComputedShapeBounds({ ...box, ...resizedGeometry } as AnyShape));
+      const hasOwnedDiagramLabel = definition?.kind === 'shape';
+      const resizedShape = withComputedShapeBounds({
+        ...box,
+        ...resizedGeometry,
+        ...(hasOwnedDiagramLabel ? { embeddedTextScale: resizeDiagramEmbeddedTextScale(box,
+          resizedGeometry.w, resizedGeometry.h) } : {}),
+      } as AnyShape);
+      if (box.type === 'diagram' && definition?.semantic?.container
+        && !this.containerResizeAllowed(box as DiagramShape, resizedShape as DiagramShape)) return;
+      let committedShape = resizedShape;
+      if (box.type === 'diagram' && box.shapeId === 'uml.activation')
+        committedShape = this.sequenceControlWithTemporalMetadata(resizedShape as DiagramShape, true, true);
+      this.put(committedShape);
+      if (box.type === 'diagram' && box.shapeId === 'uml.destroy'
+        && committedShape.type === 'diagram' && committedShape.containerId) {
+        const parent = this.shapes.get(committedShape.containerId);
+        if (parent?.type === 'diagram') this.synchronizeSequenceDestruction(parent as DiagramShape);
+      }
     }
   }
 
@@ -2190,7 +2709,7 @@ export class CanvasEngine {
     this.penMode = mode;
   }
 
-  setTool(t: ToolType) {
+  setTool(t: ToolType, preserveSelection: boolean = false) {
     // Hidden catalogue entries stay resolvable for old saved shapes, but cannot be armed as a
     // new drawing tool through stale local state, shortcuts, or programmatic callers.
     if (getShapeDefinitionByToolId(t)?.pickerVisible === false) t = 'select';
@@ -2199,11 +2718,27 @@ export class CanvasEngine {
       this.cancelPointer();
     }
     this.tool = t;
+    if (t !== 'select' && t !== 'lasso-select') {
+      this.previousCreationTool = t;
+    } else {
+      this.previousCreationTool = null;
+    }
+    this.connectorTargetFeedback = null;
+    this.connectorSourceFeedback = null;
     this.hoveredSolidControl = null;
     if (t !== 'eraser') this.eraserCursorPoint = null;
-    this.sel.clear(); this.onSel?.([]);
+    if (!preserveSelection) {
+      this.sel.clear(); this.onSel?.([]);
+    }
     this.dirty = true;
     this.onCursor?.(this.cursorForTool());
+  }
+
+  public clearSelection() {
+    this.sel.clear();
+    this.onSel?.([]);
+    this.previousCreationTool = null;
+    this.dirty = true;
   }
 
   /** End any transient pointer gesture safely on pointercancel, lost focus, tool switch, or teardown. */
@@ -2214,10 +2749,11 @@ export class CanvasEngine {
     if (this.solidTransformGesture) this.put(this.solidTransformGesture.original);
     if (this.isResizing && this.resizeRef?.s) this.put(this.resizeRef.s as AnyShape);
     if (this.isDragging) {
-      for (const [id, origin] of this.dragOrigins) {
+      for (const origin of this.dragShapeOrigins.values()) this.put(origin);
+      this.dragOrigins.forEach((_, id) => {
         const current = this.shapes.get(id);
-        if (current && 'x' in current && 'y' in current) this.put(moveShape(current, origin.x, origin.y));
-      }
+        if (current && isConnectableShape(current)) this.updateAttachedConnectors(id);
+      });
     }
     if (this.currId) {
       let shape = this.shapes.get(this.currId);
@@ -2243,6 +2779,8 @@ export class CanvasEngine {
     }
     this.isDown = false;
     this.solidCreationGesture = null;
+    this.connectorTargetFeedback = null;
+    this.connectorSourceFeedback = null;
     this.activePointerId = null;
     this.isDragging = false;
     this.isResizing = false;
@@ -2250,6 +2788,8 @@ export class CanvasEngine {
     this.isRotating3D = false;
     this.solidTransformGesture = null;
     this.hoveredSolidControl = null;
+    this.connectorTargetFeedback = null;
+    this.dragOrigins.clear(); this.dragShapeOrigins.clear();
     this.resizeH = '';
     this.resizeRef = null;
     this.isBoxing = false;
@@ -2260,37 +2800,1064 @@ export class CanvasEngine {
     this.dirty = true;
   }
 
+  selectAll(): string[] {
+    // Every deserialized supported board object participates, whether its pixels come from the
+    // canvas renderer or a DOM overlay. Do not viewport-filter this operation.
+    const ids = [...this.shapes.keys()];
+    this.sel.clear();
+    ids.forEach(id => this.sel.add(id));
+    if (this.tool !== 'select') {
+      this.tool = 'select';
+      this.onTool?.('select');
+    }
+    this.onSel?.(ids);
+    this.onCursor?.(this.cursorForTool());
+    this.dirty = true;
+    return ids;
+  }
+
   deleteSel() {
     this.deleteShapes([...this.sel]);
-    this.sel.clear(); this.onSel?.([]); this.saveH();
+    this.clearSelection();
+    this.saveH();
   }
 
   dupSel() {
-    const originals = [...this.sel].map(id => this.shapes.get(id)).filter((shape): shape is AnyShape => Boolean(shape));
-    const newIds = new Map(originals.map(shape => [shape.id, uid()]));
-    const offset = 24;
-    for (const shape of originals) {
-      const id = newIds.get(shape.id);
-      if (!id) continue;
-      this.put(cloneShapeWithOffset(shape, id, offset, newIds));
+    const originalById = new Map<string, AnyShape>();
+    const selected = [...this.sel].map(id => this.shapes.get(id)).filter((shape): shape is AnyShape => Boolean(shape));
+    const add = (shape: AnyShape | undefined) => { if (shape) originalById.set(shape.id, shape); };
+    selected.forEach(add);
+    for (const shape of selected) if (shape.type === 'diagram'
+      && getShapeDefinition(shape.shapeId)?.semantic?.family === 'uml.sequence-control' && shape.containerId) {
+      add(this.shapes.get(shape.containerId));
     }
+    // A selected semantic container is an explicit subgraph selection: include all owned nodes
+    // and connectors, not just the frame's pixels.
+    for (const shape of selected) if (shape.type === 'diagram') {
+      const definition = getShapeDefinition(shape.shapeId);
+      if (definition?.semantic?.container) {
+        this.containedDescendants(shape.id).forEach(add);
+        this.containedConnectorDescendants(shape.id).forEach(add);
+      }
+    }
+    // Duplicating an edge as a semantic object includes its endpoint nodes so no cloned connector
+    // can silently continue pointing at the originals.
+    for (const shape of selected) if (shape.type === 'connector') {
+      for (const reference of [shape.sourceRef, shape.targetRef]) {
+        if (!reference) continue;
+        const endpoint = this.shapes.get(reference.shapeId);
+        add(endpoint);
+        if (endpoint?.type === 'diagram' && getShapeDefinition(endpoint.shapeId)?.semantic?.family === 'uml.sequence-control'
+          && endpoint.containerId) add(this.shapes.get(endpoint.containerId));
+      }
+    }
+    const copiedNodeIds = new Set([...originalById.values()].filter(isConnectableShape).map(shape => shape.id));
+    // Include all edges internal to the selected semantic node set. Edges with an external end
+    // remain outside the copied graph unless the edge itself was explicitly selected.
+    for (const shape of this.shapes.values()) if (shape.type === 'connector') {
+      const connector = shape as ConnectorShape;
+      if (connector.sourceRef && connector.targetRef && copiedNodeIds.has(connector.sourceRef.shapeId)
+        && copiedNodeIds.has(connector.targetRef.shapeId)) add(connector);
+    }
+    const originals = [...originalById.values()];
+    if (!originals.length) return;
+    const newIds = new Map(originals.map(shape => [shape.id, uid()]));
+    const existingIds = new Set(this.shapes.keys());
+    const newEventIds = new Map<string, string>();
+    const newOccurrenceIds = new Map<string, string>();
+    const newLifecycleIds = new Map<string, string>();
+    const newStateRegionIds = new Map<string, string>();
+    const newOperandIds = new Map<string, Map<string, string>>();
+    const selectedSequenceFrameIds = new Set(selected.filter(shape => shape.type === 'diagram' && shape.shapeId === 'uml.frame')
+      .map(shape => shape.id));
+    const externalSequenceEndpointIds = new Set<string>();
+    for (const shape of originals) {
+      if (shape.type === 'diagram' && shape.shapeId === 'uml.composite-state') {
+        const composite = shape.data?.stateComposite as { regions?: Array<{ id?: string }> } | undefined;
+        const copiedCompositeId = newIds.get(shape.id)!;
+        composite?.regions?.forEach((region, index) => {
+          if (typeof region.id === 'string') newStateRegionIds.set(region.id, `region:${copiedCompositeId}:${index + 1}`);
+        });
+      }
+      if (shape.type === 'connector' && getShapeDefinition(shape.shapeId)?.semantic?.family === 'uml.sequence-edge'
+        && shape.sequenceEvent) {
+        const eventId = `sequence-event:${uid()}`;
+        newEventIds.set(shape.sequenceEvent.eventId, eventId);
+        newOccurrenceIds.set(shape.sequenceEvent.sourceOccurrenceId, `${eventId}:source`);
+        newOccurrenceIds.set(shape.sequenceEvent.targetOccurrenceId, `${eventId}:target`);
+      }
+      if (shape.type === 'diagram' && shape.shapeId === 'uml.destroy') {
+        const lifecycle = shape.data?.sequenceLifecycle as { lifecycleId?: string } | undefined;
+        if (lifecycle?.lifecycleId) newLifecycleIds.set(lifecycle.lifecycleId, newIds.get(shape.id)!);
+      }
+      if (shape.type === 'diagram' && shape.shapeId === 'uml.frame') {
+        const fragment = shape.data?.sequenceFragment as SequenceFragmentData | undefined;
+        const operandIds = new Map<string, string>();
+        fragment?.operands.forEach((operand, index) => operandIds.set(operand.id, `operand:${newIds.get(shape.id)}:${index + 1}`));
+        newOperandIds.set(shape.id, operandIds);
+      }
+    }
+    const copies = originals.map(original => {
+      let copy = cloneShapeWithOffset(original, newIds.get(original.id)!, 24, newIds, existingIds);
+      if (copy.type === 'diagram') {
+        const data = { ...(copy.data ?? {}) };
+        const originalData = original.type === 'diagram' ? original.data ?? {} : {};
+        if (copy.diagramContext === 'state') {
+          const oldVertex = originalData.stateVertex as Record<string, unknown> | undefined;
+          if (oldVertex) {
+            const mappedRegion = typeof oldVertex.regionId === 'string' ? newStateRegionIds.get(oldVertex.regionId) : undefined;
+            data.stateVertex = {
+              version: 1,
+              ...oldVertex,
+              vertexId: copy.id,
+              regionId: mappedRegion ?? (copy.containerId ? UML_STATE_FIRST_REGION_ID(copy.containerId) : UML_STATE_ROOT_REGION_ID),
+            };
+          }
+          const oldBehavior = originalData.stateBehavior as Record<string, unknown> | undefined;
+          if (oldBehavior) {
+            data.stateBehavior = {
+              version: 1,
+              entry: '',
+              doActivity: '',
+              exit: '',
+              ...oldBehavior,
+              stateId: copy.id,
+            };
+          }
+          const oldComposite = originalData.stateComposite as { regions?: Array<Record<string, unknown>> } | undefined;
+          if (copy.shapeId === 'uml.composite-state' && oldComposite) {
+            const regions = (oldComposite.regions ?? []).map((region, index) => ({
+              name: typeof region.name === 'string' ? region.name : `Region ${index + 1}`,
+              ...region,
+              id: typeof region.id === 'string' ? newStateRegionIds.get(region.id) ?? `region:${copy.id}:${index + 1}` : '',
+              order: index,
+            }));
+            data.stateComposite = {
+              version: 1,
+              ...oldComposite,
+              stateId: copy.id,
+              regions,
+            };
+          }
+          const oldPoint = originalData.statePoint as Record<string, unknown> | undefined;
+          if (oldPoint) {
+            const ownerStateId = typeof oldPoint.ownerStateId === 'string' ? newIds.get(oldPoint.ownerStateId) : undefined;
+            const statePoint = {
+              version: 1 as const,
+              ...oldPoint,
+              pointId: copy.id,
+              ...(ownerStateId ? { ownerStateId } : {}),
+            };
+            if (!ownerStateId) delete statePoint.ownerStateId;
+            data.statePoint = statePoint;
+          }
+        }
+        if (copy.diagramContext === 'activity') {
+          const oldPartition = originalData.activityPartition as Record<string, unknown> | undefined;
+          if (copy.shapeId === 'uml.activity-partition' && oldPartition) {
+            data.activityPartition = {
+              version: 1 as const,
+              orientation: 'vertical',
+              ...oldPartition,
+              partitionId: copy.id,
+            };
+          }
+          const oldNode = originalData.activityNode as Record<string, unknown> | undefined;
+          if (oldNode) {
+            const partitionId = typeof oldNode.partitionId === 'string' ? newIds.get(oldNode.partitionId) : undefined;
+            const activityNode = {
+              version: 1 as const,
+              ...oldNode,
+              nodeId: copy.id,
+              ...(partitionId ? { partitionId } : {}),
+            };
+            if (!partitionId) delete activityNode.partitionId;
+            data.activityNode = activityNode;
+          }
+        }
+        if (copy.shapeId === 'uml.lifeline' || copy.shapeId === 'uml.sequence-actor'
+          || copy.shapeId === 'uml.boundary' || copy.shapeId === 'uml.control' || copy.shapeId === 'uml.entity') {
+          const old = original.type === 'diagram'
+            ? (original.data?.sequenceParticipant as Record<string, unknown> | undefined) : undefined;
+          const participant = { ...(old ?? {}), version: 1 as const, participantId: copy.id } as unknown as SequenceParticipantData;
+          const creator = typeof old?.createdByMessageId === 'string' ? newIds.get(old.createdByMessageId) : undefined;
+          const destroy = typeof old?.destroyedByEventId === 'string' ? newLifecycleIds.get(old.destroyedByEventId) : undefined;
+          if (creator) participant.createdByMessageId = creator; else { delete participant.createdByMessageId; delete participant.createdAtOrder; }
+          if (destroy) participant.destroyedByEventId = destroy; else { delete participant.destroyedByEventId; delete participant.destroyedAtOrder; }
+          data.sequenceParticipant = participant;
+        } else if (copy.shapeId === 'uml.activation') {
+          const old = original.type === 'diagram'
+            ? (original.data?.sequenceActivation as Record<string, unknown> | undefined) : undefined;
+          const participantId = typeof old?.participantId === 'string' ? newIds.get(old.participantId) : undefined;
+          const activation = { ...(old ?? {}), version: 1 as const, activationId: copy.id } as unknown as SequenceActivationData;
+          if (participantId) activation.participantId = participantId; else delete activation.participantId;
+          for (const key of ['startOccurrenceId', 'endOccurrenceId'] as const) {
+            const value = typeof old?.[key] === 'string' ? newOccurrenceIds.get(old[key] as string) : undefined;
+            if (value) activation[key] = value; else delete activation[key];
+          }
+          data.sequenceActivation = activation;
+        } else if (copy.shapeId === 'uml.destroy') {
+          const old = original.type === 'diagram'
+            ? (original.data?.sequenceLifecycle as Record<string, unknown> | undefined) : undefined;
+          const participantId = typeof old?.participantId === 'string' ? newIds.get(old.participantId) : undefined;
+          const lifecycle = { ...(old ?? {}), version: 1 as const, lifecycleId: copy.id, kind: 'destroy' as const,
+            visualY: typeof old?.visualY === 'number' ? old.visualY + 24 : copy.y + copy.h / 2,
+            ...(participantId ? { participantId } : {}) } as unknown as SequenceLifecycleData;
+          data.sequenceLifecycle = lifecycle;
+          if (!participantId) delete (data.sequenceLifecycle as unknown as Record<string, unknown>).participantId;
+        } else if (copy.shapeId === 'uml.frame') {
+          const old = original.type === 'diagram'
+            ? original.data?.sequenceFragment as SequenceFragmentData | undefined : undefined;
+          if (old) {
+            const operandIds = newOperandIds.get(original.id)!;
+            data.sequenceFragment = { ...old, operands: old.operands.map(operand => ({
+              ...operand, id: operandIds.get(operand.id) ?? `operand:${copy.id}:${operand.order + 1}`,
+            })) };
+          }
+        }
+        if (getShapeDefinition(copy.shapeId)?.semantic?.family?.startsWith('uml.sequence-') || copy.shapeId === 'uml.frame')
+          copy = { ...copy, data: normalizeSequenceDiagramData(data, copy.shapeId, copy.id, copy.containerId,
+            copy.h, copy.y + copy.h / 2) } as AnyShape;
+      } else if (copy.type === 'connector') {
+        if (copy.shapeId === 'uml.state-transition') {
+          const transition = { ...(copy.stateTransition ?? {}) };
+          const oldRegionId = original.type === 'connector' ? original.stateTransition?.regionId : undefined;
+          const mappedRegion = typeof oldRegionId === 'string' ? newStateRegionIds.get(oldRegionId) : undefined;
+          if (mappedRegion) transition.regionId = mappedRegion;
+          else if (oldRegionId === UML_STATE_ROOT_REGION_ID || !copy.containerId) transition.regionId = UML_STATE_ROOT_REGION_ID;
+          else delete transition.regionId;
+          copy = { ...copy, stateTransition: transition };
+        }
+        if (original.type === 'connector' && original.containerId && selectedSequenceFrameIds.has(original.containerId)
+          && getShapeDefinition(copy.shapeId)?.semantic?.family === 'uml.sequence-edge') {
+          const copiedConnectorShapeId = copy.shapeId;
+          const externalReference = (side: EndpointSide) => {
+            const reference = side === 'source' ? original.sourceRef : original.targetRef;
+            if (!reference || newIds.has(reference.shapeId)) return undefined;
+            if (copiedConnectorShapeId === 'uml.create-message' && side === 'target' && reference.pointId === 'participant:create') return undefined;
+            const owner = this.shapes.get(reference.shapeId);
+            if (!owner || !this.sequenceParticipantIdForEndpoint(owner.id)) return undefined;
+            externalSequenceEndpointIds.add(owner.id);
+            return reference;
+          };
+          const sourceRef = externalReference('source'), targetRef = externalReference('target');
+          if (sourceRef || targetRef) copy = { ...copy,
+            ...(sourceRef ? { sourceRef, sourceIntent: 'attached' as const } : {}),
+            ...(targetRef ? { targetRef, targetIntent: 'attached' as const } : {}),
+          };
+          if (copy.shapeId === 'uml.create-message' && original.targetRef?.pointId === 'participant:create'
+            && !newIds.has(original.targetRef.shapeId)) copy = { ...copy, containerId: undefined };
+        }
+        const family = getShapeDefinition(copy.shapeId)?.semantic?.family;
+        if (family === 'uml.relationship-edge' || family === 'uml.usecase-dependency'
+          || family === 'uml.state-edge' || family === 'uml.activity-edge')
+          copy = { ...copy, parallelOrder: this.nextParallelOrder++ };
+        if (family === 'uml.sequence-edge' && original.type === 'connector' && original.sequenceEvent) {
+          const old = original.sequenceEvent;
+          const copiedSourceRef = (copy as ConnectorShape).sourceRef;
+          const copiedTargetRef = (copy as ConnectorShape).targetRef;
+          const participantForCopiedEndpoint = (side: EndpointSide, originalParticipantId?: string) => {
+            const reference = side === 'source' ? copiedSourceRef : copiedTargetRef;
+            if (!reference) return undefined;
+            return (originalParticipantId ? newIds.get(originalParticipantId) : undefined)
+              ?? this.sequenceParticipantIdForEndpoint(reference.shapeId);
+          };
+          const newSourceParticipant = participantForCopiedEndpoint('source', old.sourceParticipantId);
+          const newTargetParticipant = participantForCopiedEndpoint('target', old.targetParticipantId);
+          const eventId = newEventIds.get(old.eventId) ?? `sequence-event:${uid()}`;
+          const sameParticipant = Boolean(newSourceParticipant && newSourceParticipant === newTargetParticipant);
+          const sequenceEvent: SequenceMessageEventData = {
+            ...old,
+            eventId,
+            messageId: copy.id,
+            visualY: Math.round((old.visualY + 24) * 1000) / 1000,
+            ...(old.targetVisualY !== undefined ? { targetVisualY: Math.round((old.targetVisualY + 24) * 1000) / 1000 } : {}),
+            sourceOccurrenceId: newOccurrenceIds.get(old.sourceOccurrenceId) ?? `${eventId}:source`,
+            targetOccurrenceId: newOccurrenceIds.get(old.targetOccurrenceId) ?? `${eventId}:target`,
+            ...(copy.sourceRef ? { sourceEndpointId: copy.sourceRef.shapeId } : {}),
+            ...(copy.targetRef ? { targetEndpointId: copy.targetRef.shapeId } : {}),
+            ...(newSourceParticipant ? { sourceParticipantId: newSourceParticipant } : { sourceParticipantId: undefined }),
+            ...(newTargetParticipant ? { targetParticipantId: newTargetParticipant } : { targetParticipantId: undefined }),
+            ...(sameParticipant ? { selfCall: true } : { selfCall: undefined }),
+          };
+          if (!copy.sourceRef) delete sequenceEvent.sourceEndpointId;
+          if (!copy.sourceRef || !newSourceParticipant) delete sequenceEvent.sourceParticipantId;
+          if (!copy.targetRef) delete sequenceEvent.targetEndpointId;
+          if (!copy.targetRef || !newTargetParticipant) delete sequenceEvent.targetParticipantId;
+          if (!sameParticipant) {
+            delete sequenceEvent.targetVisualY;
+            if (sequenceEvent.kind === 'self-call') sequenceEvent.kind = 'synchronous';
+          }
+          if (old.returnForMessageId) {
+            const returnLink = newIds.get(old.returnForMessageId);
+            if (returnLink) sequenceEvent.returnForMessageId = returnLink;
+            else delete sequenceEvent.returnForMessageId;
+          }
+          if (old.timelineId && newIds.has(old.timelineId)) sequenceEvent.timelineId = newIds.get(old.timelineId)!;
+          if (old.fragmentId) {
+            const fragmentId = newIds.get(old.fragmentId);
+            const operandId = newOperandIds.get(old.fragmentId)?.get(old.operandId ?? '');
+            if (fragmentId && operandId && copy.containerId === fragmentId) {
+              sequenceEvent.fragmentId = fragmentId; sequenceEvent.operandId = operandId;
+            } else {
+              delete sequenceEvent.fragmentId; delete sequenceEvent.operandId;
+            }
+          }
+          copy = { ...copy, sequenceTime: sequenceEvent.visualY, sequenceEvent };
+        }
+      }
+      return copy;
+    });
+    this.putMany(copies, { syncAttachments: false });
+    const copiedSequenceConnectors = copies.filter((copy): copy is ConnectorShape => copy.type === 'connector'
+      && getShapeDefinition(copy.shapeId)?.semantic?.family === 'uml.sequence-edge' && Boolean(copy.sequenceEvent));
+    const copiesByTimeline = new Map<string, ConnectorShape[]>();
+    for (const copy of copiedSequenceConnectors) {
+      const timelineKey = copy.sequenceEvent?.timelineId ?? '';
+      const group = copiesByTimeline.get(timelineKey) ?? [];
+      group.push(copy); copiesByTimeline.set(timelineKey, group);
+    }
+    for (const [timelineKey, timelineCopies] of copiesByTimeline) {
+      timelineCopies.sort((left, right) => left.sequenceEvent!.visualY - right.sequenceEvent!.visualY
+        || compareSequenceEvents(left.sequenceEvent!, right.sequenceEvent!));
+      const pendingIds = new Set(timelineCopies.map(copy => copy.id));
+      const parallelCopyGroups: ConnectorShape[][] = [];
+      for (const copy of timelineCopies) {
+        const previous = parallelCopyGroups.at(-1);
+        const previousY = previous?.[0]?.sequenceEvent?.visualY;
+        if (previous && previousY !== undefined && Math.abs(copy.sequenceEvent!.visualY - previousY) <= 1.25)
+          previous.push(copy);
+        else parallelCopyGroups.push([copy]);
+      }
+      for (const parallelCopies of parallelCopyGroups) {
+        const visualY = parallelCopies[0].sequenceEvent!.visualY;
+        // putMany inserts the complete cloned subgraph at once. Ignore the not-yet-positioned
+        // copies while finding this group's logical slot, otherwise a peer's copied old order
+        // would make a new time appear to be parallel with its source event. Earlier clone groups
+        // have already received their new token and remain available as preceding events.
+        const order = this.sequenceOrderAtVisualY(visualY, timelineKey || undefined, pendingIds);
+        for (const copy of parallelCopies) {
+          const live = this.shapes.get(copy.id);
+          if (live?.type === 'connector' && live.sequenceEvent && live.sequenceEvent.order !== order) {
+            const sequenceEvent = { ...live.sequenceEvent, order };
+            this.put({ ...live, sequenceEvent, sequenceTime: live.sequenceEvent.visualY }, { notify: false, syncAttachments: false });
+          }
+          pendingIds.delete(copy.id);
+        }
+      }
+    }
+    externalSequenceEndpointIds.forEach(endpointId => this.updateAttachedConnectors(endpointId));
+    for (const copy of copies) {
+      if (copy.type === 'connector' && copy.shapeId === 'uml.create-message')
+        this.synchronizeSequenceCreateOwnership(copy as ConnectorShape);
+      if (copy.type === 'diagram' && getShapeDefinition(copy.shapeId)?.semantic?.connectionPointProvider === 'sequence-lifeline')
+        this.synchronizeSequenceDestruction(copy as DiagramShape);
+    }
+    this.rebalanceParallelConnectorLanes();
     this.sel.clear();
     for (const id of newIds.values()) this.sel.add(id);
     this.onSel?.([...this.sel]);
     this.saveH();
   }
 
+  private wrapCanvasText(text: string, maxWidth: number): string[] {
+    const context = this.cx, safeWidth = Math.max(1, maxWidth), lines: string[] = [];
+    for (const sourceLine of String(text ?? '').split(/\r?\n/)) {
+      if (!sourceLine.trim()) { lines.push(''); continue; }
+      let line = '';
+      for (const word of sourceLine.trim().split(/\s+/)) {
+        const candidate = line ? `${line} ${word}` : word;
+        if (line && context.measureText(candidate).width <= safeWidth) { line = candidate; continue; }
+        if (!line && context.measureText(word).width <= safeWidth) { line = word; continue; }
+        if (line) { lines.push(line); line = ''; }
+        let fragment = '';
+        for (const character of [...word]) {
+          if (fragment && context.measureText(fragment + character).width > safeWidth) {
+            lines.push(fragment); fragment = character;
+          } else fragment += character;
+        }
+        line = fragment;
+      }
+      if (line) lines.push(line);
+    }
+    return lines.length ? lines : [''];
+  }
+
+  private diagramContentMinimumSize(shape: DiagramShape, text = shape.text ?? '', data = shape.data): { width: number; height: number } | null {
+    const definition = getShapeDefinition(shape.shapeId);
+    if (!definition) return null;
+    if (['uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity'].includes(shape.shapeId)) {
+      const headerH = Math.min(definition.height, sequenceParticipantHeaderHeight(definition.geometry));
+      return { width: Math.max(48, Math.round(definition.width * 0.5)), height: headerH + 30 };
+    }
+    if (shape.shapeId === 'uml.activation') {
+      return { width: 16, height: 40 };
+    }
+    if (shape.shapeId === 'uml.destroy') {
+      return { width: 24, height: 24 };
+    }
+    if (['uml.frame', 'uml.package', 'uml.component'].includes(shape.shapeId)) {
+      return { width: 140, height: 90 };
+    }
+    const textCapabilities = diagramCapabilitiesFor(definition, shape.diagramContext).text;
+    const baseFontSize = Math.max(textCapabilities.minFontSize ?? 12, shape.fs ?? 14);
+    const typography = diagramTypography(textCapabilities.role ?? 'state', baseFontSize, textCapabilities.minFontSize ?? 12);
+    const context = this.cx;
+    if (shape.shapeId === 'uml.state' || shape.shapeId === 'uml.composite-state') {
+      const behavior = (isRecord(data?.stateBehavior) ? data.stateBehavior : {}) as Record<string, unknown>;
+      const behaviorRows = [
+        typeof behavior.entry === 'string' && behavior.entry.trim() ? `entry / ${behavior.entry.trim()}` : '',
+        typeof behavior.doActivity === 'string' && behavior.doActivity.trim() ? `do / ${behavior.doActivity.trim()}` : '',
+        typeof behavior.exit === 'string' && behavior.exit.trim() ? `exit / ${behavior.exit.trim()}` : '',
+      ].filter(Boolean);
+      if (behaviorRows.length) {
+        context.save();
+        context.font = `${typography.secondary}px Inter, 'Segoe UI', sans-serif`;
+        const maxLine = Math.max(0, ...behaviorRows.map(row => context.measureText(row).width));
+        const width = Math.max(definition.width, maxLine + 30);
+        const lines = behaviorRows.reduce((count, row) => count + this.wrapCanvasText(row, Math.max(24, width - 24)).length, 0);
+        const titleHeight = Math.max(typography.title * 1.55, 24);
+        const behaviorHeight = Math.max(1, lines) * typography.secondary * 1.2;
+        const sectionHeight = titleHeight + behaviorHeight + 14;
+        const height = shape.shapeId === 'uml.composite-state'
+          ? Math.max(definition.height, sectionHeight / 0.46)
+          : Math.max(definition.height, sectionHeight + 16);
+        context.restore();
+        return { width, height };
+      }
+    }
+    if (definition.dataCapabilities?.includes('classifier') && isRecord(data?.classifier)
+      && Array.isArray(data.classifier.compartments)) {
+      const classifier = data.classifier as unknown as UMLClassifierData;
+      const name = text.trim() || definition.label;
+      const stereotype = typeof shape.params?.stereotype === 'string' ? shape.params.stereotype : '';
+      const measure = (value: string) => {
+        context.save(); context.font = `${typography.title}px Inter, 'Segoe UI', sans-serif`;
+        const titleWidth = context.measureText(value).width;
+        context.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+        const bodyWidth = context.measureText(value).width; context.restore();
+        return Math.max(titleWidth, bodyWidth);
+      };
+      context.save();
+      const layout = classifierLayout(classifier, name, stereotype, typography.title, typography.body, measure);
+      context.restore();
+      return { width: layout.minWidth, height: layout.minHeight };
+    }
+    if (definition.dataCapabilities?.includes('instance') && isRecord(data?.instance)
+      && Array.isArray(data.instance.values)) {
+      const instance = data.instance as unknown as UMLInstanceData;
+      const name = text.trim() || definition.label;
+      context.save();
+      const layout = instanceLayout(instance, name, typography.title, typography.body, value => {
+        context.font = `${typography.title}px Inter, 'Segoe UI', sans-serif`;
+        const titleWidth = context.measureText(value).width;
+        context.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+        return Math.max(titleWidth, context.measureText(value).width);
+      });
+      context.restore();
+      return { width: layout.minWidth, height: layout.minHeight };
+    }
+    if (textCapabilities.role !== 'use-case' && textCapabilities.role !== 'actor') return null;
+    context.save(); context.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+    const words = String(text ?? '').split(/\s+/).filter(Boolean);
+    const longestWord = Math.max(0, ...words.map(word => context.measureText(word).width));
+    const aspect = Number.isFinite(diagramCapabilitiesFor(definition, shape.diagramContext).transform.aspectRatio)
+      ? diagramCapabilitiesFor(definition, shape.diagramContext).transform.aspectRatio! : definition.width / Math.max(1, definition.height);
+    let width = Math.max(definition.width,
+      textCapabilities.role === 'use-case' ? (longestWord + 24) / 0.68 : (longestWord + 12) / 0.90);
+    let height = Math.max(definition.height, width / aspect);
+    const textWidthRatio = textCapabilities.role === 'use-case' ? 0.68 : 0.90;
+    const labelHeightRatio = textCapabilities.role === 'use-case' ? 0.60 : 0.19;
+    for (let pass = 0; pass < 4; pass++) {
+      const lines = this.wrapCanvasText(text, width * textWidthRatio);
+      const requiredHeight = Math.max(definition.height, lines.length * typography.body * 1.25 / labelHeightRatio + 12);
+      const nextHeight = Math.max(definition.height, requiredHeight);
+      const nextWidth = Math.max(width, nextHeight * aspect);
+      if (nextHeight === height && nextWidth === width) break;
+      height = nextHeight; width = nextWidth;
+    }
+    const extensionPoints = (data?.usecase as UMLUseCaseData | undefined)?.extensionPoints ?? [];
+    if (textCapabilities.role === 'use-case' && extensionPoints.length > 0) {
+      context.font = `${typography.secondary}px Inter, 'Segoe UI', sans-serif`;
+      const longestEp = Math.max(
+        context.measureText('extension points').width,
+        ...extensionPoints.map(ep => context.measureText(ep.explanation ? `${ep.name} : ${ep.explanation}` : ep.name).width),
+      );
+      width = Math.max(width, (longestEp + 28) / 0.72);
+      const epHeight = (extensionPoints.length + 1) * typography.secondary * 1.25 + 16;
+      height = Math.max(height, height * 0.55 + epHeight + 14);
+    }
+    context.restore();
+    return { width, height };
+  }
+
+  private growDiagramTextBox(shape: DiagramShape, text: string, data = shape.data): DiagramShape {
+    const definition = getShapeDefinition(shape.shapeId);
+    const capabilities = diagramCapabilitiesFor(definition, shape.diagramContext);
+    const textCapability = capabilities.text;
+    if (textCapability.editable === false) return { ...shape, text };
+    // Persist the canonical base size; role-specific display levels never compound into shape.fs.
+    const baseFontSize = Math.max(textCapability.minFontSize ?? 12, shape.fs ?? 14);
+    const contentMinimum = this.diagramContentMinimumSize(shape, text, data);
+    if (contentMinimum) {
+      let w = Math.max(shape.w, contentMinimum.width), h = Math.max(shape.h, contentMinimum.height);
+      if (capabilities.transform.aspectLocked) {
+        const aspect = Number.isFinite(capabilities.transform.aspectRatio) && (capabilities.transform.aspectRatio ?? 0) > 0
+          ? capabilities.transform.aspectRatio! : Math.max(0.1, shape.w / Math.max(1, shape.h));
+        w = Math.max(w, h * aspect); h = w / aspect;
+      }
+      return withComputedShapeBounds({ ...shape, text, fs: baseFontSize, w, h } as DiagramShape) as DiagramShape;
+    }
+    const roleTypography = diagramTypography(textCapability.role ?? 'state', baseFontSize, textCapability.minFontSize ?? 12);
+    const fs = roleTypography.body, measureFs = Math.max(roleTypography.body, roleTypography.title);
+    const context = this.cx;
+    context.save(); context.font = `${measureFs}px Inter, 'Segoe UI', sans-serif`;
+    const measure = (value: string) => context.measureText(value).width;
+    const sourceLines = String(text ?? '').split(/\r?\n/);
+    const contentLines = sourceLines;
+    const longestWord = Math.max(0, ...contentLines.flatMap(line => line.split(/\s+/).filter(Boolean).map(measure)));
+    const longestWholeLine = Math.max(0, ...contentLines.map(measure));
+    const horizontalPadding = Math.max(24, measureFs * 1.6);
+    const noWrapRole = textCapability.role === 'container-title' || textCapability.role === 'sequence-participant'
+      || textCapability.role === 'classifier' || textCapability.role === 'partition-title';
+    const targetWidth = Math.max(shape.w, (noWrapRole ? longestWholeLine : longestWord) + horizontalPadding);
+    const lineWidthLimit = Math.max(fs * 2, Math.max(shape.w, targetWidth) - horizontalPadding);
+    let lineCount = this.wrapCanvasText(text, lineWidthLimit).length;
+    context.restore();
+    let w = textCapability.autoGrow === false ? shape.w : targetWidth;
+    let h = Math.max(shape.h, (lineCount || 1) * fs * 1.35 + Math.max(18, fs * 1.4));
+    if (capabilities.transform.aspectLocked) {
+      const aspect = Number.isFinite(capabilities.transform.aspectRatio) && (capabilities.transform.aspectRatio ?? 0) > 0
+        ? capabilities.transform.aspectRatio! : Math.max(0.1, shape.w / Math.max(1, shape.h));
+      w = Math.max(w, h * aspect); h = w / aspect;
+    }
+    return withComputedShapeBounds({ ...shape, text, fs: baseFontSize, w, h } as DiagramShape) as DiagramShape;
+  }
+
+  /** Keep an explicitly-owned Use Case inside its System Boundary after content growth or resize. */
+  private ensureUseCaseChildFitsBoundary(child: DiagramShape, origin: object = this) {
+    const childDefinition = getShapeDefinition(child.shapeId);
+    if (childDefinition?.semantic?.family !== 'uml.use-case' || !child.containerId) return;
+    const parent = this.shapes.get(child.containerId);
+    if (!parent || parent.type !== 'diagram') return;
+    const boundary = parent as DiagramShape, boundaryDefinition = getShapeDefinition(boundary.shapeId);
+    if (boundaryDefinition?.semantic?.family !== 'uml.use-case.container'
+      || !containerAcceptsSemanticChild(boundaryDefinition, childDefinition)) return;
+    const localCorners = rotatedBoxCorners(child).map(([x, y]) => worldPointToObject(boundary, { x, y }));
+    const minX = Math.min(...localCorners.map(point => point.x)), maxX = Math.max(...localCorners.map(point => point.x));
+    const minY = Math.min(...localCorners.map(point => point.y)), maxY = Math.max(...localCorners.map(point => point.y));
+    const padding = 16, contentTop = UML_BOUNDARY_TITLE_HEIGHT;
+    const left = Math.ceil(Math.max(0, padding - minX));
+    const top = Math.ceil(Math.max(0, contentTop + padding - minY));
+    const right = Math.ceil(Math.max(0, maxX + padding - boundary.w));
+    const bottom = Math.ceil(Math.max(0, maxY + padding - boundary.h));
+    if (!left && !top && !right && !bottom) return;
+    const w = boundary.w + left + right, h = boundary.h + top + bottom;
+    // Expand in boundary-local coordinates while preserving its center-relative transform; this
+    // moves only the frame, not the explicitly owned Use Case or its canonical typography.
+    const radians = (boundary.rotation ?? 0) * Math.PI / 180;
+    const localCenterShiftX = (right - left) / 2, localCenterShiftY = (bottom - top) / 2;
+    const centerShiftX = localCenterShiftX * Math.cos(radians) - localCenterShiftY * Math.sin(radians);
+    const centerShiftY = localCenterShiftX * Math.sin(radians) + localCenterShiftY * Math.cos(radians);
+    const x = boundary.x + boundary.w / 2 + centerShiftX - w / 2;
+    const y = boundary.y + boundary.h / 2 + centerShiftY - h / 2;
+    this.put({ ...boundary, x, y, w, h }, { origin });
+  }
+
+  private canEditShapeText(shape: AnyShape): boolean {
+    if (shape.type === 'diagram') return diagramCapabilitiesFor(getShapeDefinition(shape.shapeId)).text.editable === true;
+    if (shape.type === 'connector') return diagramCapabilitiesFor(getShapeDefinition(shape.shapeId)).connector?.labelMode === 'plain';
+    return 'text' in shape || isLabelEditableShape(shape);
+  }
+
   updateText(id: string, text: string) {
     const shape = this.shapes.get(id);
-    if (shape && ('text' in shape || isLabelEditableShape(shape))) {
-      this.put({ ...shape, text } as AnyShape);
-      this.saveH();
-    }
+    if (!shape || !this.canEditShapeText(shape)) return;
+    const next = shape.type === 'diagram' ? this.growDiagramTextBox(shape as DiagramShape, text)
+      : { ...shape, text } as AnyShape;
+    this.put(next as AnyShape);
+    this.saveH();
   }
 
   updateTextLive(id: string, text: string) {
     const shape = this.shapes.get(id);
-    if (shape && ('text' in shape || isLabelEditableShape(shape))) this.put({ ...shape, text } as AnyShape);
+    if (!shape || !this.canEditShapeText(shape)) return;
+    const next = shape.type === 'diagram' ? this.growDiagramTextBox(shape as DiagramShape, text)
+      : { ...shape, text } as AnyShape;
+    this.put(next as AnyShape);
+  }
+
+  public getClassifierHit(shapeId: string, clientX: number, clientY: number): (ClassifierHitResult & { localBounds: { x: number; y: number; w: number; h: number }; clientBounds: { l: number; t: number; w: number; h: number } }) | null {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return null;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def) return null;
+    const kind = classifierKindForShape(def.id);
+    if (!kind) return null;
+
+    const fontScale = Number.isFinite(diagram.embeddedTextScale) && (diagram.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, diagram.embeddedTextScale!))
+      : Math.sqrt((diagram.w / Math.max(1, def.width)) * (diagram.h / Math.max(1, def.height)));
+    const baseFs = (diagram.fs ?? 14) * Math.min(4, Math.max(0.4, fontScale));
+    const textCapabilities = diagramCapabilitiesFor(def, this.getSemanticContextForShape(diagram.id)).text;
+    const typography = diagramTypography(textCapabilities.role ?? 'classifier', baseFs, textCapabilities.minFontSize ?? 12);
+    const name = typeof diagram.text === 'string' && diagram.text.trim() ? diagram.text.trim() : def.label;
+    const stereotype = typeof diagram.params?.stereotype === 'string' ? diagram.params.stereotype : '';
+
+    const measure = (val: string) => {
+      this.cx.save();
+      this.cx.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+      const measuredW = this.cx.measureText(val).width;
+      this.cx.restore();
+      return measuredW;
+    };
+
+    const world = this.clientToWorld(clientX, clientY);
+    const rad = (diagram.rotation ?? 0) * (Math.PI / 180);
+    const centerPointX = diagram.x + diagram.w / 2, centerPointY = diagram.y + diagram.h / 2;
+    const deltaX = world.x - centerPointX, deltaY = world.y - centerPointY;
+    const localX = (deltaX * Math.cos(-rad) - deltaY * Math.sin(-rad)) + diagram.w / 2;
+    const localY = (deltaX * Math.sin(-rad) + deltaY * Math.cos(-rad)) + diagram.h / 2;
+
+    let hit: ClassifierHitResult;
+    let localRow: { x: number; y: number; w: number; h: number };
+
+    if (kind === 'object') {
+      const rawInstance = (diagram.data?.instance ?? def.defaultData?.instance) as import('./shapes/types').UMLInstanceData;
+      if (!rawInstance) return null;
+      const layout = instanceLayout(rawInstance, name, typography.title, typography.body, measure);
+      hit = hitTestInstance(layout, localX, localY, diagram.w, diagram.h, name, typography.title, typography.body);
+      localRow = hit.rowBounds;
+    } else {
+      const rawClassifier = (diagram.data?.classifier ?? def.defaultData?.classifier) as unknown as import('./shapes/types').UMLClassifierData;
+      if (!rawClassifier) return null;
+      const layout = classifierLayout(rawClassifier, name, stereotype, typography.title, typography.body, measure);
+      hit = hitTestClassifier(layout, localX, localY, diagram.w, diagram.h, name, typography.title, typography.body);
+      localRow = hit.rowBounds;
+    }
+
+    const rowWorldCenter = {
+      x: diagram.x + localRow.x + localRow.w / 2,
+      y: diagram.y + localRow.y + localRow.h / 2,
+    };
+    const rowWorldRotated = rad !== 0 ? {
+      x: centerPointX + (rowWorldCenter.x - centerPointX) * Math.cos(rad) - (rowWorldCenter.y - centerPointY) * Math.sin(rad),
+      y: centerPointY + (rowWorldCenter.x - centerPointX) * Math.sin(rad) + (rowWorldCenter.y - centerPointY) * Math.cos(rad),
+    } : rowWorldCenter;
+
+    const sp = this.worldToClient(rowWorldRotated.x - localRow.w / 2, rowWorldRotated.y - localRow.h / 2);
+    const clientBounds = {
+      l: sp.x,
+      t: sp.y,
+      w: localRow.w * this.cam.zoom,
+      h: localRow.h * this.cam.zoom,
+    };
+
+    return {
+      ...hit,
+      localBounds: localRow,
+      clientBounds,
+    };
+  }
+
+  public updateClassifierMember(shapeId: string, memberId: string, text: string): boolean {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return false;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def) return false;
+
+    if (def.id === 'uml.object') {
+      const rawInstance = (diagram.data?.instance ?? def.defaultData?.instance) as import('./shapes/types').UMLInstanceData;
+      if (!rawInstance) return false;
+      const updatedValue = parseInstanceValueText(text, memberId);
+      const nextInstance = updateInstanceValueInModel(rawInstance, memberId, updatedValue);
+      this.put({
+        ...diagram,
+        data: {
+          ...(diagram.data ?? {}),
+          instance: nextInstance,
+        },
+      });
+      this.dirty = true;
+      this.saveH();
+      return true;
+    }
+
+    const rawClassifier = (diagram.data?.classifier ?? def.defaultData?.classifier) as unknown as import('./shapes/types').UMLClassifierData;
+    if (!rawClassifier) return false;
+
+    let kind: UMLClassifierCompartmentKind = 'attributes';
+    for (const comp of rawClassifier.compartments) {
+      if (comp.items.some(it => it.id === memberId)) {
+        kind = comp.kind;
+        break;
+      }
+    }
+
+    const updatedMember = parseClassifierMemberText(text, kind, memberId);
+    const nextClassifier = updateClassifierMemberInModel(rawClassifier, memberId, updatedMember as any);
+    this.put({
+      ...diagram,
+      data: {
+        ...(diagram.data ?? {}),
+        classifier: nextClassifier,
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return true;
+  }
+
+  public addClassifierMember(
+    shapeId: string,
+    compartmentKind: UMLClassifierCompartmentKind,
+    text: string,
+    afterMemberId?: string,
+  ): string | null {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return null;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def) return null;
+
+    if (def.id === 'uml.object') {
+      const rawInstance = (diagram.data?.instance ?? def.defaultData?.instance) as import('./shapes/types').UMLInstanceData;
+      if (!rawInstance) return null;
+      const newMember = parseInstanceValueText(text);
+      const nextInstance = addInstanceValueToModel(rawInstance, newMember, afterMemberId);
+      this.put({
+        ...diagram,
+        data: {
+          ...(diagram.data ?? {}),
+          instance: nextInstance,
+        },
+      });
+      this.dirty = true;
+      this.saveH();
+      return newMember.id;
+    }
+
+    const rawClassifier = (diagram.data?.classifier ?? def.defaultData?.classifier) as unknown as import('./shapes/types').UMLClassifierData;
+    if (!rawClassifier) return null;
+
+    const newMember = parseClassifierMemberText(text, compartmentKind);
+    const nextClassifier = addClassifierMemberToModel(rawClassifier, compartmentKind, newMember as any, afterMemberId);
+
+    const fontScale = Number.isFinite(diagram.embeddedTextScale) && (diagram.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, diagram.embeddedTextScale!))
+      : Math.sqrt((diagram.w / Math.max(1, def.width)) * (diagram.h / Math.max(1, def.height)));
+    const baseFs = (diagram.fs ?? 14) * Math.min(4, Math.max(0.4, fontScale));
+    const textCapabilities = diagramCapabilitiesFor(def, this.getSemanticContextForShape(diagram.id)).text;
+    const typography = diagramTypography(textCapabilities.role ?? 'classifier', baseFs, textCapabilities.minFontSize ?? 12);
+    const name = typeof diagram.text === 'string' && diagram.text.trim() ? diagram.text.trim() : def.label;
+    const stereotype = typeof diagram.params?.stereotype === 'string' ? diagram.params.stereotype : '';
+    const layout = classifierLayout(nextClassifier, name, stereotype, typography.title, typography.body, s => s.length * 8);
+    const nextH = Math.max(diagram.h, layout.minHeight);
+
+    this.put({
+      ...diagram,
+      h: nextH,
+      data: {
+        ...(diagram.data ?? {}),
+        classifier: nextClassifier,
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return newMember.id;
+  }
+
+  public removeClassifierMember(shapeId: string, memberId: string): boolean {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return false;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def) return false;
+
+    if (def.id === 'uml.object') {
+      const rawInstance = (diagram.data?.instance ?? def.defaultData?.instance) as import('./shapes/types').UMLInstanceData;
+      if (!rawInstance) return false;
+      const nextInstance = removeInstanceValueFromModel(rawInstance, memberId);
+      this.put({
+        ...diagram,
+        data: {
+          ...(diagram.data ?? {}),
+          instance: nextInstance,
+        },
+      });
+      this.dirty = true;
+      this.saveH();
+      return true;
+    }
+
+    const rawClassifier = (diagram.data?.classifier ?? def.defaultData?.classifier) as unknown as import('./shapes/types').UMLClassifierData;
+    if (!rawClassifier) return false;
+
+    const nextClassifier = removeClassifierMemberFromModel(rawClassifier, memberId);
+    this.put({
+      ...diagram,
+      data: {
+        ...(diagram.data ?? {}),
+        classifier: nextClassifier,
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return true;
+  }
+
+  public getClassifierMemberBounds(shapeId: string, memberId: string): { localBounds: { x: number; y: number; w: number; h: number }; clientBounds: { l: number; t: number; w: number; h: number }; fontSize: number; textAlign: 'left' | 'center'; initialText: string; compartmentKind: UMLClassifierCompartmentKind } | null {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return null;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def) return null;
+
+    const fontScale = Number.isFinite(diagram.embeddedTextScale) && (diagram.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, diagram.embeddedTextScale!))
+      : Math.sqrt((diagram.w / Math.max(1, def.width)) * (diagram.h / Math.max(1, def.height)));
+    const baseFs = (diagram.fs ?? 14) * Math.min(4, Math.max(0.4, fontScale));
+    const textCapabilities = diagramCapabilitiesFor(def, this.getSemanticContextForShape(diagram.id)).text;
+    const typography = diagramTypography(textCapabilities.role ?? 'classifier', baseFs, textCapabilities.minFontSize ?? 12);
+    const name = typeof diagram.text === 'string' && diagram.text.trim() ? diagram.text.trim() : def.label;
+    const stereotype = typeof diagram.params?.stereotype === 'string' ? diagram.params.stereotype : '';
+
+    const measure = (val: string) => {
+      this.cx.save();
+      this.cx.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+      const measuredW = this.cx.measureText(val).width;
+      this.cx.restore();
+      return measuredW;
+    };
+
+    if (def.id === 'uml.object') {
+      const rawInstance = (diagram.data?.instance ?? def.defaultData?.instance) as import('./shapes/types').UMLInstanceData;
+      if (!rawInstance) return null;
+      const layout = instanceLayout(rawInstance, name, typography.title, typography.body, measure);
+      const row = layout.rows.find(r => r.member.id === memberId);
+      if (!row) return null;
+      const localRow = {
+        x: layout.paddingX,
+        y: row.y - layout.rowHeight / 2,
+        w: Math.max(40, diagram.w - layout.paddingX * 2),
+        h: layout.rowHeight,
+      };
+      const rad = (diagram.rotation ?? 0) * (Math.PI / 180);
+      const centerPointX = diagram.x + diagram.w / 2, centerPointY = diagram.y + diagram.h / 2;
+      const rowWorldCenter = {
+        x: diagram.x + localRow.x + localRow.w / 2,
+        y: diagram.y + localRow.y + localRow.h / 2,
+      };
+      const rowWorldRotated = rad !== 0 ? {
+        x: centerPointX + (rowWorldCenter.x - centerPointX) * Math.cos(rad) - (rowWorldCenter.y - centerPointY) * Math.sin(rad),
+        y: centerPointY + (rowWorldCenter.x - centerPointX) * Math.sin(rad) + (rowWorldCenter.y - centerPointY) * Math.cos(rad),
+      } : rowWorldCenter;
+      const sp = this.worldToClient(rowWorldRotated.x - localRow.w / 2, rowWorldRotated.y - localRow.h / 2);
+      return {
+        localBounds: localRow,
+        clientBounds: {
+          l: sp.x,
+          t: sp.y,
+          w: localRow.w * this.cam.zoom,
+          h: localRow.h * this.cam.zoom,
+        },
+        fontSize: typography.body,
+        textAlign: 'left',
+        initialText: row.text,
+        compartmentKind: 'values',
+      };
+    }
+
+    const rawClassifier = (diagram.data?.classifier ?? def.defaultData?.classifier) as unknown as import('./shapes/types').UMLClassifierData;
+    if (!rawClassifier) return null;
+
+    const layout = classifierLayout(rawClassifier, name, stereotype, typography.title, typography.body, measure);
+    const row = layout.rows.find(r => r.member.id === memberId);
+    if (!row) return null;
+
+    const localRow = {
+      x: layout.paddingX,
+      y: row.y - layout.rowHeight / 2,
+      w: Math.max(40, diagram.w - layout.paddingX * 2),
+      h: layout.rowHeight,
+    };
+    const rad = (diagram.rotation ?? 0) * (Math.PI / 180);
+    const centerPointX = diagram.x + diagram.w / 2, centerPointY = diagram.y + diagram.h / 2;
+    const rowWorldCenter = {
+      x: diagram.x + localRow.x + localRow.w / 2,
+      y: diagram.y + localRow.y + localRow.h / 2,
+    };
+    const rowWorldRotated = rad !== 0 ? {
+      x: centerPointX + (rowWorldCenter.x - centerPointX) * Math.cos(rad) - (rowWorldCenter.y - centerPointY) * Math.sin(rad),
+      y: centerPointY + (rowWorldCenter.x - centerPointX) * Math.sin(rad) + (rowWorldCenter.y - centerPointY) * Math.cos(rad),
+    } : rowWorldCenter;
+
+    const sp = this.worldToClient(rowWorldRotated.x - localRow.w / 2, rowWorldRotated.y - localRow.h / 2);
+    return {
+      localBounds: localRow,
+      clientBounds: {
+        l: sp.x,
+        t: sp.y,
+        w: localRow.w * this.cam.zoom,
+        h: localRow.h * this.cam.zoom,
+      },
+      fontSize: typography.body,
+      textAlign: 'left',
+      initialText: row.text,
+      compartmentKind: row.compartmentKind,
+    };
+  }
+
+  public getErTableHit(shapeId: string, clientX: number, clientY: number): {
+    target: 'header' | 'column';
+    columnIndex?: number;
+    initialText: string;
+    localBounds: { x: number; y: number; w: number; h: number };
+    clientBounds: { l: number; t: number; w: number; h: number };
+    fontSize: number;
+    textAlign: 'left' | 'center';
+  } | null {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return null;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table')) return null;
+
+    const rawColumns = (diagram.data?.table as { columns?: unknown[] } | undefined)?.columns ?? (def.defaultData?.table as { columns?: unknown[] } | undefined)?.columns ?? [];
+    const columns = rawColumns.filter(isRecord);
+    const layout = structuredTableLayout(diagram.h, columns.length + 1);
+
+    const world = this.clientToWorld(clientX, clientY);
+    const rad = (diagram.rotation ?? 0) * (Math.PI / 180);
+    const centerPointX = diagram.x + diagram.w / 2, centerPointY = diagram.y + diagram.h / 2;
+    const deltaX = world.x - centerPointX, deltaY = world.y - centerPointY;
+    const _localX = (deltaX * Math.cos(-rad) - deltaY * Math.sin(-rad)) + diagram.w / 2;
+    const localY = (deltaX * Math.sin(-rad) + deltaY * Math.cos(-rad)) + diagram.h / 2;
+    void _localX;
+
+    const fontScale = Number.isFinite(diagram.embeddedTextScale) ? Math.max(0.01, Math.min(64, diagram.embeddedTextScale!)) : 1;
+    const fs = Math.max(1.25, Math.min(96, (diagram.fs ?? 14) * fontScale));
+    const padX = Math.max(8, diagram.w * 0.05);
+    const contentW = Math.max(40, diagram.w - padX * 2);
+    const title = typeof diagram.text === 'string' && diagram.text.trim() ? diagram.text.trim() : def.label;
+
+    let target: 'header' | 'column' = 'header';
+    let columnIndex: number | undefined;
+    let initialText = title;
+    let localRow = { x: padX, y: 0, w: contentW, h: layout.rowHeight };
+
+    if (localY <= layout.rowHeight) {
+      target = 'header';
+      initialText = title;
+      localRow = { x: padX, y: 0, w: contentW, h: layout.rowHeight };
+    } else {
+      const idx = Math.min(columns.length - 1, Math.max(0, Math.floor((localY - layout.rowHeight) / layout.rowHeight)));
+      target = 'column';
+      columnIndex = idx;
+      const col = columns[idx] as { name?: string; type?: string; key?: string };
+      const key = col.key === 'primary' ? 'PK ' : col.key === 'foreign' ? 'FK ' : '';
+      const name = col.name ?? `column_${idx + 1}`;
+      const type = col.type ? ` : ${col.type}` : '';
+      initialText = `${key}${name}${type}`;
+      localRow = { x: padX, y: (idx + 1) * layout.rowHeight, w: contentW, h: layout.rowHeight };
+    }
+
+    const rowWorldCenter = {
+      x: diagram.x + localRow.x + localRow.w / 2,
+      y: diagram.y + localRow.y + localRow.h / 2,
+    };
+    const rowWorldRotated = rad !== 0 ? {
+      x: centerPointX + (rowWorldCenter.x - centerPointX) * Math.cos(rad) - (rowWorldCenter.y - centerPointY) * Math.sin(rad),
+      y: centerPointY + (rowWorldCenter.x - centerPointX) * Math.sin(rad) + (rowWorldCenter.y - centerPointY) * Math.cos(rad),
+    } : rowWorldCenter;
+    const sp = this.worldToClient(rowWorldRotated.x - localRow.w / 2, rowWorldRotated.y - localRow.h / 2);
+
+    return {
+      target,
+      columnIndex,
+      initialText,
+      localBounds: localRow,
+      clientBounds: {
+        l: sp.x,
+        t: sp.y,
+        w: localRow.w * this.cam.zoom,
+        h: localRow.h * this.cam.zoom,
+      },
+      fontSize: fs,
+      textAlign: 'left',
+    };
+  }
+
+  public updateErTableColumn(shapeId: string, columnIndex: number, text: string): boolean {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return false;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table')) return false;
+
+    const rawTable = (diagram.data?.table ?? def.defaultData?.table) as { columns?: Array<Record<string, unknown>> } | undefined;
+    const columns = [...(rawTable?.columns ?? [])];
+    if (columnIndex < 0 || columnIndex >= columns.length) return false;
+
+    const oldCol = columns[columnIndex] ?? {};
+    const trimmed = text.trim();
+    let isPk = oldCol.key === 'primary';
+    let isFk = oldCol.key === 'foreign';
+    let remaining = trimmed;
+    if (/^pk\s+/i.test(remaining)) {
+      isPk = true; isFk = false; remaining = remaining.replace(/^pk\s+/i, '').trim();
+    } else if (/^fk\s+/i.test(remaining)) {
+      isFk = true; isPk = false; remaining = remaining.replace(/^fk\s+/i, '').trim();
+    }
+    const colonIdx = remaining.indexOf(':');
+    const name = colonIdx >= 0 ? remaining.slice(0, colonIdx).trim() : remaining;
+    const type = colonIdx >= 0 ? remaining.slice(colonIdx + 1).trim() : (oldCol.type as string | undefined ?? 'text');
+    columns[columnIndex] = {
+      ...oldCol,
+      name: name || (oldCol.name as string | undefined ?? 'column'),
+      type: type || 'text',
+      key: isPk ? 'primary' : isFk ? 'foreign' : 'none',
+    };
+
+    this.put({
+      ...diagram,
+      data: {
+        ...(diagram.data ?? {}),
+        table: { ...(rawTable ?? {}), columns },
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return true;
+  }
+
+  public updateUseCaseExtensionPoints(shapeId: string, text: string): boolean {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return false;
+    const diagram = shape as DiagramShape;
+    const lines = text.split('\n').map(l => l.trim().replace(/^[•\-\*]\s*/, '')).filter(Boolean);
+    const existingEps = (diagram.data?.usecase as { extensionPoints?: Array<{ id: string; name: string }> } | undefined)?.extensionPoints ?? [];
+    const extensionPoints = lines.map((line, idx) => ({
+      id: existingEps[idx]?.id ?? `ep-${idx + 1}`,
+      name: line,
+      explanation: '',
+    }));
+    this.put({
+      ...diagram,
+      data: {
+        ...(diagram.data ?? {}),
+        usecase: {
+          ...(diagram.data?.usecase ?? {}),
+          version: 1,
+          extensionPoints,
+        },
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return true;
   }
 
   updateFormulaLive(id: string, source: string, lastValidPreview: string, notify = true) {
@@ -2325,14 +3892,6 @@ export class CanvasEngine {
     this.put({ ...shape, h: height, minX: shape.x, minY: shape.y, maxX: shape.x + shape.w, maxY: shape.y + height });
   }
 
-  setCodeAutoHeight(id: string, enabled: boolean, fittedHeight: number) {
-    const shape = this.shapes.get(id);
-    if (!shape || shape.type !== 'code') return;
-    const height = enabled && Number.isFinite(fittedHeight) ? Math.max(1, Math.ceil(fittedHeight)) : shape.h;
-    if (shape.autoHeight === enabled && shape.h === height) return;
-    this.put({ ...shape, autoHeight: enabled, h: height, minX: shape.x, minY: shape.y, maxX: shape.x + shape.w, maxY: shape.y + height });
-  }
-
   updateCode(id: string, text: string, language: CodeLanguage) {
     const shape = this.shapes.get(id);
     if (!shape || shape.type !== 'code') return;
@@ -2354,13 +3913,35 @@ export class CanvasEngine {
       let next: AnyShape;
       if (shape.type === 'connector') {
         const connector = shape as ConnectorShape;
-        next = { ...connector, ...props, color: props.color ?? props.stroke ?? connector.color, sw: props.sw ?? connector.sw };
+        const definition = getShapeDefinition(connector.shapeId), capabilities = diagramCapabilitiesFor(definition);
+        if (definition?.semantic?.notation === 'uml') {
+          next = { ...connector,
+            ...(capabilities.style.stroke && (props.color !== undefined || props.stroke !== undefined)
+              ? { color: props.color ?? props.stroke } : {}),
+            ...(capabilities.style.strokeWidth && props.sw !== undefined ? { sw: props.sw } : {}),
+          };
+        } else next = { ...connector, ...props, color: props.color ?? props.stroke ?? connector.color, sw: props.sw ?? connector.sw };
       } else if (shape.type === 'line' || shape.type === 'arrow') {
         const line = shape as LineShape | ArrowShape;
         next = { ...line, ...props, color: props.color ?? props.stroke ?? line.color, sw: props.sw ?? line.sw } as AnyShape;
-      } else {
-        next = { ...shape, ...props } as AnyShape;
-      }
+      } else if (shape.type === 'diagram') {
+        const diagram = shape as DiagramShape, definition = getShapeDefinition(diagram.shapeId);
+        const capabilities = diagramCapabilitiesFor(definition);
+        if (definition?.semantic?.notation === 'uml') {
+          next = { ...diagram,
+            ...(capabilities.style.fill && props.fill !== undefined ? { fill: props.fill } : {}),
+            ...(capabilities.style.stroke && props.stroke !== undefined ? { stroke: props.stroke } : {}),
+            ...(capabilities.style.strokeWidth && props.sw !== undefined ? { sw: props.sw } : {}),
+            ...(capabilities.style.textColor && props.textColor !== undefined ? { textColor: props.textColor } : {}),
+            ...(capabilities.text.editable && capabilities.style.fontSize && props.fs !== undefined && Number.isFinite(props.fs)
+              ? { fs: Math.max(capabilities.text.minFontSize ?? 12, Math.min(96, props.fs)) } : {}),
+          };
+        } else next = { ...diagram, ...props };
+        if (definition && (definition.dataCapabilities?.includes('classifier') || definition.dataCapabilities?.includes('instance')
+          || definition.semantic?.family === 'uml.use-case' || definition.semantic?.family === 'uml.actor'))
+          next = this.growDiagramTextBox(next as DiagramShape, (next as DiagramShape).text ?? definition.defaultText ?? definition.label,
+            (next as DiagramShape).data);
+      } else next = { ...shape, ...props } as AnyShape;
       this.put(next);
     });
     this.saveH();
@@ -2397,13 +3978,613 @@ export class CanvasEngine {
 
   getShape(id: string) { return this.shapes.get(id) ?? null; }
 
+  /** Apply safe one-time UML record upgrades before observing the Y.Map or enabling local history. */
+  private migrateLoadedUmlRecords() {
+    const records = [...this.shapes.values()];
+    const inferredContexts = inferUmlContexts(records);
+    const changed: AnyShape[] = [];
+    for (const shape of records) {
+      const definition = this.definitionForEndpoint(shape);
+      if (definition?.semantic?.notation !== 'uml') continue;
+      const raw = this.yMap.get(shape.id) as unknown as Record<string, unknown> | undefined;
+      const storedSchemaVersion = typeof raw?.umlSchemaVersion === 'number' && Number.isFinite(raw.umlSchemaVersion)
+        ? raw.umlSchemaVersion : 0;
+      const migrateLegacySequencePoints = storedSchemaVersion < 2;
+      const storedContext = shape.type === 'diagram' || shape.type === 'connector' ? shape.diagramContext : undefined;
+      const requested = storedContext ?? inferredContexts.get(shape.id) ?? null;
+      const resolvedContext = contextForDefinition(definition, requested);
+      const laneManagedConnector = shape.type === 'connector'
+        && (definition.semantic?.family === 'uml.relationship-edge' || definition.semantic?.family === 'uml.usecase-dependency'
+          || definition.semantic?.family === 'uml.state-edge' || definition.semantic?.family === 'uml.activity-edge');
+      const parallelOrder = laneManagedConnector
+        ? Number.isFinite((shape as ConnectorShape).parallelOrder)
+          ? Math.max(0, Math.floor((shape as ConnectorShape).parallelOrder!)) : this.nextParallelOrder++
+        : undefined;
+      let next: AnyShape = {
+        ...shape,
+        ...(parallelOrder !== undefined ? { parallelOrder } : {}),
+        umlSchemaVersion: UML_FOUNDATION_SCHEMA_VERSION,
+        ...(resolvedContext ? { diagramContext: resolvedContext } : {}),
+      } as AnyShape;
+      if (shape.type === 'diagram') {
+        let diagram = next as DiagramShape;
+        const parent = diagram.containerId ? this.shapes.get(diagram.containerId) : undefined;
+        diagram = this.normalizeBehavioralOwnership(diagram, diagram.containerId,
+          parent?.type === 'diagram' ? parent.shapeId : undefined);
+        if (['uml.entry-point', 'uml.exit-point'].includes(diagram.shapeId)
+          && parent?.type === 'diagram' && parent.shapeId === 'uml.composite-state')
+          diagram = this.anchorOwnedStatePoint(diagram, parent as DiagramShape, this.loadMigrationOrigin, true, false);
+        const params = deriveStructuredShapeParameters(definition, diagram.data ?? {}, diagram.params ?? {});
+        diagram = { ...diagram, params };
+        const contentDriven = definition.dataCapabilities?.includes('classifier') || definition.dataCapabilities?.includes('instance')
+          || definition.semantic?.family === 'uml.use-case' || definition.semantic?.family === 'uml.actor'
+          || ['uml.state', 'uml.composite-state', 'uml.action', 'uml.object-node'].includes(diagram.shapeId);
+        next = contentDriven ? this.growDiagramTextBox(diagram,
+          diagram.text ?? definition.defaultText ?? definition.label, diagram.data) : diagram;
+      }
+      if (shape.type === 'connector') {
+        const normalizeSide = (connector: ConnectorShape, side: EndpointSide): ConnectorShape => {
+          const ref = side === 'source' ? connector.sourceRef : connector.targetRef;
+          if (!ref) return connector;
+          const owner = this.shapes.get(ref.shapeId);
+          if (!owner || !isConnectableShape(owner) || !('x' in owner)) return connector;
+          const point = connectionPointById(owner as BoxShape, ref.pointId);
+          if (!point || (ref.kind !== undefined && ref.kind !== point.kind)) return connector;
+          const stableSequenceId = migrateLegacySequencePoints
+            ? persistentSequencePointId(owner as BoxShape, ref.pointId, point) : undefined;
+          const stablePoint = stableSequenceId ? connectionPointById(owner as BoxShape, stableSequenceId) : undefined;
+          const resolvedPoint = stablePoint ?? point;
+          const nextRef = { ...ref, ...(stablePoint ? { pointId: stableSequenceId! } : {}), kind: resolvedPoint.kind };
+          return side === 'source'
+            ? { ...connector, x1: resolvedPoint.x, y1: resolvedPoint.y, sourceRef: nextRef }
+            : { ...connector, x2: resolvedPoint.x, y2: resolvedPoint.y, targetRef: nextRef };
+        };
+        next = normalizeSide(next as ConnectorShape, 'source');
+        next = normalizeSide(next as ConnectorShape, 'target');
+        next = { ...(next as ConnectorShape), ...connectorBounds(next as ConnectorShape) };
+        if (definition.semantic?.family === 'uml.sequence-edge') {
+          const migratedConnector = next as ConnectorShape;
+          const eventOrdinate = migratedConnector.sourceRef ? migratedConnector.y1
+            : migratedConnector.targetRef ? migratedConnector.y2 : undefined;
+          const storedEvent = migratedConnector.sequenceEvent;
+          const hadPersistedEvent = Boolean(raw?.sequenceEvent && typeof raw.sequenceEvent === 'object');
+          const visualY = hadPersistedEvent ? storedEvent?.visualY ?? eventOrdinate ?? migratedConnector.y1
+            : eventOrdinate ?? storedEvent?.visualY ?? migratedConnector.sequenceTime ?? migratedConnector.y1;
+          const sourceParticipantId = this.sequenceParticipantIdForEndpoint(migratedConnector.sourceRef?.shapeId);
+          const targetParticipantId = this.sequenceParticipantIdForEndpoint(migratedConnector.targetRef?.shapeId);
+          const sameParticipant = Boolean(sourceParticipantId && sourceParticipantId === targetParticipantId);
+          const event = storedEvent ? { ...storedEvent,
+            visualY: Math.round(visualY * 1000) / 1000,
+            ...(migratedConnector.sourceRef ? { sourceEndpointId: migratedConnector.sourceRef.shapeId } : { sourceEndpointId: undefined }),
+            ...(migratedConnector.targetRef ? { targetEndpointId: migratedConnector.targetRef.shapeId } : { targetEndpointId: undefined }),
+            ...(sourceParticipantId ? { sourceParticipantId } : { sourceParticipantId: undefined }),
+            ...(targetParticipantId ? { targetParticipantId } : { targetParticipantId: undefined }),
+            ...(sameParticipant ? { selfCall: true, ...(storedEvent.kind === 'synchronous' ? { kind: 'self-call' as const } : {}) }
+              : { selfCall: undefined, ...(storedEvent.kind === 'self-call' ? { kind: 'synchronous' as const } : {}) }),
+          } : undefined;
+          if (event) next = { ...migratedConnector, sequenceEvent: event,
+            sequenceTime: Math.round(visualY * 1000) / 1000 };
+        }
+      }
+      const migrated = next as unknown as Record<string, unknown>;
+      const refsNeedMigration = shape.type === 'connector' && (['source', 'target'] as const).some(side => {
+        const original = (raw?.[`${side}Ref`] as Record<string, unknown> | undefined);
+        const normalized = (migrated[`${side}Ref`] as Record<string, unknown> | undefined);
+        return Boolean(normalized && (original?.kind !== normalized.kind || original?.pointId !== normalized.pointId));
+      });
+      const contextChanged = resolvedContext !== storedContext;
+      const needsParallelOrder = laneManagedConnector && raw?.parallelOrder !== parallelOrder;
+      const needsSchema = raw?.umlSchemaVersion !== UML_FOUNDATION_SCHEMA_VERSION;
+      const structuredDataNeedsWrite = shape.type === 'diagram'
+        && (definition.dataCapabilities?.includes('classifier') || definition.dataCapabilities?.includes('instance')
+          || resolvedContext === 'state' || resolvedContext === 'activity')
+        && JSON.stringify(raw?.data ?? {}) !== JSON.stringify((next as DiagramShape).data ?? {})
+        || shape.type === 'connector' && (definition.semantic?.family === 'uml.state-edge' || definition.semantic?.family === 'uml.activity-edge')
+          && (JSON.stringify(raw?.stateTransition ?? null) !== JSON.stringify((next as ConnectorShape).stateTransition ?? null)
+            || JSON.stringify(raw?.activityFlow ?? null) !== JSON.stringify((next as ConnectorShape).activityFlow ?? null));
+      const sequenceDataNeedsWrite = shape.type === 'connector' && definition.semantic?.family === 'uml.sequence-edge'
+        ? JSON.stringify(raw?.sequenceEvent ?? null) !== JSON.stringify((next as ConnectorShape).sequenceEvent ?? null)
+        : shape.type === 'diagram' && (definition.semantic?.family === 'uml.sequence-participant'
+          || definition.semantic?.family === 'uml.sequence-control' || definition.semantic?.family === 'uml.sequence-frame')
+          ? JSON.stringify(raw?.data ?? {}) !== JSON.stringify((next as DiagramShape).data ?? {}) : false;
+      const contentGeometryNeedsWrite = shape.type === 'diagram'
+        && (definition.dataCapabilities?.includes('classifier') || definition.dataCapabilities?.includes('instance')
+          || definition.semantic?.family === 'uml.use-case' || definition.semantic?.family === 'uml.actor'
+          || ['uml.state', 'uml.composite-state', 'uml.action', 'uml.object-node'].includes(shape.shapeId))
+        && (raw?.w !== (next as DiagramShape).w || raw?.h !== (next as DiagramShape).h);
+      const connectorBoundsNeedWrite = shape.type === 'connector'
+        && (raw?.minX !== migrated.minX || raw?.minY !== migrated.minY || raw?.maxX !== migrated.maxX || raw?.maxY !== migrated.maxY);
+      if (needsSchema || refsNeedMigration || contextChanged || needsParallelOrder || structuredDataNeedsWrite
+        || contentGeometryNeedsWrite || connectorBoundsNeedWrite || sequenceDataNeedsWrite) changed.push(next);
+    }
+    // Content migration can grow a UML box before the live engine starts observing the map.
+    // Re-resolve every attached endpoint against those upgraded owner geometries in the same
+    // load transaction; otherwise a legacy use-case/class label can shift a port and leave a
+    // persisted connector stale until the owner is moved again.
+    if (changed.length || records.some(shape => shape.type === 'connector' && shape.shapeId === 'uml.state-transition')) {
+      const upgraded = new Map(records.map(shape => [shape.id, shape]));
+      const changedIndex = new Map<string, number>();
+      changed.forEach((shape, index) => { upgraded.set(shape.id, shape); changedIndex.set(shape.id, index); });
+      const stageChanged = (shape: AnyShape) => {
+        const index = changedIndex.get(shape.id);
+        if (index === undefined) { changedIndex.set(shape.id, changed.length); changed.push(shape); }
+        else changed[index] = shape;
+        upgraded.set(shape.id, shape);
+      };
+      for (const original of records) {
+        if (original.type !== 'connector' || original.shapeId !== 'uml.state-transition') continue;
+        const current = (upgraded.get(original.id) ?? original) as ConnectorShape;
+        if (!current.sourceRef || !current.targetRef) continue;
+        const source = upgraded.get(current.sourceRef.shapeId), target = upgraded.get(current.targetRef.shapeId);
+        if (source?.type !== 'diagram' || target?.type !== 'diagram') continue;
+        const sourceRegion = (source.data?.stateVertex as { regionId?: string } | undefined)?.regionId;
+        const targetRegion = (target.data?.stateVertex as { regionId?: string } | undefined)?.regionId;
+        let regionId = sourceRegion === targetRegion ? sourceRegion : undefined;
+        if (!regionId && target.shapeId === 'uml.entry-point') regionId = sourceRegion;
+        if (!regionId && source.shapeId === 'uml.exit-point') regionId = targetRegion;
+        if (!regionId && (source.shapeId === 'uml.entry-point' || source.shapeId === 'uml.exit-point'
+          || target.shapeId === 'uml.entry-point' || target.shapeId === 'uml.exit-point')) regionId = sourceRegion ?? targetRegion;
+        if (!regionId || current.stateTransition?.regionId === regionId) continue;
+        stageChanged({ ...current, stateTransition: { ...(current.stateTransition ?? {}), regionId } });
+      }
+      for (const original of records) {
+        if (original.type !== 'connector') continue;
+        const current = (upgraded.get(original.id) ?? original) as ConnectorShape;
+        let next = current, attachmentChanged = false;
+        for (const side of ['source', 'target'] as const) {
+          const ref = side === 'source' ? next.sourceRef : next.targetRef;
+          if (!ref) continue;
+          const owner = upgraded.get(ref.shapeId);
+          if (!owner || !isConnectableShape(owner) || !('x' in owner)) continue;
+          const point = connectionPointById(owner as BoxShape, ref.pointId);
+          if (!point || (ref.kind !== undefined && ref.kind !== point.kind)) continue;
+          const updatedRef = { ...ref, kind: point.kind };
+          const differs = side === 'source'
+            ? Math.hypot(next.x1 - point.x, next.y1 - point.y) > 1e-7 || ref.kind !== point.kind
+            : Math.hypot(next.x2 - point.x, next.y2 - point.y) > 1e-7 || ref.kind !== point.kind;
+          if (!differs) continue;
+          attachmentChanged = true;
+          next = side === 'source'
+            ? { ...next, x1: point.x, y1: point.y, sourceRef: updatedRef }
+            : { ...next, x2: point.x, y2: point.y, targetRef: updatedRef };
+        }
+        if (!attachmentChanged) continue;
+        next = { ...next, ...connectorBounds(next) };
+        stageChanged(next);
+      }
+      this.putMany(changed, { origin: this.loadMigrationOrigin, notify: false, syncAttachments: false });
+    }
+    for (const shape of [...this.shapes.values()]) {
+      if (shape.type === 'connector' && shape.shapeId === 'uml.create-message')
+        this.synchronizeSequenceCreateOwnership(shape as ConnectorShape, this.loadMigrationOrigin);
+      if (shape.type === 'diagram' && getShapeDefinition(shape.shapeId)?.semantic?.connectionPointProvider === 'sequence-lifeline')
+        this.synchronizeSequenceDestruction(shape as DiagramShape, this.loadMigrationOrigin);
+    }
+  }
+
+  setDiagramContext(context: UMLDiagramFamily | null) {
+    this.diagramContext = context;
+  }
+
+  getDiagramContext() { return this.diagramContext; }
+
+  getSemanticContextForShape(id: string): UMLDiagramFamily | null {
+    const shape = this.shapes.get(id);
+    if (!shape || (shape.type !== 'diagram' && shape.type !== 'connector')) return null;
+    const definition = this.definitionForEndpoint(shape);
+    if (definition?.semantic?.notation !== 'uml') return null;
+    if (shape.type !== 'connector')
+      return shape.diagramContext ?? contextForDefinition(definition, this.diagramContext) ?? null;
+    const connector = shape as ConnectorShape;
+    const source = connector.sourceRef ? this.shapes.get(connector.sourceRef.shapeId) : undefined;
+    const target = connector.targetRef ? this.shapes.get(connector.targetRef.shapeId) : undefined;
+    return contextForConnector(definition, source ? this.definitionForEndpoint(source) : undefined,
+      target ? this.definitionForEndpoint(target) : undefined, connector.diagramContext ?? this.diagramContext) ?? null;
+  }
+
+  getDiagramGraphDiagnostics(): DiagramGraphDiagnostic[] {
+    const diagnostics = diagnoseUmlGraph([...this.shapes.values()]);
+    for (const shape of this.shapes.values()) {
+      if ((shape.type !== 'diagram' && shape.type !== 'connector') || !shape.containerId) continue;
+      const definition = this.definitionForEndpoint(shape);
+      if (definition?.semantic?.notation !== 'uml') continue;
+      const parent = this.shapes.get(shape.containerId);
+      const contained = shape.type === 'diagram' && parent?.type === 'diagram'
+        ? this.diagramContains(parent as DiagramShape, shape as DiagramShape)
+        : shape.type === 'connector' && parent?.type === 'diagram'
+          ? this.connectorContains(parent as DiagramShape, shape as ConnectorShape) : false;
+      const cycle = this.hasContainmentCycle(shape.id, shape.containerId);
+      if (!contained || cycle) diagnostics.push({ id: shape.id, code: cycle ? 'container-cycle' : 'outside-container-bounds',
+        severity: 'invalid', ...(shape.diagramContext ? { family: shape.diagramContext } : {}),
+        message: cycle ? 'Semantic container ownership contains a cycle.' : 'Object geometry is outside its explicitly assigned container.',
+        relatedIds: [shape.id, shape.containerId] });
+    }
+    return diagnostics;
+  }
+
+  private queueGraphDiagnostics() {
+    if (!this.onGraphUpdate || this.graphNotifyQueued) return;
+    this.graphNotifyQueued = true;
+    queueMicrotask(() => {
+      this.graphNotifyQueued = false;
+      if (!this.destroyed) this.onGraphUpdate?.(this.getDiagramGraphDiagnostics());
+    });
+  }
+
+  private normalizeBehavioralOwnership(
+    shape: DiagramShape,
+    containerId = shape.containerId,
+    parentShapeId?: string,
+  ): DiagramShape {
+    const definition = getShapeDefinition(shape.shapeId);
+    if (definition?.semantic?.notation !== 'uml') return shape;
+    let context = shape.diagramContext ?? contextForDefinition(definition, this.diagramContext);
+    if (parentShapeId === 'uml.composite-state') context = 'state';
+    else if (parentShapeId === 'uml.activity-partition' || parentShapeId === 'uml.activity') context = 'activity';
+    let data = normalizeBehavioralDiagramData(definition, shape.id, { ...(shape.data ?? {}) }, context,
+      containerId, parentShapeId);
+    if (context === 'state' && data.stateVertex && typeof data.stateVertex === 'object') {
+      const parent = containerId ? this.shapes.get(containerId) : undefined;
+      const regions = parent?.type === 'diagram' && parent.shapeId === 'uml.composite-state'
+        ? (parent.data?.stateComposite as { regions?: Array<{ id?: string }> } | undefined)?.regions ?? [] : [];
+      const currentRegion = (data.stateVertex as { regionId?: string }).regionId;
+      const regionId = parent?.type === 'diagram' && parent.shapeId === 'uml.composite-state'
+        ? regions.some(region => region.id === currentRegion) ? currentRegion! : regions[0]?.id ?? UML_STATE_FIRST_REGION_ID(parent.id)
+        : UML_STATE_ROOT_REGION_ID;
+      data.stateVertex = { ...(data.stateVertex as object), regionId };
+    }
+    if (context === 'state' && data.statePoint && typeof data.statePoint === 'object') {
+      const point = { ...(data.statePoint as Record<string, unknown>) };
+      if (containerId && parentShapeId === 'uml.composite-state') point.ownerStateId = containerId;
+      else delete point.ownerStateId;
+      data.statePoint = point;
+    }
+    return { ...shape, ...(context ? { diagramContext: context } : {}),
+      ...(containerId ? { containerId } : { containerId: undefined }), data };
+  }
+
+  private statePointAnchor(
+    composite: DiagramShape,
+    point: DiagramShape,
+    side: 'north' | 'east' | 'south' | 'west',
+    offsetPermille: number,
+  ): { x: number; y: number } {
+    const offset = Math.max(0, Math.min(1000, offsetPermille)) / 1000;
+    const local = side === 'north' ? { x: composite.w * offset, y: 0 }
+      : side === 'east' ? { x: composite.w, y: composite.h * offset }
+        : side === 'south' ? { x: composite.w * offset, y: composite.h }
+          : { x: 0, y: composite.h * offset };
+    const world = objectPointToWorld(composite, local);
+    return { x: world.x - point.w / 2, y: world.y - point.h / 2 };
+  }
+
+  private anchorOwnedStatePoint(point: DiagramShape, composite: DiagramShape, origin: object = this,
+    preserveSideAndOffset = false, write = true): DiagramShape {
+    if (!['uml.entry-point', 'uml.exit-point'].includes(point.shapeId)) return point;
+    const localCenter = worldPointToObject(composite, { x: point.x + point.w / 2, y: point.y + point.h / 2 });
+    const metadata = point.data?.statePoint as Record<string, unknown> | undefined;
+    const storedSide = ['north', 'east', 'south', 'west'].includes(String(metadata?.side))
+      ? metadata!.side as 'north' | 'east' | 'south' | 'west' : undefined;
+    const side = preserveSideAndOffset && storedSide ? storedSide : ([            
+      { side: 'north' as const, distance: Math.abs(localCenter.y) },
+      { side: 'east' as const, distance: Math.abs(localCenter.x - composite.w) },
+      { side: 'south' as const, distance: Math.abs(localCenter.y - composite.h) },
+      { side: 'west' as const, distance: Math.abs(localCenter.x) },
+    ].sort((left, right) => left.distance - right.distance)[0]?.side ?? 'west');
+    const rawOffset = side === 'north' || side === 'south'
+      ? localCenter.x / Math.max(1, composite.w) * 1000
+      : localCenter.y / Math.max(1, composite.h) * 1000;
+    const offsetPermille = preserveSideAndOffset && typeof metadata?.offsetPermille === 'number' && storedSide === side
+      ? Math.max(0, Math.min(1000, Math.round(metadata.offsetPermille)))
+      : Math.max(0, Math.min(1000, Math.round(rawOffset)));
+    const anchor = this.statePointAnchor(composite, point, side, offsetPermille);
+    const data = { ...(point.data ?? {}), statePoint: { ...(metadata ?? {}), version: 1 as const, pointId: point.id,
+      ownerStateId: composite.id, side, offsetPermille } };
+    const next = { ...point, containerId: composite.id, data, x: anchor.x, y: anchor.y };
+    const moved = Math.hypot(next.x - point.x, next.y - point.y) > 0.01;
+    if (write && (moved || JSON.stringify(data) !== JSON.stringify(point.data ?? {})))
+      this.put(next, { origin, syncAttachments: true });
+    return next;
+  }
+
+  private reanchorOwnedStatePoints(compositeId: string, preserveSideAndOffset = true) {
+    const composite = this.shapes.get(compositeId);
+    if (composite?.type !== 'diagram' || composite.shapeId !== 'uml.composite-state') return;
+    const children = [...(this.ownedIdsByContainer.get(compositeId) ?? [])];
+    for (const id of children) {
+      const point = this.shapes.get(id);
+      if (point?.type === 'diagram' && (point.shapeId === 'uml.entry-point' || point.shapeId === 'uml.exit-point'))
+        this.anchorOwnedStatePoint(point as DiagramShape, composite as DiagramShape, this, preserveSideAndOffset);
+    }
+  }
+
   private diagramContains(container: DiagramShape, child: DiagramShape): boolean {
     const containerDefinition = getShapeDefinition(container.shapeId), childDefinition = getShapeDefinition(child.shapeId);
     if (!containerDefinition || !childDefinition || !containerAcceptsSemanticChild(containerDefinition, childDefinition)) return false;
+    if ((child.shapeId === 'uml.entry-point' || child.shapeId === 'uml.exit-point')
+      && container.shapeId === 'uml.composite-state') {
+      const point = child.data?.statePoint as Record<string, unknown> | undefined;
+      if (child.containerId === container.id && point?.ownerStateId === container.id
+        && ['north', 'east', 'south', 'west'].includes(String(point.side))
+        && typeof point.offsetPermille === 'number') {
+        const expected = this.statePointAnchor(container, child, point.side as 'north' | 'east' | 'south' | 'west', point.offsetPermille);
+        return Math.hypot(expected.x - child.x, expected.y - child.y) <= 1.5;
+      }
+      const local = worldPointToObject(container, { x: child.x + child.w / 2, y: child.y + child.h / 2 });
+      return local.x >= -child.w / 2 - 2 && local.y >= -child.h / 2 - 2
+        && local.x <= container.w + child.w / 2 + 2 && local.y <= container.h + child.h / 2 + 2;
+    }
+    const childRole = childDefinition.semantic?.role;
+    const isSequenceOwnedControl = childDefinition.semantic?.family === 'uml.sequence-control'
+      && (childRole === 'activation bar' || childRole === 'lifeline destruction mark');
+    if (isSequenceOwnedControl && containerDefinition.semantic?.connectionPointProvider === 'sequence-lifeline') {
+      const center = worldPointToObject(container, { x: child.x + child.w / 2, y: child.y + child.h / 2 });
+      const startY = sequenceParticipantHeaderHeight(containerDefinition.geometry);
+      return center.x >= -1 && center.x <= container.w + 1
+        && center.y >= Math.min(container.h, startY) - 1 && center.y <= container.h + 1;
+    }
+    let contentLeft = 0, contentTop = 0, contentRight = container.w, contentBottom = container.h;
+    if (containerDefinition.geometry === 'umlBoundary' && childDefinition.semantic?.family === 'uml.use-case')
+      contentTop = Math.min(container.h, UML_BOUNDARY_TITLE_HEIGHT);
+    if (container.shapeId === 'uml.activity-partition') {
+      const partition = container.data?.activityPartition as { orientation?: string } | undefined;
+      if (partition?.orientation === 'horizontal') contentLeft = Math.min(container.w, container.w * 0.24);
+      else contentTop = Math.min(container.h, container.h * 0.24);
+    }
+    if (container.shapeId === 'uml.activity') contentTop = Math.min(container.h, 34);
+    if (container.shapeId === 'uml.composite-state' && child.diagramContext === 'state') {
+      const regions = (container.data?.stateComposite as { regions?: Array<{ id?: string }> } | undefined)?.regions ?? [];
+      const regionId = (child.data?.stateVertex as { regionId?: string } | undefined)?.regionId;
+      const regionIndex = regions.findIndex(region => region.id === regionId);
+      if (regionIndex < 0 || !regions.length) return false;
+      const header = typeof container.params.stateHeaderFraction === 'number'
+        ? Math.max(0.29, Math.min(0.62, container.params.stateHeaderFraction)) : 0.29;
+      const contentHeight = container.h * (1 - header);
+      contentTop = container.h * header + contentHeight * regionIndex / regions.length;
+      contentBottom = container.h * header + contentHeight * (regionIndex + 1) / regions.length;
+      contentLeft = container.w * 0.08; contentRight = container.w * 0.92;
+    }
     return rotatedBoxCorners(child).every(([x, y]) => {
       const local = worldPointToObject(container, { x, y });
-      return local.x >= -0.5 && local.y >= -0.5 && local.x <= container.w + 0.5 && local.y <= container.h + 0.5;
+      return local.x >= contentLeft - 0.5 && local.y >= contentTop - 0.5
+        && local.x <= contentRight + 0.5 && local.y <= contentBottom + 0.5;
     });
+  }
+
+  private containerResizeAllowed(original: DiagramShape, resized: DiagramShape): boolean {
+    // Behavioral containers are semantic owners, not scale groups. Their frame can resize without
+    // touching child geometry; any newly out-of-bounds child remains visible to graph diagnostics.
+    if (original.shapeId === 'uml.composite-state' || original.shapeId === 'uml.activity-partition') return true;
+    const directIds = this.ownedIdsByContainer.get(original.id) ?? new Set<string>();
+    const directChildren = [...directIds].map(id => this.shapes.get(id))
+      .filter((child): child is DiagramShape => child?.type === 'diagram');
+    if (directChildren.some(child => !this.diagramContains(resized, child))) return false;
+    const directConnectors = [...directIds].map(id => this.shapes.get(id))
+      .filter((candidate): candidate is ConnectorShape => candidate?.type === 'connector');
+    return directConnectors.every(connector => this.connectorContains(resized, connector));
+  }
+
+  private diagramIsInside(container: DiagramShape, child: DiagramShape): boolean {
+    let current: DiagramShape | undefined = child;
+    const seen = new Set<string>();
+    while (current && !seen.has(current.id)) {
+      if (current.id === container.id || this.diagramContains(container, current)) return true;
+      seen.add(current.id);
+      const parent: AnyShape | DiagramShape | undefined = current.containerId
+        ? this.shapes.get(current.containerId) : this.findContainingContainer(current);
+      current = parent?.type === 'diagram' ? parent as DiagramShape : undefined;
+    }
+    return false;
+  }
+
+  private connectorContains(container: DiagramShape, connector: ConnectorShape): boolean {
+    const containerDefinition = getShapeDefinition(container.shapeId), connectorDefinition = getShapeDefinition(connector.shapeId);
+    if (!containerDefinition || !connectorDefinition || !containerAcceptsSemanticChild(containerDefinition, connectorDefinition)
+      || !connector.sourceRef || !connector.targetRef) return false;
+    const source = this.shapes.get(connector.sourceRef.shapeId), target = this.shapes.get(connector.targetRef.shapeId);
+    if (!source || source.type !== 'diagram' || !target || target.type !== 'diagram') return false;
+    const sequenceFragmentEdge = containerDefinition.semantic?.family === 'uml.sequence-frame'
+      && connectorDefinition.semantic?.family === 'uml.sequence-edge';
+    if (sequenceFragmentEdge) {
+      // A combined fragment owns occurrences and message routes, not whole lifelines. Requiring
+      // each participant's full box to fit inside the frame would make ordinary cross-frame
+      // interactions impossible because lifelines intentionally continue beyond the fragment.
+      const sourceFamily = getShapeDefinition((source as DiagramShape).shapeId)?.semantic?.family;
+      const targetFamily = getShapeDefinition((target as DiagramShape).shapeId)?.semantic?.family;
+      const endpointRoleAllowed = (family: string | undefined) =>
+        family === 'uml.sequence-participant' || family === 'uml.sequence-control';
+      if (!endpointRoleAllowed(sourceFamily) || !endpointRoleAllowed(targetFamily)) return false;
+    } else if (!this.diagramIsInside(container, source as DiagramShape)
+      || !this.diagramIsInside(container, target as DiagramShape)) return false;
+    const route = getConnectorRoute(connector);
+    if (!route.length) return false;
+    return route.every(([x, y]) => {
+      const local = worldPointToObject(container, { x, y });
+      return local.x >= -1 && local.y >= -1 && local.x <= container.w + 1 && local.y <= container.h + 1;
+    });
+  }
+
+  private normalizeSequenceOwnedControl(child: DiagramShape, parent: DiagramShape): DiagramShape {
+    const childDefinition = getShapeDefinition(child.shapeId), parentDefinition = getShapeDefinition(parent.shapeId);
+    const role = childDefinition?.semantic?.role;
+    if (childDefinition?.semantic?.family !== 'uml.sequence-control' || !parentDefinition
+      || parentDefinition.semantic?.connectionPointProvider !== 'sequence-lifeline'
+      || (role !== 'activation bar' && role !== 'lifeline destruction mark')) return child;
+    const local = worldPointToObject(parent, { x: child.x + child.w / 2, y: child.y + child.h / 2 });
+    const lineStart = Math.min(parent.h, sequenceParticipantHeaderHeight(parentDefinition.geometry));
+    const halfHeight = child.h / 2;
+    const centerY = Math.max(lineStart + halfHeight, Math.min(parent.h - halfHeight, local.y));
+    const center = objectPointToWorld(parent, { x: parent.w / 2, y: centerY });
+    const positioned = withComputedShapeBounds({ ...child, x: center.x - child.w / 2, y: center.y - child.h / 2,
+      rotation: parent.rotation ?? 0 }) as DiagramShape;
+    const data = normalizeSequenceDiagramData(positioned.data ?? {}, positioned.shapeId, positioned.id,
+      parent.id, positioned.h, center.y);
+    if (role === 'activation bar' && data.sequenceActivation) {
+      const activation = data.sequenceActivation;
+      const sequenceEvents = this.sequenceEventsInTimeline(undefined);
+      const startOrder = activation.startOrder ?? (sequenceEvents.length ? this.sequenceOrderBoundaryAtVisualY(positioned.y) : undefined);
+      const endOrder = activation.endOrder ?? (sequenceEvents.length ? this.sequenceOrderBoundaryAtVisualY(positioned.y + positioned.h) : undefined);
+      data.sequenceActivation = {
+        ...activation,
+        participantId: parent.id,
+        duration: Math.max(1, activation.duration || positioned.h),
+        ...(startOrder !== undefined ? { startOrder } : {}),
+        ...(endOrder !== undefined ? { endOrder } : {}),
+      };
+      if (!sequenceEvents.length) {
+        delete data.sequenceActivation.startOrder;
+        delete data.sequenceActivation.endOrder;
+      }
+    } else if (role === 'lifeline destruction mark' && data.sequenceLifecycle) {
+      const lifecycle = data.sequenceLifecycle;
+      data.sequenceLifecycle = { ...lifecycle, participantId: parent.id, visualY: center.y,
+        order: lifecycle.order ?? this.sequenceOrderAtVisualY(center.y) };
+    }
+    return { ...positioned, data } as DiagramShape;
+  }
+
+  private sequenceControlWithTemporalMetadata(
+    shape: DiagramShape,
+    updatePosition: boolean,
+    updateDuration: boolean,
+  ): DiagramShape {
+    const definition = getShapeDefinition(shape.shapeId);
+    if (definition?.semantic?.family !== 'uml.sequence-control') return shape;
+    const center = objectPointToWorld(shape, { x: shape.w / 2, y: shape.h / 2 });
+    const normalized = normalizeSequenceDiagramData(shape.data ?? {}, shape.shapeId, shape.id,
+      shape.containerId, shape.h, center.y);
+    if (shape.shapeId === 'uml.activation' && normalized.sequenceActivation) {
+      const activation = normalized.sequenceActivation;
+      const sequenceEvents = this.sequenceEventsInTimeline(undefined);
+      const sequenceOrder = updatePosition && sequenceEvents.length ? {
+        startOrder: this.sequenceOrderBoundaryAtVisualY(shape.y),
+        endOrder: this.sequenceOrderBoundaryAtVisualY(shape.y + shape.h),
+      } : {};
+      normalized.sequenceActivation = {
+        ...activation,
+        ...(shape.containerId ? { participantId: shape.containerId } : {}),
+        ...(updateDuration ? { duration: Math.max(1, shape.h) } : {}),
+        ...sequenceOrder,
+        ...(updatePosition && !sequenceEvents.length ? { startOrder: undefined, endOrder: undefined } : {}),
+      };
+      if (updatePosition && !sequenceEvents.length) {
+        delete normalized.sequenceActivation.startOrder;
+        delete normalized.sequenceActivation.endOrder;
+      }
+    } else if (shape.shapeId === 'uml.destroy' && normalized.sequenceLifecycle) {
+      const lifecycle = normalized.sequenceLifecycle;
+      normalized.sequenceLifecycle = {
+        ...lifecycle,
+        ...(shape.containerId ? { participantId: shape.containerId } : {}),
+        visualY: Math.round(center.y * 1000) / 1000,
+        ...(updatePosition ? { order: this.sequenceOrderAtVisualY(center.y) } : {}),
+      };
+    }
+    return { ...shape, data: normalized };
+  }
+
+  private sequenceOperandForEvent(frame: DiagramShape, event: SequenceMessageEventData): string | undefined {
+    const fragment = frame.data?.sequenceFragment as SequenceFragmentData | undefined;
+    if (!fragment?.operands.length) return undefined;
+    if (fragment.operands.length === 1) return fragment.operands[0].id;
+    const local = worldPointToObject(frame, { x: frame.x + frame.w / 2, y: event.visualY });
+    const contentTop = Math.min(frame.h, frame.h * 0.14);
+    const contentHeight = Math.max(1, frame.h - contentTop);
+    const index = Math.max(0, Math.min(fragment.operands.length - 1,
+      Math.floor((local.y - contentTop) / contentHeight * fragment.operands.length)));
+    return fragment.operands[index]?.id;
+  }
+
+  /** Fragment ownership is semantic and stable until an explicit containment or event move changes it. */
+  private synchronizeSequenceFragmentMembership(connector: ConnectorShape, force = false): ConnectorShape {
+    if (!isSequenceMessageShape(connector.shapeId) || !connector.sequenceEvent) return connector;
+    const parent = connector.containerId ? this.shapes.get(connector.containerId) : undefined;
+    const parentDefinition = parent?.type === 'diagram' ? getShapeDefinition(parent.shapeId) : undefined;
+    const frame = parent?.type === 'diagram' && parentDefinition?.semantic?.family === 'uml.sequence-frame'
+      ? parent as DiagramShape : undefined;
+    if (!frame) {
+      if (!force || (!connector.sequenceEvent.fragmentId && !connector.sequenceEvent.operandId)) return connector;
+      const sequenceEvent = { ...connector.sequenceEvent };
+      delete sequenceEvent.fragmentId;
+      delete sequenceEvent.operandId;
+      return { ...connector, sequenceEvent };
+    }
+    const fragment = frame.data?.sequenceFragment as SequenceFragmentData | undefined;
+    const operandIds = new Set(fragment?.operands.map(operand => operand.id) ?? []);
+    const current = connector.sequenceEvent;
+    const currentOwnershipIsValid = current.fragmentId === frame.id && Boolean(current.operandId && operandIds.has(current.operandId));
+    if (!force && currentOwnershipIsValid) return connector;
+    const operandId = this.sequenceOperandForEvent(frame, current);
+    if (!fragment || !operandId) return connector;
+    const sequenceEvent = { ...current, fragmentId: frame.id, operandId };
+    return { ...connector, sequenceEvent };
+  }
+
+  private synchronizeEventsInSequenceFragment(frameId: string) {
+    for (const candidate of this.shapes.values()) {
+      if (candidate.type !== 'connector' || getShapeDefinition(candidate.shapeId)?.semantic?.family !== 'uml.sequence-edge') continue;
+      const connector = candidate as ConnectorShape;
+      if (connector.containerId !== frameId && connector.sequenceEvent?.fragmentId !== frameId) continue;
+      const next = this.synchronizeSequenceFragmentMembership(connector, true);
+      if (JSON.stringify(next.sequenceEvent ?? null) !== JSON.stringify(connector.sequenceEvent ?? null))
+        this.put(next, { notify: false, syncAttachments: false });
+    }
+  }
+
+  private synchronizeSequenceDestruction(lifeline: DiagramShape, origin: object = this) {
+    const definition = getShapeDefinition(lifeline.shapeId);
+    if (definition?.semantic?.connectionPointProvider !== 'sequence-lifeline') return;
+    const markers = [...this.shapes.values()].filter((candidate): candidate is DiagramShape => candidate.type === 'diagram'
+      && candidate.shapeId === 'uml.destroy' && candidate.containerId === lifeline.id)
+      .sort((left, right) => {
+        const leftOrder = (left.data?.sequenceLifecycle as { order?: number } | undefined)?.order ?? Number.POSITIVE_INFINITY;
+        const rightOrder = (right.data?.sequenceLifecycle as { order?: number } | undefined)?.order ?? Number.POSITIVE_INFINITY;
+        return leftOrder - rightOrder || left.id.localeCompare(right.id);
+      });
+    const marker = markers[0];
+    const params = { ...(lifeline.params ?? {}) };
+    let lifecycle: SequenceLifecycleData | undefined;
+    if (marker) {
+      const center = objectPointToWorld(marker, { x: marker.w / 2, y: marker.h / 2 });
+      const local = worldPointToObject(lifeline, center);
+      const startY = Math.min(lifeline.h, sequenceParticipantHeaderHeight(definition.geometry));
+      params.sequenceDestroyPermille = Math.round(Math.max(0, Math.min(1000,
+        (local.y - startY) / Math.max(1, lifeline.h - startY) * 1000)));
+      const normalized = normalizeSequenceDiagramData(marker.data ?? {}, marker.shapeId, marker.id,
+        lifeline.id, marker.h, center.y);
+      lifecycle = normalized.sequenceLifecycle ? {
+        ...normalized.sequenceLifecycle,
+        participantId: lifeline.id,
+        visualY: Math.round(center.y * 1000) / 1000,
+        order: normalized.sequenceLifecycle.order ?? this.sequenceOrderAtVisualY(center.y),
+      } : undefined;
+      if (lifecycle && JSON.stringify(marker.data?.sequenceLifecycle ?? null) !== JSON.stringify(lifecycle)) {
+        this.put({ ...marker, data: { ...normalized, sequenceLifecycle: lifecycle } }, { notify: false, syncAttachments: false, origin });
+      }
+    } else {
+      delete params.sequenceDestroyPermille;
+    }
+    const normalizedParticipant = normalizeSequenceDiagramData(lifeline.data ?? {}, lifeline.shapeId, lifeline.id,
+      lifeline.containerId, lifeline.h, lifeline.y + lifeline.h / 2);
+    const participant = normalizedParticipant.sequenceParticipant;
+    if (participant) {
+      if (marker && lifecycle) {
+        participant.destroyedByEventId = lifecycle.lifecycleId;
+        participant.destroyedAtOrder = lifecycle.order;
+      } else {
+        delete participant.destroyedByEventId;
+        delete participant.destroyedAtOrder;
+      }
+    }
+    const data = normalizedParticipant;
+    const nextParticipant = {
+      ...lifeline,
+      params,
+      data,
+    };
+    if (JSON.stringify(nextParticipant.params) === JSON.stringify(lifeline.params ?? {})
+      && JSON.stringify(nextParticipant.data) === JSON.stringify(lifeline.data ?? {})) return;
+    this.put(nextParticipant, { notify: false, origin });
   }
 
   private hasContainmentCycle(childId: string, containerId: string): boolean {
@@ -2418,64 +4599,181 @@ export class CanvasEngine {
     return false;
   }
 
+  private findAcceptedContainerAtPoint(childDefinition: ShapeDefinition, x: number, y: number): DiagramShape | undefined {
+    const candidates = [...this.shapes.values()].filter((candidate): candidate is DiagramShape => {
+      if (candidate.type !== 'diagram') return false;
+      const container = candidate as DiagramShape, definition = getShapeDefinition(container.shapeId);
+      if (!definition?.semantic?.container || !containerAcceptsSemanticChild(definition, childDefinition)) return false;
+      const local = worldPointToObject(container, { x, y });
+      if (local.x < 0 || local.y < 0 || local.x > container.w || local.y > container.h) return false;
+      if (definition.geometry === 'umlBoundary' && childDefinition.semantic?.family === 'uml.use-case'
+        && local.y < Math.min(container.h, UML_BOUNDARY_TITLE_HEIGHT)) return false;
+      if (container.shapeId === 'uml.activity-partition') {
+        const orientation = (container.data?.activityPartition as { orientation?: string } | undefined)?.orientation;
+        if (orientation === 'horizontal' ? local.x < container.w * 0.24 : local.y < container.h * 0.24) return false;
+      }
+      if (container.shapeId === 'uml.composite-state' && childDefinition.semantic?.diagramFamilies?.includes('state')
+        && local.y < container.h * (typeof container.params.stateHeaderFraction === 'number'
+          ? Math.max(0.29, Math.min(0.62, container.params.stateHeaderFraction)) : 0.29)) return false;
+      const sequenceControl = childDefinition.semantic?.family === 'uml.sequence-control'
+        && definition.semantic.connectionPointProvider === 'sequence-lifeline';
+      if (sequenceControl) {
+        const headerHeight = sequenceParticipantHeaderHeight(definition.geometry);
+        if (local.y < Math.min(container.h, headerHeight)) return false;
+      }
+      return true;
+    });
+    return candidates.sort((left, right) => left.w * left.h - right.w * right.h)[0];
+  }
+
   private findContainingContainer(child: DiagramShape): DiagramShape | undefined {
     const candidates = [...this.shapes.values()].filter((candidate): candidate is DiagramShape => candidate.type === 'diagram'
       && candidate.id !== child.id && !this.hasContainmentCycle(child.id, candidate.id) && this.diagramContains(candidate, child));
     return candidates.sort((left, right) => left.w * left.h - right.w * right.h)[0];
   }
 
+  private findContainingConnectorContainer(connector: ConnectorShape): DiagramShape | undefined {
+    const candidates = [...this.shapes.values()].filter((candidate): candidate is DiagramShape => candidate.type === 'diagram'
+      && candidate.id !== connector.id && this.connectorContains(candidate, connector));
+    return candidates.sort((left, right) => left.w * left.h - right.w * right.h)[0];
+  }
+
+  private containedConnectorDescendants(containerId: string): ConnectorShape[] {
+    const ownerIds = new Set([containerId, ...this.containedDescendants(containerId).map(shape => shape.id)]);
+    const connectorIds = new Set<string>();
+    for (const ownerId of ownerIds) for (const id of this.ownedIdsByContainer.get(ownerId) ?? []) connectorIds.add(id);
+    return [...connectorIds].map(id => this.shapes.get(id))
+      .filter((shape): shape is ConnectorShape => shape?.type === 'connector');
+  }
+
   private containedDescendants(containerId: string): DiagramShape[] {
     const descendants: DiagramShape[] = [], visited = new Set<string>([containerId]), queue = [containerId];
     while (queue.length) {
       const parentId = queue.shift()!;
-      for (const candidate of this.shapes.values()) {
-        if (candidate.type !== 'diagram' || (candidate as DiagramShape).containerId !== parentId || visited.has(candidate.id)) continue;
-        visited.add(candidate.id); descendants.push(candidate as DiagramShape); queue.push(candidate.id);
+      for (const id of this.ownedIdsByContainer.get(parentId) ?? []) {
+        if (visited.has(id)) continue;
+        const candidate = this.shapes.get(id);
+        if (!candidate || candidate.type !== 'diagram') continue;
+        visited.add(id); descendants.push(candidate as DiagramShape); queue.push(id);
       }
     }
     return descendants;
   }
 
   private detachContainedChildrenFrom(containerId: string, origin: object) {
-    for (const candidate of this.shapes.values()) {
-      if (candidate.type !== 'diagram' || (candidate as DiagramShape).containerId !== containerId) continue;
-      const next = { ...(candidate as DiagramShape) };
-      delete next.containerId;
-      this.put(next, { origin, notify: false, syncAttachments: false });
+    const directIds = [...(this.ownedIdsByContainer.get(containerId) ?? [])];
+    for (const id of directIds) {
+      const candidate = this.shapes.get(id);
+      if (!candidate || (candidate.type !== 'diagram' && candidate.type !== 'connector')) continue;
+      if (candidate.type === 'diagram') {
+        const next = { ...candidate } as DiagramShape & { containerId?: string };
+        delete next.containerId;
+        if (candidate.diagramContext === 'state') {
+          const data = { ...(candidate.data ?? {}) };
+          if (data.stateVertex && typeof data.stateVertex === 'object')
+            data.stateVertex = { ...(data.stateVertex as UMLStateVertexData), version: 1 as const, regionId: UML_STATE_ROOT_REGION_ID };
+          if (['uml.entry-point', 'uml.exit-point', 'uml.shallow-history', 'uml.deep-history'].includes(candidate.shapeId)) {
+            const point = { ...(candidate.data?.statePoint as UMLStatePointData), version: 1 as const };
+            delete point.ownerStateId;
+            data.statePoint = point;
+          }
+          next.data = data;
+        }
+        if (candidate.diagramContext === 'activity' && candidate.shapeId !== 'uml.activity-partition') {
+          const activityNode = { ...(candidate.data?.activityNode as UMLActivityNodeData), version: 1 as const };
+          delete activityNode.partitionId;
+          next.data = { ...(next.data ?? {}), activityNode };
+        }
+        this.put(next, { origin, notify: false, syncAttachments: true });
+      } else {
+        const next = { ...candidate } as ConnectorShape & { containerId?: string };
+        delete next.containerId;
+        this.put(next, { origin, notify: false });
+      }
     }
   }
 
-  private reconcileContainerMembership(origin: object = this, autoAssign = true) {
-    const diagrams = [...this.shapes.values()].filter((shape): shape is DiagramShape => shape.type === 'diagram');
-    for (const child of diagrams) {
-      const currentId = child.containerId;
-      const current = currentId ? this.shapes.get(currentId) : undefined;
-      let nextId = current?.type === 'diagram' && !this.hasContainmentCycle(child.id, current.id)
-        && this.diagramContains(current as DiagramShape, child) ? current.id : undefined;
-      if (!nextId && autoAssign) nextId = this.findContainingContainer(child)?.id;
-      if (nextId === currentId) continue;
-      const next = { ...child };
-      delete next.containerId;
-      if (nextId) next.containerId = nextId;
-      this.put(next, { origin, notify: false, syncAttachments: false });
+  private assignCreatedObjectContainer(shape: DiagramShape | ConnectorShape) {
+    const live = this.shapes.get(shape.id);
+    if (!live) return;
+    if (live.type === 'diagram') {
+      let diagram = live as DiagramShape;
+      if (getShapeDefinition(diagram.shapeId)?.semantic?.family === 'uml.sequence-control') {
+        diagram = this.sequenceControlWithTemporalMetadata(diagram, true, diagram.shapeId === 'uml.activation');
+        this.put(diagram, { notify: false, syncAttachments: false });
+      }
+      const parent = this.findContainingContainer(diagram);
+      if (!parent) return;
+      let next: DiagramShape = { ...diagram, containerId: parent.id };
+      next = this.normalizeSequenceOwnedControl(next, parent);
+      next = this.normalizeBehavioralOwnership(next, parent.id, parent.shapeId);
+      this.put(next, { syncAttachments: true });
+      if (['uml.entry-point', 'uml.exit-point'].includes(next.shapeId) && parent.shapeId === 'uml.composite-state')
+        next = this.anchorOwnedStatePoint(next, parent);
+      if (diagram.shapeId === 'uml.destroy') this.synchronizeSequenceDestruction(parent);
+    } else if (live.type === 'connector') {
+      const connector = live as ConnectorShape;
+      const parent = this.findContainingConnectorContainer(connector);
+      if (parent) {
+        const owned = this.synchronizeSequenceFragmentMembership({ ...connector, containerId: parent.id } as ConnectorShape, true);
+        this.put(owned, { notify: false });
+      }
     }
   }
 
-  /** Explicit semantic containment; normal drag/create completion also assigns the smallest valid container. */
+  /** Containers available for a deliberate reparent action; no pointer-up inference is performed. */
+  getContainerCandidates(childId: string): DiagramShape[] {
+    const child = this.shapes.get(childId);
+    if (!child || (child.type !== 'diagram' && child.type !== 'connector')) return [];
+    return [...this.shapes.values()].filter((candidate): candidate is DiagramShape => candidate.type === 'diagram'
+      && candidate.id !== childId
+      && (child.type === 'diagram'
+        ? !this.hasContainmentCycle(childId, candidate.id) && this.diagramContains(candidate, child as DiagramShape)
+        : this.connectorContains(candidate, child as ConnectorShape)))
+      .sort((left, right) => left.w * left.h - right.w * right.h || left.id.localeCompare(right.id));
+  }
+
+  /** Explicit semantic containment. Detach, reparent, and move-between-containers are deliberate. */
   setShapeContainer(childId: string, containerId: string | null, commit = true): boolean {
     const child = this.shapes.get(childId);
-    if (!child || child.type !== 'diagram') return false;
+    if (!child || (child.type !== 'diagram' && child.type !== 'connector')) return false;
+    const previousId = child.containerId;
+    if (containerId === previousId) return true;
     if (containerId === null) {
-      const next = { ...(child as DiagramShape) };
+      let next = { ...child } as AnyShape & { containerId?: string };
       delete next.containerId;
-      this.put(next, { syncAttachments: false });
+      if (child.type === 'diagram')
+        next = this.normalizeBehavioralOwnership(next as DiagramShape, undefined, undefined);
+      const unowned = child.type === 'connector'
+        ? this.synchronizeSequenceFragmentMembership(next as ConnectorShape, true) : next as AnyShape;
+      this.put(unowned as AnyShape, { syncAttachments: child.type === 'diagram' });
+      const oldParent = previousId ? this.shapes.get(previousId) : undefined;
+      if (child.type === 'diagram' && child.shapeId === 'uml.destroy' && oldParent?.type === 'diagram')
+        this.synchronizeSequenceDestruction(oldParent as DiagramShape);
       if (commit) this.saveH();
       return true;
     }
     const parent = this.shapes.get(containerId);
-    if (!parent || parent.type !== 'diagram' || this.hasContainmentCycle(childId, containerId)
-      || !this.diagramContains(parent as DiagramShape, child as DiagramShape)) return false;
-    this.put({ ...(child as DiagramShape), containerId }, { syncAttachments: false });
+    if (!parent || parent.type !== 'diagram') return false;
+    let next: AnyShape;
+    if (child.type === 'diagram') {
+      if (this.hasContainmentCycle(childId, containerId) || !this.diagramContains(parent as DiagramShape, child as DiagramShape)) return false;
+      let diagram = this.normalizeSequenceOwnedControl({ ...(child as DiagramShape), containerId }, parent as DiagramShape);
+      diagram = this.normalizeBehavioralOwnership(diagram, containerId, (parent as DiagramShape).shapeId);
+      next = diagram;
+    } else {
+      if (!this.connectorContains(parent as DiagramShape, child as ConnectorShape)) return false;
+      next = this.synchronizeSequenceFragmentMembership({ ...(child as ConnectorShape), containerId } as ConnectorShape, true);
+    }
+    this.put(next, { syncAttachments: child.type === 'diagram' });
+    if (child.type === 'diagram' && ['uml.entry-point', 'uml.exit-point'].includes(child.shapeId)
+      && (parent as DiagramShape).shapeId === 'uml.composite-state')
+      this.anchorOwnedStatePoint(next as DiagramShape, parent as DiagramShape);
+    const oldParent = previousId ? this.shapes.get(previousId) : undefined;
+    if (child.type === 'diagram' && child.shapeId === 'uml.destroy') {
+      if (oldParent?.type === 'diagram') this.synchronizeSequenceDestruction(oldParent as DiagramShape);
+      this.synchronizeSequenceDestruction(parent as DiagramShape);
+    }
     if (commit) this.saveH();
     return true;
   }
@@ -2492,86 +4790,699 @@ export class CanvasEngine {
     return getShapeDefinitionForLegacyType(shape.type);
   }
 
+  private sequenceParticipantIdForEndpoint(endpointId?: string): string | undefined {
+    if (!endpointId) return undefined;
+    const endpoint = this.shapes.get(endpointId);
+    if (!endpoint || endpoint.type !== 'diagram') return undefined;
+    const definition = getShapeDefinition(endpoint.shapeId);
+    if (definition?.semantic?.family === 'uml.sequence-participant') return endpoint.id;
+    if (definition?.semantic?.family === 'uml.sequence-control' && endpoint.containerId) {
+      const owner = this.shapes.get(endpoint.containerId);
+      return owner?.type === 'diagram' && getShapeDefinition(owner.shapeId)?.semantic?.family === 'uml.sequence-participant'
+        ? owner.id : undefined;
+    }
+    return undefined;
+  }
+
+  private behavioralEdgeFamily(connectorDefinition: ShapeDefinition | undefined): 'uml.activity-edge' | 'uml.state-edge' | undefined {
+    const family = connectorDefinition?.semantic?.family;
+    return family === 'uml.activity-edge' || family === 'uml.state-edge' ? family : undefined;
+  }
+
+  private behavioralFlowCount(nodeId: string, family: 'uml.activity-edge' | 'uml.state-edge', side: 'source' | 'target', excludingId?: string): number {
+    const node = this.shapes.get(nodeId);
+    if (!node || !('minX' in node)) return 0;
+    const nearby = this.rtree.search({ minX: node.minX - 4, minY: node.minY - 4, maxX: node.maxX + 4, maxY: node.maxY + 4 });
+    const familyContext = family === 'uml.state-edge' ? 'state' : 'activity';
+    return nearby.filter(candidate => candidate.type === 'connector' && candidate.id !== excludingId
+      && this.definitionForEndpoint(candidate)?.semantic?.family === family
+      && this.getSemanticContextForShape(candidate.id) === familyContext
+      && (side === 'source' ? (candidate as ConnectorShape).sourceRef?.shapeId
+        : (candidate as ConnectorShape).targetRef?.shapeId) === nodeId).length;
+  }
+
+  private behavioralEndpointContextAllowed(connectorDefinition: ShapeDefinition | undefined, node: AnyShape): boolean {
+    const family = this.behavioralEdgeFamily(connectorDefinition);
+    if (!family) return true;
+    const expected = family === 'uml.state-edge' ? 'state' : 'activity';
+    const actual = this.getSemanticContextForShape(node.id);
+    return actual === null || actual === expected;
+  }
+
+  private behavioralEndpointCapacityAllowed(
+    connectorDefinition: ShapeDefinition | undefined, node: AnyShape, side: 'source' | 'target', excludingId?: string,
+  ): boolean {
+    const family = this.behavioralEdgeFamily(connectorDefinition);
+    if (!family || node.type !== 'diagram') return true;
+    const context = this.getSemanticContextForShape(node.id);
+    if (family === 'uml.state-edge' && context !== 'state' || family === 'uml.activity-edge' && context !== 'activity') return true;
+    const policyRecord = node as unknown as import('./shapes/statePolicy').BehavioralPolicyRecord;
+    const limits = family === 'uml.state-edge' ? StatePolicy.flowRule(policyRecord) : ActivityPolicy.flowRule(policyRecord);
+    if (!limits) return true;
+    const maximum = side === 'source' ? limits.maxOutgoing : limits.maxIncoming;
+    if (maximum === undefined) return true;
+    return this.behavioralFlowCount(node.id, family, side, excludingId) < maximum;
+  }
+
+  /** Backward-compatible summary backed by the centralized context-aware graph diagnostics. */
+  getBehavioralGraphIssues(): string[] {
+    return this.getDiagramGraphDiagnostics().filter(issue => issue.family === 'activity' || issue.family === 'state')
+      .map(issue => `${issue.id}: ${issue.message}`);
+  }
+
   private connectionPointCandidates(
     x: number, y: number, excludeId: string, connectorDefinition: ShapeDefinition | undefined,
-    side: 'source' | 'target',
-  ): Array<{ point: { id: string; x: number; y: number }; shapeId: string; definition: ShapeDefinition | undefined; distance: number }> {
+    side: EndpointSide, options: { includeIncompatible?: boolean; maxDistance?: number; onlyShapeId?: string; sequenceTime?: number } = {},
+  ): Array<{ point: ShapeConnectionPoint; shapeId: string; definition: ShapeDefinition | undefined; distance: number }> {
     const threshold = 16 / Math.max(0.04, this.cam.zoom);
-    const candidates: Array<{ point: { id: string; x: number; y: number }; shapeId: string; definition: ShapeDefinition | undefined; distance: number }> = [];
-    for (const shape of this.shapes.values()) {
+    const maxDistance = options.maxDistance ?? threshold;
+    const candidates: Array<{ point: ShapeConnectionPoint; shapeId: string; definition: ShapeDefinition | undefined; distance: number }> = [];
+    const nearbyShapes = options.onlyShapeId
+      ? [this.shapes.get(options.onlyShapeId)].filter((shape): shape is AnyShape => Boolean(shape))
+      : Number.isFinite(maxDistance)
+        ? this.rtree.search({ minX: x - maxDistance, minY: y - maxDistance, maxX: x + maxDistance, maxY: y + maxDistance })
+        : [...this.shapes.values()];
+    for (const shape of nearbyShapes) {
       if (shape.id === excludeId || !isConnectableShape(shape) || !('x' in shape)) continue;
       const definition = this.definitionForEndpoint(shape);
-      if (!connectorEndpointSideAllowed(connectorDefinition!, definition, side)) continue;
+      if (!options.includeIncompatible && connectorDefinition
+        && (!connectorEndpointSideAllowed(connectorDefinition, definition, side)
+          || !this.behavioralEndpointContextAllowed(connectorDefinition, shape)
+          || !this.behavioralEndpointCapacityAllowed(connectorDefinition, shape, side, excludeId))) continue;
+      const provider = definition?.semantic?.connectionPointProvider;
+      const points = connectionPointsForBox(shape as BoxShape, { x, y });
+      const isCreateMessage = connectorDefinition?.id === 'uml.create-message' && side === 'target';
+      const activeConnector = this.shapes.get(excludeId);
+      const oppositeRef = activeConnector?.type === 'connector'
+        ? side === 'source' ? activeConnector.targetRef : activeConnector.sourceRef : undefined;
+      const oppositeParticipantId = oppositeRef ? this.sequenceParticipantIdForEndpoint(oppositeRef.shapeId) : undefined;
+      const sameParticipantLoop = Boolean(oppositeParticipantId
+        && oppositeParticipantId === this.sequenceParticipantIdForEndpoint(shape.id));
+      const pointSequenceTime = sameParticipantLoop ? y : options.sequenceTime;
+      let usablePoints: ShapeConnectionPoint[] = provider === 'sequence-lifeline'
+        ? points.filter(point => point.id.startsWith('lifeline-time:') || point.id.startsWith('lifeline:')
+          || (isCreateMessage && point.id === 'participant:create'))
+        : points;
+      if ((provider === 'sequence-lifeline' || provider === 'sequence-activation')
+        && pointSequenceTime !== undefined && !isCreateMessage) {
+        usablePoints = connectionPointsAtSequenceTime(shape as BoxShape, pointSequenceTime);
+      }
+      if (isCreateMessage) usablePoints = points.filter(point => point.id === 'participant:create');
       let best: typeof candidates[number] | null = null;
-      for (const point of connectionPointsForBox(shape as BoxShape)) {
+      for (const point of usablePoints) {
         if (connectorDefinition?.connectorRule && connectorDefinition.connectorRule !== 'generic' && point.id === 'center') continue;
-        const distance = Math.hypot(point.x - x, point.y - y);
-        if (distance <= threshold && (!best || distance < best.distance)) best = { point, shapeId: shape.id, definition, distance };
+        const distance = (provider === 'sequence-lifeline' || provider === 'sequence-activation')
+          && options.sequenceTime !== undefined ? Math.abs(point.x - x) : Math.hypot(point.x - x, point.y - y);
+        const prefersStructuredRow = provider === 'structured-table-rows' && point.id.startsWith('table-row:')
+          && best && !best.point.id.startsWith('table-row:') && Math.abs(distance - best.distance) <= 0.01;
+        const prefersFloating = point.kind === 'floating' && best && best.point.kind !== 'floating'
+          && Math.abs(distance - best.distance) <= 0.01;
+        if (distance <= maxDistance && (!best || distance < best.distance - 0.01 || prefersStructuredRow || prefersFloating))
+          best = { point, shapeId: shape.id, definition, distance };
       }
       if (best) candidates.push(best);
     }
     return candidates.sort((a, b) => a.distance - b.distance || a.shapeId.localeCompare(b.shapeId) || a.point.id.localeCompare(b.point.id));
   }
 
-  private snapConnectorShape(connector: ConnectorShape) {
-    const connectorDefinition = getShapeDefinition(connector.shapeId);
-    const starts = this.connectionPointCandidates(connector.x1, connector.y1, connector.id, connectorDefinition, 'source');
-    const ends = this.connectionPointCandidates(connector.x2, connector.y2, connector.id, connectorDefinition, 'target');
-    type EndpointCandidate = (typeof starts)[number];
-    let start: EndpointCandidate | null = starts[0] ?? null;
-    let end: EndpointCandidate | null = ends[0] ?? null;
-    if (connectorDefinition?.connectorRule && connectorDefinition.connectorRule !== 'generic' && start && end) {
-      // Search the nearby endpoint pairs before rejecting one side: a slightly farther but
-      // semantically valid pair wins over two individually-nearest incompatible objects.
-      let bestPair: { start: typeof start; end: typeof end; distance: number } | null = null;
-      const nearestByDefinition = (candidates: typeof starts) => {
-        const nearest = new Map<ShapeDefinition | undefined, typeof candidates[number]>();
-        for (const candidate of candidates) if (!nearest.has(candidate.definition)) nearest.set(candidate.definition, candidate);
-        return [...nearest.values()];
-      };
-      const sourceDefinitions = nearestByDefinition(starts), targetDefinitions = nearestByDefinition(ends);
-      for (const source of sourceDefinitions) for (const target of targetDefinitions) {
-        if (!connectorEndpointPairAllowed(connectorDefinition, source.definition, target.definition)) continue;
-        const distance = source.distance + target.distance;
-        if (!bestPair || distance < bestPair.distance) bestPair = { start: source, end: target, distance };
-      }
-      if (bestPair) { start = bestPair.start; end = bestPair.end; }
-      else if (start.distance <= end.distance) end = null;
-      else start = null;
-    }
-    const next: ConnectorShape = { ...connector, sourceRef: undefined, targetRef: undefined };
-    if (start) { next.x1 = start.point.x; next.y1 = start.point.y; next.sourceRef = { shapeId: start.shapeId, pointId: start.point.id }; }
-    if (end) { next.x2 = end.point.x; next.y2 = end.point.y; next.targetRef = { shapeId: end.shapeId, pointId: end.point.id }; }
-    this.put({ ...next, ...connectorBounds(next) }, { notify: false });
+  private sequenceTimeForConnector(connector: ConnectorShape, movingSide: EndpointSide): number | undefined {
+    if (getShapeDefinition(connector.shapeId)?.semantic?.family !== 'uml.sequence-edge') return undefined;
+    const ordinate = movingSide === 'target' && connector.sequenceEvent?.selfCall
+      ? connector.sequenceEvent.targetVisualY ?? connector.sequenceEvent.visualY
+      : connector.sequenceEvent?.visualY ?? connector.sequenceTime ?? (movingSide === 'source' ? connector.y2 : connector.y1);
+    return Number.isFinite(ordinate) ? ordinate : undefined;
   }
 
-  private updateAttachedConnectors(shapeId: string) {
+  private sequenceAttachmentAtTime(reference: NonNullable<ConnectorShape['sourceRef']>, visualY: number) {
+    const owner = this.shapes.get(reference.shapeId);
+    if (!owner || !isConnectableShape(owner) || !('x' in owner)) return undefined;
+    const provider = this.definitionForEndpoint(owner)?.semantic?.connectionPointProvider;
+    if (provider !== 'sequence-lifeline' && provider !== 'sequence-activation') return undefined;
+    const preferredSide = reference.pointId.includes(':right:') || reference.pointId.startsWith('activation:right:') ? 'right'
+      : reference.pointId.includes(':left:') || reference.pointId.startsWith('activation:left:') ? 'left' : undefined;
+    const atOwner = connectionPointsAtSequenceTime(owner as BoxShape, visualY);
+    const point = preferredSide ? atOwner.find(item => item.id.includes(`:${preferredSide}:`)) : atOwner[0];
+    if (point) return reference.kind === undefined || reference.kind === point.kind ? { ownerId: owner.id, point } : undefined;
+    if (provider !== 'sequence-activation' || owner.type !== 'diagram' || !owner.containerId) return undefined;
+    const participant = this.shapes.get(owner.containerId);
+    if (participant?.type !== 'diagram'
+      || getShapeDefinition(participant.shapeId)?.semantic?.connectionPointProvider !== 'sequence-lifeline') return undefined;
+    const fallback = connectionPointsAtSequenceTime(participant as BoxShape, visualY)[0];
+    return fallback && (reference.kind === undefined || reference.kind === fallback.kind)
+      ? { ownerId: participant.id, point: fallback } : undefined;
+  }
+
+  private sequenceEventsInTimeline(timelineId: string | undefined, excludingId?: string): ConnectorShape[] {
+    return [...this.shapes.values()].filter((candidate): candidate is ConnectorShape => candidate.type === 'connector'
+      && candidate.id !== excludingId && isSequenceMessageShape(candidate.shapeId) && Boolean(candidate.sequenceEvent)
+      && candidate.sequenceEvent?.timelineId === timelineId);
+  }
+
+  /** Assign a logical order token at an intentional event-placement Y; geometry is never the stored order. */
+  private sequenceOrderAtVisualY(
+    visualY: number, timelineId?: string, excludingIds?: string | ReadonlySet<string>,
+  ): number {
+    const events = this.sequenceEventsInTimeline(timelineId).filter(candidate =>
+      typeof excludingIds === 'string' ? candidate.id !== excludingIds : !excludingIds?.has(candidate.id))
+      .sort((left, right) => left.sequenceEvent!.visualY - right.sequenceEvent!.visualY
+        || compareSequenceEvents(left.sequenceEvent!, right.sequenceEvent!));
+    const parallel = events.find(candidate => Math.abs(candidate.sequenceEvent!.visualY - visualY) <= 1.25);
+    if (parallel) return parallel.sequenceEvent!.order;
+    const previous = events.filter(candidate => candidate.sequenceEvent!.visualY < visualY).at(-1)?.sequenceEvent;
+    const following = events.find(candidate => candidate.sequenceEvent!.visualY > visualY)?.sequenceEvent;
+    if (!previous && !following) return 1024;
+    if (!previous) return following!.order - 1024;
+    if (!following) return previous.order + 1024;
+    if (following.order - previous.order > 1e-6) return (previous.order + following.order) / 2;
+
+    // Rare floating-point exhaustion: rebalance only this timeline's order tokens, not its layout.
+    let order = 0;
+    let lastY: number | undefined;
+    let lastOrder = 0;
+    for (const candidate of events) {
+      const event = candidate.sequenceEvent!;
+      if (lastY === undefined || Math.abs(event.visualY - lastY) > 1.25) order += 1024;
+      else order = lastOrder;
+      if (event.order !== order) {
+        const next = { ...candidate, sequenceEvent: { ...event, order } };
+        this.put(next, { notify: false, syncAttachments: false });
+      }
+      lastY = event.visualY; lastOrder = order;
+    }
+    const rebased = this.sequenceEventsInTimeline(timelineId).filter(candidate =>
+      typeof excludingIds === 'string' ? candidate.id !== excludingIds : !excludingIds?.has(candidate.id))
+      .sort((left, right) => left.sequenceEvent!.visualY - right.sequenceEvent!.visualY
+        || compareSequenceEvents(left.sequenceEvent!, right.sequenceEvent!));
+    const after = rebased.filter(candidate => candidate.sequenceEvent!.visualY < visualY).at(-1)?.sequenceEvent;
+    const before = rebased.find(candidate => candidate.sequenceEvent!.visualY > visualY)?.sequenceEvent;
+    return after && before ? (after.order + before.order) / 2 : after ? after.order + 1024 : before ? before.order - 1024 : 1024;
+  }
+
+  /** Logical activation boundary tokens interpolate existing events without ever rewriting them. */
+  private sequenceOrderBoundaryAtVisualY(visualY: number): number | undefined {
+    const events = this.sequenceEventsInTimeline(undefined)
+      .sort((left, right) => left.sequenceEvent!.visualY - right.sequenceEvent!.visualY
+        || compareSequenceEvents(left.sequenceEvent!, right.sequenceEvent!));
+    if (!events.length) return undefined;
+    const parallel = events.find(candidate => Math.abs(candidate.sequenceEvent!.visualY - visualY) <= 1.25);
+    if (parallel) return parallel.sequenceEvent!.order;
+    const previous = events.filter(candidate => candidate.sequenceEvent!.visualY < visualY).at(-1)?.sequenceEvent;
+    const following = events.find(candidate => candidate.sequenceEvent!.visualY > visualY)?.sequenceEvent;
+    if (!previous) return following!.order - 1024;
+    if (!following) return previous.order + 1024;
+    return following.order - previous.order > 1e-6 ? (previous.order + following.order) / 2 : previous.order;
+  }
+
+  private synchronizeSequenceActivationRanges() {
+    const eventsExist = this.sequenceEventsInTimeline(undefined).length > 0;
+    for (const candidate of this.shapes.values()) {
+      if (candidate.type !== 'diagram' || candidate.shapeId !== 'uml.activation') continue;
+      const activation = (candidate as DiagramShape).data?.sequenceActivation;
+      if (!activation) continue;
+      const nextActivation = { ...activation };
+      if (eventsExist) {
+        const startOrder = this.sequenceOrderBoundaryAtVisualY(candidate.y);
+        const endOrder = this.sequenceOrderBoundaryAtVisualY(candidate.y + candidate.h);
+        if (startOrder !== undefined) nextActivation.startOrder = startOrder;
+        if (endOrder !== undefined) nextActivation.endOrder = endOrder;
+      } else {
+        delete nextActivation.startOrder; delete nextActivation.endOrder;
+      }
+      if (JSON.stringify(nextActivation) !== JSON.stringify(activation))
+        this.put({ ...candidate, data: { ...(candidate as DiagramShape).data, sequenceActivation: nextActivation } as DiagramShape['data'] },
+          { notify: false, syncAttachments: false });
+    }
+  }
+
+  private sequenceEventWithEndpoint(
+    connector: ConnectorShape,
+    side: EndpointSide,
+    endpointId: string | undefined,
+    visualY = connector.sequenceEvent?.visualY ?? connector.sequenceTime ?? connector.y1,
+    endpointY = visualY,
+  ): SequenceMessageEventData | undefined {
+    if (!isSequenceMessageShape(connector.shapeId) || !connector.sequenceEvent) return connector.sequenceEvent;
+    const event = { ...connector.sequenceEvent, visualY: Math.round(visualY * 1000) / 1000 };
+    const participantId = this.sequenceParticipantIdForEndpoint(endpointId);
+    if (side === 'source') {
+      if (endpointId) { event.sourceEndpointId = endpointId; } else delete event.sourceEndpointId;
+      if (participantId) event.sourceParticipantId = participantId; else delete event.sourceParticipantId;
+    } else {
+      if (endpointId) { event.targetEndpointId = endpointId; } else delete event.targetEndpointId;
+      if (participantId) event.targetParticipantId = participantId; else delete event.targetParticipantId;
+    }
+    const sameParticipant = Boolean(event.sourceParticipantId && event.sourceParticipantId === event.targetParticipantId);
+    const baseKind = sequenceMessageKindForShape(connector.shapeId);
+    event.selfCall = sameParticipant || undefined;
+    if (side === 'target' && sameParticipant) event.targetVisualY = Math.round(endpointY * 1000) / 1000;
+    else if (!sameParticipant) delete event.targetVisualY;
+    else if (!event.targetVisualY) event.targetVisualY = Math.round((visualY + 24) * 1000) / 1000;
+    if (baseKind === 'synchronous') event.kind = sameParticipant ? 'self-call' : 'synchronous';
+    else if (baseKind) event.kind = baseKind;
+    return event;
+  }
+
+  /** Synchronize a create message with exactly the participant it creates; never infer from x/y. */
+  private synchronizeSequenceCreateOwnership(connector: ConnectorShape, origin: object = this) {
+    if (connector.shapeId !== 'uml.create-message' || !connector.sequenceEvent) return;
+    const targetId = connector.targetRef?.pointId === 'participant:create'
+      ? this.sequenceParticipantIdForEndpoint(connector.targetRef.shapeId) : undefined;
+    for (const candidate of this.shapes.values()) {
+      if (candidate.type !== 'diagram' || getShapeDefinition(candidate.shapeId)?.semantic?.family !== 'uml.sequence-participant') continue;
+      const participant = candidate as DiagramShape;
+      const current = participant.data?.sequenceParticipant as Record<string, unknown> | undefined;
+      const isCurrentOwner = current?.createdByMessageId === connector.id;
+      const shouldOwn = participant.id === targetId;
+      if (!isCurrentOwner && !shouldOwn) continue;
+      const sequenceParticipant = { ...(current ?? {}), version: 1 as const, participantId: participant.id } as unknown as SequenceParticipantData;
+      if (shouldOwn) {
+        sequenceParticipant.createdByMessageId = connector.id;
+        sequenceParticipant.createdAtOrder = connector.sequenceEvent.order;
+      } else {
+        delete sequenceParticipant.createdByMessageId;
+        delete sequenceParticipant.createdAtOrder;
+      }
+      const data = { ...(participant.data ?? {}), sequenceParticipant };
+      if (JSON.stringify(data) !== JSON.stringify(participant.data ?? {}))
+        this.put({ ...participant, data }, { notify: false, syncAttachments: false, origin });
+    }
+  }
+
+  /** Move one interaction vertically as an intentional temporal edit; attached owners stay latched. */
+  private moveSequenceMessageGesture(origin: ConnectorShape, dx: number, dy: number): ConnectorShape {
+    if (!origin.sequenceEvent) return moveShape(origin, origin.x1 + dx, origin.y1 + dy) as ConnectorShape;
+    // A create event attached to the new lifeline head follows that lifecycle anchor, not a free Y.
+    const createAnchored = origin.shapeId === 'uml.create-message' && origin.targetRef?.pointId === 'participant:create';
+    const temporalDy = createAnchored ? 0 : dy;
+    const visualY = Math.round((origin.sequenceEvent.visualY + temporalDy) * 1000) / 1000;
+    const targetY = origin.sequenceEvent.selfCall
+      ? Math.round(((origin.sequenceEvent.targetVisualY ?? origin.sequenceEvent.visualY) + temporalDy) * 1000) / 1000 : visualY;
+    const moved = moveShape(origin, origin.x1 + dx, origin.y1 + temporalDy) as ConnectorShape;
+    const resolve = (reference: NonNullable<ConnectorShape['sourceRef']>, desiredY: number) => {
+      if (reference.pointId !== 'participant:create') return this.sequenceAttachmentAtTime(reference, desiredY);
+      const owner = this.shapes.get(reference.shapeId);
+      if (!owner || !isConnectableShape(owner) || !('x' in owner)) return undefined;
+      const point = connectionPointById(owner as BoxShape, reference.pointId);
+      return point ? { ownerId: owner.id, point } : undefined;
+    };
+    const source = origin.sourceRef ? resolve(origin.sourceRef, visualY) : undefined;
+    const target = origin.targetRef ? resolve(origin.targetRef, targetY) : undefined;
+    // If a requested time falls outside the connected lifelines, keep the event intact rather than
+    // leaving attached geometry detached from its owner.
+    if ((origin.sourceRef && !source) || (origin.targetRef && !target)) return origin;
+    let next: ConnectorShape = { ...moved,
+      ...(source ? { x1: source.point.x, y1: source.point.y,
+        sourceRef: { ...origin.sourceRef!, shapeId: source.ownerId, pointId: source.point.id, kind: source.point.kind } } : {}),
+      ...(target ? { x2: target.point.x, y2: target.point.y,
+        targetRef: { ...origin.targetRef!, shapeId: target.ownerId, pointId: target.point.id, kind: target.point.kind } } : {}),
+    };
+    let sequenceEvent = this.sequenceEventWithEndpoint(next, 'source', next.sourceRef?.shapeId, visualY, source?.point.y ?? next.y1);
+    if (sequenceEvent) next = { ...next, sequenceEvent };
+    sequenceEvent = this.sequenceEventWithEndpoint(next, 'target', next.targetRef?.shapeId, visualY, target?.point.y ?? next.y2);
+    if (sequenceEvent) {
+      if (Math.abs(temporalDy) >= 0.001)
+        sequenceEvent.order = this.sequenceOrderAtVisualY(visualY, sequenceEvent.timelineId, origin.id);
+      next = { ...next, sequenceEvent, sequenceTime: visualY };
+    }
+    if (Math.abs(temporalDy) >= 0.001) next = this.synchronizeSequenceFragmentMembership(next, true);
+    return { ...next, ...connectorBounds(next) };
+  }
+
+  private endpointCandidateIsValid(
+    connector: ConnectorShape, side: EndpointSide,
+    candidate: { shapeId: string; definition: ShapeDefinition | undefined },
+  ): boolean {
+    const definition = getShapeDefinition(connector.shapeId);
+    const owner = this.shapes.get(candidate.shapeId);
+    if (!definition || !owner || !connectorEndpointSideAllowed(definition, candidate.definition, side)
+      || !this.behavioralEndpointContextAllowed(definition, owner)
+      || !this.behavioralEndpointCapacityAllowed(definition, owner, side, connector.id)) return false;
+    const oppositeRef = side === 'source' ? connector.targetRef : connector.sourceRef;
+    const opposite = oppositeRef ? this.shapes.get(oppositeRef.shapeId) : undefined;
+    const oppositeDefinition = opposite ? this.definitionForEndpoint(opposite) : undefined;
+    if (!oppositeDefinition) return true; // the other end is intentionally free or already diagnosed as broken
+    return side === 'source'
+      ? connectorEndpointPairAllowed(definition, candidate.definition, oppositeDefinition)
+      : connectorEndpointPairAllowed(definition, oppositeDefinition, candidate.definition);
+  }
+
+  private updateConnectorTargetFeedback(connector: ConnectorShape, x: number, y: number, side: EndpointSide = 'target') {
+    const definition = getShapeDefinition(connector.shapeId);
+    const sequenceTime = this.sequenceTimeForConnector(connector, side);
+    const candidates = this.connectionPointCandidates(x, y, connector.id, definition, side,
+      { includeIncompatible: true, ...(sequenceTime !== undefined ? { sequenceTime } : {}) });
+    const invalidLatchedSource = Boolean(this.connectorSourceFeedback && !this.connectorSourceFeedback.valid);
+    const ranked = candidates.map(candidate => ({ candidate,
+      valid: !invalidLatchedSource && this.endpointCandidateIsValid(connector, side, candidate) }))
+      .sort((left, right) => Number(right.valid) - Number(left.valid)
+        || left.candidate.distance - right.candidate.distance
+        || left.candidate.shapeId.localeCompare(right.candidate.shapeId));
+    const best = ranked[0];
+    if (!best) {
+      if (this.connectorTargetFeedback) { this.connectorTargetFeedback = null; this.dirty = true; }
+      return;
+    }
+    const next = { shapeId: best.candidate.shapeId,
+      point: { x: best.candidate.point.x, y: best.candidate.point.y }, valid: best.valid };
+    const previous = this.connectorTargetFeedback;
+    if (previous?.shapeId !== next.shapeId || previous.valid !== next.valid
+      || Math.hypot(previous.point.x - next.point.x, previous.point.y - next.point.y) > 0.5) {
+      this.connectorTargetFeedback = next;
+      this.dirty = true;
+    }
+  }
+
+  private synchronizeStateTransitionRegion(connector: ConnectorShape): ConnectorShape {
+    if (connector.shapeId !== 'uml.state-transition' || !connector.sourceRef || !connector.targetRef) return connector;
+    const source = this.shapes.get(connector.sourceRef.shapeId), target = this.shapes.get(connector.targetRef.shapeId);
+    if (source?.type !== 'diagram' || target?.type !== 'diagram'
+      || this.getSemanticContextForShape(source.id) !== 'state' || this.getSemanticContextForShape(target.id) !== 'state') return connector;
+    const sourceRegion = (source.data?.stateVertex as { regionId?: string } | undefined)?.regionId;
+    const targetRegion = (target.data?.stateVertex as { regionId?: string } | undefined)?.regionId;
+    let regionId = sourceRegion === targetRegion ? sourceRegion : undefined;
+    if (!regionId && target.shapeId === 'uml.entry-point') regionId = sourceRegion;
+    if (!regionId && source.shapeId === 'uml.exit-point') regionId = targetRegion;
+    if (!regionId && (source.shapeId === 'uml.entry-point' || source.shapeId === 'uml.exit-point'
+      || target.shapeId === 'uml.entry-point' || target.shapeId === 'uml.exit-point')) regionId = sourceRegion ?? targetRegion;
+    if (!regionId) return connector;
+    const stateTransition = { ...(connector.stateTransition ?? {}), regionId };
+    return JSON.stringify(stateTransition) === JSON.stringify(connector.stateTransition ?? {})
+      ? connector : { ...connector, stateTransition };
+  }
+
+  /** Commit exactly one endpoint; the opposite reference, intent, and coordinates are untouched. */
+  private snapConnectorEndpoint(connector: ConnectorShape, side: EndpointSide) {
+    const definition = getShapeDefinition(connector.shapeId);
+    if (!definition) return;
+    const x = side === 'source' ? connector.x1 : connector.x2;
+    const y = side === 'source' ? connector.y1 : connector.y2;
+    const sequenceTime = this.sequenceTimeForConnector(connector, side);
+    const candidates = this.connectionPointCandidates(x, y, connector.id, definition, side,
+      { includeIncompatible: true, ...(sequenceTime !== undefined ? { sequenceTime } : {}) });
+    const chosen = candidates.map(candidate => ({ candidate, valid: this.endpointCandidateIsValid(connector, side, candidate) }))
+      .filter(item => item.valid)
+      .sort((left, right) => left.candidate.distance - right.candidate.distance
+        || left.candidate.shapeId.localeCompare(right.candidate.shapeId)
+        || left.candidate.point.id.localeCompare(right.candidate.point.id))[0]?.candidate;
+    const invalidEndpointRefs = { ...(connector.invalidEndpointRefs ?? {}) };
+    delete invalidEndpointRefs[side];
+    let next: ConnectorShape = { ...connector, invalidEndpointRefs: Object.keys(invalidEndpointRefs).length ? invalidEndpointRefs : undefined };
+    if (chosen) {
+      const ref = { shapeId: chosen.shapeId, pointId: chosen.point.id, kind: chosen.point.kind };
+      if (side === 'source') {
+        next.x1 = chosen.point.x; next.y1 = chosen.point.y; next.sourceRef = ref; next.sourceIntent = 'attached';
+      } else {
+        next.x2 = chosen.point.x; next.y2 = chosen.point.y; next.targetRef = ref; next.targetIntent = 'attached';
+      }
+    } else if (side === 'source') {
+      next.sourceRef = undefined; next.sourceIntent = 'free';
+    } else {
+      next.targetRef = undefined; next.targetIntent = 'free';
+    }
+    if (definition.semantic?.family === 'uml.sequence-edge') {
+      const createHeaderTarget = definition.id === 'uml.create-message' && side === 'target'
+        && chosen?.point.id === 'participant:create';
+      const eventOrdinate = createHeaderTarget ? chosen!.point.y
+        : next.sourceRef ? next.y1 : next.targetRef ? next.y2 : next.sequenceEvent?.visualY ?? next.sequenceTime ?? next.y1;
+      const visualY = Math.round(eventOrdinate * 1000) / 1000;
+      if (createHeaderTarget && next.sourceRef) {
+        const owner = this.shapes.get(next.sourceRef.shapeId);
+        const sourcePoint = owner && isConnectableShape(owner) && 'x' in owner
+          ? connectionPointsAtSequenceTime(owner as BoxShape, visualY)[0] : undefined;
+        if (sourcePoint) {
+          next.x1 = sourcePoint.x; next.y1 = sourcePoint.y;
+          next.sourceRef = { ...next.sourceRef, pointId: sourcePoint.id, kind: sourcePoint.kind };
+        }
+      }
+      let sequenceEvent = this.sequenceEventWithEndpoint(next, side, chosen?.shapeId, visualY,
+        side === 'source' ? next.y1 : next.y2);
+      if (sequenceEvent) {
+        sequenceEvent.order = this.sequenceOrderAtVisualY(visualY, sequenceEvent.timelineId, connector.id);
+        next = { ...next, sequenceTime: visualY, sequenceEvent };
+      }
+    }
+    next = this.synchronizeStateTransitionRegion(next);
+    this.put({ ...next, ...connectorBounds(next) }, { notify: false, syncAttachments: false });
+    this.synchronizeSequenceCreateOwnership(next);
+    if (definition.semantic?.family === 'uml.sequence-edge') this.synchronizeSequenceActivationRanges();
+    this.rebalanceParallelConnectorLanes();
+    if (this.connectorTargetFeedback) { this.connectorTargetFeedback = null; this.dirty = true; }
+  }
+
+  private latchConnectorSource(connector: ConnectorShape, x: number, y: number) {
+    const definition = getShapeDefinition(connector.shapeId);
+    const hit = this.hitShape(x, y);
+    const hitOwner = hit && isConnectableShape(hit) ? hit : undefined;
+    const nearbyCandidates = this.connectionPointCandidates(x, y, connector.id, definition, 'source',
+      { includeIncompatible: true });
+    const canStartAt = (candidate: { shapeId: string; definition: ShapeDefinition | undefined }) => {
+      const owner = this.shapes.get(candidate.shapeId);
+      return Boolean(definition && owner && connectorEndpointSideAllowed(definition, candidate.definition, 'source')
+        && this.behavioralEndpointContextAllowed(definition, owner)
+        && this.behavioralEndpointCapacityAllowed(definition, owner, 'source', connector.id));
+    };
+    // Selection hit-testing deliberately has an 8px halo. At tight Class gaps it can report a
+    // neighboring classifier even though the pointer is exactly on the other classifier's port.
+    // Rank all nearby legal ports by distance in that case, rather than allowing the halo to
+    // steal the latched source. Preserve direct invalid/capacity feedback when the hit shape itself
+    // has a port inside snap range; use the old in-shape fallback for body clicks away from ports.
+    const hitOwnerHasNearbyPort = Boolean(hitOwner && nearbyCandidates.some(candidate => candidate.shapeId === hitOwner.id));
+    let candidates = nearbyCandidates;
+    if (hitOwner && hitOwnerHasNearbyPort && !canStartAt({
+      shapeId: hitOwner.id, definition: this.definitionForEndpoint(hitOwner),
+    })) {
+      candidates = nearbyCandidates.filter(candidate => candidate.shapeId === hitOwner.id);
+    } else if (!nearbyCandidates.some(canStartAt) && hitOwner) {
+      candidates = this.connectionPointCandidates(x, y, connector.id, definition, 'source', {
+        includeIncompatible: true, maxDistance: Number.POSITIVE_INFINITY, onlyShapeId: hitOwner.id,
+      });
+    }
+    const validCandidates = candidates.filter(canStartAt);
+    const candidate = validCandidates[0];
+    if (!candidate) {
+      const incompatible = candidates[0];
+      this.connectorSourceFeedback = incompatible
+        ? { shapeId: incompatible.shapeId, point: { x: incompatible.point.x, y: incompatible.point.y }, valid: false } : null;
+      this.put({ ...connector, sourceIntent: 'free', targetIntent: 'pending' }, { notify: false, syncAttachments: false });
+      return;
+    }
+    this.connectorSourceFeedback = null;
+    const sourceRef = { shapeId: candidate.shapeId, pointId: candidate.point.id, kind: candidate.point.kind };
+    let next: ConnectorShape = { ...connector,
+      x1: candidate.point.x, y1: candidate.point.y, sourceRef, sourceIntent: 'attached', targetIntent: 'pending',
+    };
+    if (definition?.semantic?.family === 'uml.sequence-edge') {
+      const visualY = Math.round(candidate.point.y * 1000) / 1000;
+      const sequenceEvent = this.sequenceEventWithEndpoint(next, 'source', candidate.shapeId, visualY);
+      if (sequenceEvent) {
+        sequenceEvent.order = this.sequenceOrderAtVisualY(visualY, sequenceEvent.timelineId, connector.id);
+        next = { ...next, sequenceTime: visualY, sequenceEvent };
+      }
+    }
+    this.put({ ...next, ...connectorBounds(next) }, { notify: false, syncAttachments: false });
+  }
+
+  private rebalanceParallelConnectorLanes() {
+    type LaneEntry = { connector: ConnectorShape; orientation: 1 | -1 };
+    const groups = new Map<string, LaneEntry[]>();
+    const clear: ConnectorShape[] = [];
+    for (const shape of this.shapes.values()) {
+      if (shape.type !== 'connector') continue;
+      const connector = shape as ConnectorShape, definition = this.definitionForEndpoint(connector);
+      const family = this.behavioralEdgeFamily(definition);
+      const isSequenceEdge = definition?.semantic?.family === 'uml.sequence-edge';
+      const sequence = connector.sequenceEvent;
+      const semanticContext = this.getSemanticContextForShape(connector.id);
+      const isClassRelation = definition?.semantic?.family === 'uml.relationship-edge' && semanticContext === 'class';
+      const isUseCaseRelation = (definition?.semantic?.family === 'uml.relationship-edge'
+        || definition?.semantic?.family === 'uml.usecase-dependency') && semanticContext === 'use-case';
+      if ((!family && !isSequenceEdge && !isClassRelation && !isUseCaseRelation) || !connector.sourceRef || !connector.targetRef) {
+        if (connector.parallelLane !== undefined) clear.push(connector);
+        continue;
+      }
+      const sourceId = isSequenceEdge ? sequence?.sourceParticipantId ?? connector.sourceRef.shapeId : connector.sourceRef.shapeId;
+      const targetId = isSequenceEdge ? sequence?.targetParticipantId ?? connector.targetRef.shapeId : connector.targetRef.shapeId;
+      let key: string, orientation: 1 | -1 = 1;
+      if (isSequenceEdge) {
+        // All messages at the same explicit occurrence order share one routing group, not just
+        // repeated messages between the same pair. Fan-out/fan-in events otherwise draw over one
+        // another from their shared participant and become impossible to pick reliably.
+        key = `uml.sequence|${sequence?.timelineId ?? ''}|${sequence?.order ?? 0}`;
+        const source = this.shapes.get(sourceId), target = this.shapes.get(targetId);
+        const sourceX = source && isPositionedShape(source) ? source.x + source.w / 2 : connector.x1;
+        const targetX = target && isPositionedShape(target) ? target.x + target.w / 2 : connector.x2;
+        orientation = sourceId === targetId || sourceX <= targetX ? 1 : -1;
+      } else if ((isClassRelation || isUseCaseRelation) && definition?.semantic?.role === 'association') {
+        const [first, second] = [sourceId, targetId].sort((left, right) => left.localeCompare(right));
+        key = `uml.${isClassRelation ? 'class' : 'use-case'}.association|${first}|${second}`;
+        orientation = sourceId === first ? 1 : -1;
+      } else {
+        key = `${family ?? 'uml.class.relation'}|${sourceId}|${targetId}`;
+      }
+      const group = groups.get(key) ?? [];
+      group.push({ connector, orientation }); groups.set(key, group);
+    }
+    for (const connector of clear) {
+      const next = { ...connector, parallelLane: undefined };
+      this.put({ ...next, ...connectorBounds(next) }, { notify: false });
+    }
+    for (const group of groups.values()) {
+      const ownsUmlRelationOrder = group.every(({ connector }) => {
+        const relationFamily = this.definitionForEndpoint(connector)?.semantic?.family;
+        return connector.parallelOrder !== undefined
+          && (relationFamily === 'uml.relationship-edge' || relationFamily === 'uml.usecase-dependency');
+      });
+      const ownsStableBehaviorOrder = group.every(({ connector }) => {
+        const edgeFamily = this.definitionForEndpoint(connector)?.semantic?.family;
+        return connector.parallelOrder !== undefined && (edgeFamily === 'uml.state-edge' || edgeFamily === 'uml.activity-edge');
+      });
+      if (ownsUmlRelationOrder || ownsStableBehaviorOrder) {
+        // Persistent Class/Use Case relation order is semantic and never derives from random IDs.
+        group.sort((left, right) => (left.connector.parallelOrder ?? 0) - (right.connector.parallelOrder ?? 0));
+      } else if (group.every(({ connector }) => getShapeDefinition(connector.shapeId)?.semantic?.family === 'uml.sequence-edge')) {
+        const laneKey = (connector: ConnectorShape) => {
+          const event = connector.sequenceEvent;
+          const centerX = (participantId: string | undefined, fallback: number) => {
+            const owner = participantId ? this.shapes.get(participantId) : undefined;
+            return owner && isPositionedShape(owner) ? owner.x + owner.w / 2 : fallback;
+          };
+          return {
+            sourceX: centerX(event?.sourceParticipantId, connector.x1),
+            targetX: centerX(event?.targetParticipantId, connector.x2),
+            targetY: event?.targetVisualY ?? event?.visualY ?? connector.y2,
+            kind: event?.kind ?? '', shapeId: connector.shapeId, label: connector.label ?? '',
+            // Only exact geometric/semantic ties need an identity tie-breaker; event order itself
+            // remains explicit numeric data and is never inferred from this stable routing key.
+            eventId: event?.eventId ?? '',
+          };
+        };
+        group.sort((left, right) => {
+          const a = laneKey(left.connector), b = laneKey(right.connector);
+          return a.sourceX - b.sourceX || a.targetX - b.targetX || a.targetY - b.targetY
+            || a.kind.localeCompare(b.kind) || a.shapeId.localeCompare(b.shapeId)
+            || a.label.localeCompare(b.label) || a.eventId.localeCompare(b.eventId);
+        });
+      } else {
+        // Preserve pre-existing State/Activity lane ordering behavior outside this pass.
+        group.sort((left, right) => left.connector.id.localeCompare(right.connector.id));
+      }
+      group.forEach(({ connector, orientation }, index) => {
+        const lane = group.length > 1 ? (index - (group.length - 1) / 2) * orientation : undefined;
+        if (connector.parallelLane === lane) return;
+        const next = { ...connector, parallelLane: lane };
+        this.put({ ...next, ...connectorBounds(next) }, { notify: false });
+      });
+    }
+  }
+
+  private updateAttachedConnectors(shapeId: string, origin: object = this) {
     const target = this.shapes.get(shapeId);
     if (!target || !isConnectableShape(target) || !('x' in target)) return;
-    const points = connectionPointsForBox(target as BoxShape);
-    const pointById = new Map(points.map(point => [point.id, point]));
-    for (const candidate of this.shapes.values()) {
-      if (candidate.type !== 'connector') continue;
+    const attachedIds = [...(this.connectorIdsByEndpoint.get(shapeId) ?? [])];
+    for (const connectorId of attachedIds) {
+      const candidate = this.shapes.get(connectorId);
+      if (candidate?.type !== 'connector') continue;
       const connector = candidate as ConnectorShape;
-      const source = connector.sourceRef?.shapeId === shapeId ? pointById.get(connector.sourceRef.pointId) : undefined;
-      const end = connector.targetRef?.shapeId === shapeId ? pointById.get(connector.targetRef.pointId) : undefined;
-      if (!source && !end) continue;
-      const next = { ...connector,
-        ...(source ? { x1: source.x, y1: source.y } : {}),
-        ...(end ? { x2: end.x, y2: end.y } : {}),
+      const sourceAffected = connector.sourceRef?.shapeId === shapeId;
+      const targetAffected = connector.targetRef?.shapeId === shapeId;
+      if (!sourceAffected && !targetAffected) continue;
+      const isSequence = getShapeDefinition(connector.shapeId)?.semantic?.family === 'uml.sequence-edge';
+      const createTargetMovesEvent = isSequence && connector.shapeId === 'uml.create-message'
+        && targetAffected && connector.targetRef?.pointId === 'participant:create';
+      const targetCreatePoint = createTargetMovesEvent
+        ? connectionPointById(target as BoxShape, 'participant:create') : undefined;
+      const eventY = createTargetMovesEvent ? targetCreatePoint?.y
+        : connector.sequenceEvent?.visualY ?? connector.sequenceTime ?? connector.y1;
+      const resolve = (reference: NonNullable<ConnectorShape['sourceRef']>, desiredY: number) => {
+        const owner = this.shapes.get(reference.shapeId);
+        if (!owner || !isConnectableShape(owner) || !('x' in owner)) return undefined;
+        if (isSequence && Number.isFinite(desiredY) && reference.pointId !== 'participant:create') {
+          const provider = this.definitionForEndpoint(owner)?.semantic?.connectionPointProvider;
+          if (provider === 'sequence-lifeline' || provider === 'sequence-activation')
+            return this.sequenceAttachmentAtTime(reference, desiredY);
+        }
+        const point = connectionPointById(owner as BoxShape, reference.pointId);
+        if (!point || (reference.kind !== undefined && reference.kind !== point.kind)) return undefined;
+        return { ownerId: owner.id, point };
       };
-      this.put({ ...next, ...connectorBounds(next) }, { notify: false });
+      const sourceY = Number.isFinite(eventY) ? eventY! : connector.y1;
+      const targetY = connector.sequenceEvent?.selfCall
+        ? connector.sequenceEvent.targetVisualY ?? sourceY : sourceY;
+      const source = connector.sourceRef
+        ? isSequence ? resolve(connector.sourceRef, sourceY) : sourceAffected ? resolve(connector.sourceRef, connector.y1) : undefined
+        : undefined;
+      const end = connector.targetRef
+        ? isSequence ? resolve(connector.targetRef, targetY) : targetAffected ? resolve(connector.targetRef, connector.y2) : undefined
+        : undefined;
+      if (!source && !end) continue;
+      const invalidEndpointRefs = { ...(connector.invalidEndpointRefs ?? {}) };
+      if (source) delete invalidEndpointRefs.source;
+      if (end) delete invalidEndpointRefs.target;
+      let next: ConnectorShape = { ...connector,
+        ...(source ? { x1: source.point.x, y1: source.point.y,
+          sourceRef: { ...connector.sourceRef!, shapeId: source.ownerId, pointId: source.point.id, kind: source.point.kind }, sourceIntent: 'attached' as const } : {}),
+        ...(end ? { x2: end.point.x, y2: end.point.y,
+          targetRef: { ...connector.targetRef!, shapeId: end.ownerId, pointId: end.point.id, kind: end.point.kind }, targetIntent: 'attached' as const } : {}),
+        invalidEndpointRefs: Object.keys(invalidEndpointRefs).length ? invalidEndpointRefs : undefined,
+      };
+      if (getShapeDefinition(connector.shapeId)?.semantic?.family === 'uml.state-edge')
+        next = this.synchronizeStateTransitionRegion(next);
+      if (isSequence) {
+        const visualY = Math.round(sourceY * 1000) / 1000;
+        let sequenceEvent = this.sequenceEventWithEndpoint(next, 'source', next.sourceRef?.shapeId, visualY, source?.point.y ?? sourceY);
+        if (sequenceEvent) next = { ...next, sequenceEvent };
+        sequenceEvent = this.sequenceEventWithEndpoint(next, 'target', next.targetRef?.shapeId, visualY, end?.point.y ?? targetY);
+        if (sequenceEvent) next = { ...next, sequenceEvent, sequenceTime: visualY };
+      }
+      this.put({ ...next, ...connectorBounds(next) }, { notify: false, syncAttachments: false, origin });
+      if (isSequence) this.synchronizeSequenceCreateOwnership(next);
     }
   }
 
   private detachConnectorsFrom(shapeId: string, origin: object = this) {
-    for (const candidate of this.shapes.values()) {
-      if (candidate.type !== 'connector') continue;
+    const removedShape = this.shapes.get(shapeId);
+    const removedDefinition = removedShape ? this.definitionForEndpoint(removedShape) : undefined;
+    const removesParticipant = removedDefinition?.semantic?.family === 'uml.sequence-participant';
+    const attachedIds = [...(this.connectorIdsByEndpoint.get(shapeId) ?? [])];
+    for (const connectorId of attachedIds) {
+      const candidate = this.shapes.get(connectorId);
+      if (candidate?.type !== 'connector') continue;
       const connector = candidate as ConnectorShape;
-      if (connector.sourceRef?.shapeId !== shapeId && connector.targetRef?.shapeId !== shapeId) continue;
-      const next = { ...connector, sourceRef: connector.sourceRef?.shapeId === shapeId ? undefined : connector.sourceRef,
-        targetRef: connector.targetRef?.shapeId === shapeId ? undefined : connector.targetRef };
-      this.put({ ...next, ...connectorBounds(next) }, { notify: false, origin });
+      const sourceRemoved = connector.sourceRef?.shapeId === shapeId;
+      const targetRemoved = connector.targetRef?.shapeId === shapeId;
+      if (!sourceRemoved && !targetRemoved) continue;
+      const invalidEndpointRefs = { ...(connector.invalidEndpointRefs ?? {}) };
+      if (sourceRemoved) delete invalidEndpointRefs.source;
+      if (targetRemoved) delete invalidEndpointRefs.target;
+      let sequenceEvent = connector.sequenceEvent ? { ...connector.sequenceEvent } : undefined;
+      if (sequenceEvent && getShapeDefinition(connector.shapeId)?.semantic?.family === 'uml.sequence-edge') {
+        if (sourceRemoved) {
+          delete sequenceEvent.sourceEndpointId;
+          if (removesParticipant) delete sequenceEvent.sourceParticipantId;
+        }
+        if (targetRemoved) {
+          delete sequenceEvent.targetEndpointId;
+          if (removesParticipant) delete sequenceEvent.targetParticipantId;
+        }
+        const sameParticipant = Boolean(sequenceEvent.sourceParticipantId
+          && sequenceEvent.sourceParticipantId === sequenceEvent.targetParticipantId);
+        sequenceEvent.selfCall = sameParticipant || undefined;
+        if (!sameParticipant) {
+          delete sequenceEvent.targetVisualY;
+          if (sequenceEvent.kind === 'self-call') sequenceEvent.kind = 'synchronous';
+        } else if (!sequenceEvent.targetVisualY) sequenceEvent.targetVisualY = sequenceEvent.visualY + 24;
+      }
+      const next: ConnectorShape = { ...connector,
+        sourceRef: sourceRemoved ? undefined : connector.sourceRef,
+        targetRef: targetRemoved ? undefined : connector.targetRef,
+        ...(sourceRemoved ? { sourceIntent: 'free' as const } : {}),
+        ...(targetRemoved ? { targetIntent: 'free' as const } : {}),
+        ...(sequenceEvent ? { sequenceEvent } : {}),
+        invalidEndpointRefs: Object.keys(invalidEndpointRefs).length ? invalidEndpointRefs : undefined,
+      };
+      this.put({ ...next, ...connectorBounds(next) }, { notify: false, origin, syncAttachments: false });
+      if (getShapeDefinition(next.shapeId)?.semantic?.family === 'uml.sequence-edge')
+        this.synchronizeSequenceCreateOwnership(next, origin);
     }
   }
 
@@ -2584,7 +5495,12 @@ export class CanvasEngine {
     const editablePatch = normalizeShapeParameterPatch(definition, params);
     if (!Object.keys(editablePatch).length) return;
     const existingParams = 'params' in shape ? shape.params ?? {} : {};
-    const next = { ...shape, params: { ...existingParams, ...editablePatch } } as AnyShape;
+    let next = { ...shape, params: { ...existingParams, ...editablePatch } } as AnyShape;
+    if (next.type === 'diagram' && (definition.dataCapabilities?.includes('classifier') || definition.dataCapabilities?.includes('instance')
+      || definition.semantic?.family === 'uml.use-case' || definition.semantic?.family === 'uml.actor')) {
+      const diagram = next as DiagramShape;
+      next = this.growDiagramTextBox(diagram, diagram.text ?? definition.defaultText ?? definition.label, diagram.data);
+    }
     this.put(next);
     if (commit) this.saveH();
   }
@@ -2612,7 +5528,14 @@ export class CanvasEngine {
     }
     scale3d = normalizeSolid3DScale(geometry, scale3d);
     if (scale3d.x === current.x && scale3d.y === current.y && scale3d.z === current.z) return;
-    this.put({ ...diagram, scale3d });
+    const beforeBounds = localSolidProjectedBounds(diagram);
+    const afterBounds = localSolidProjectedBounds({ ...diagram, scale3d });
+    const beforeWidth = Math.max(1, beforeBounds.maxX - beforeBounds.minX);
+    const beforeHeight = Math.max(1, beforeBounds.maxY - beforeBounds.minY);
+    const afterWidth = Math.max(1, afterBounds.maxX - afterBounds.minX);
+    const afterHeight = Math.max(1, afterBounds.maxY - afterBounds.minY);
+    const embeddedTextScale = resizeDiagramEmbeddedTextScale({ ...diagram, w: beforeWidth, h: beforeHeight }, afterWidth, afterHeight);
+    this.put({ ...diagram, scale3d, embeddedTextScale });
     if (commit) this.saveH();
   }
 
@@ -2620,19 +5543,111 @@ export class CanvasEngine {
     const shape = this.shapes.get(id);
     if (!shape || shape.type !== 'diagram') return;
     const diagram = shape as DiagramShape;
-    const data = { ...(diagram.data ?? {}), ...patch };
     const definition = getShapeDefinition(diagram.shapeId);
+    const mergedData = { ...(definition?.defaultData ?? {}), ...(diagram.data ?? {}), ...patch };
+    let data = definition?.semantic?.notation === 'uml'
+      ? normalizeUmlStructuredData(definition, mergedData, mergedData) : mergedData;
+    if (definition?.semantic?.notation === 'uml') {
+      const parent = diagram.containerId ? this.shapes.get(diagram.containerId) : undefined;
+      data = normalizeBehavioralDiagramData(definition, diagram.id, data,
+        this.getSemanticContextForShape(diagram.id) ?? diagram.diagramContext,
+        diagram.containerId, parent?.type === 'diagram' ? parent.shapeId : undefined);
+      data = normalizeUseCaseDiagramData(definition, data);
+    }
+    if (definition?.semantic?.family?.startsWith('uml.sequence-') || diagram.shapeId === 'uml.frame')
+      data = normalizeSequenceDiagramData(data, diagram.shapeId, diagram.id, diagram.containerId, diagram.h, diagram.y + diagram.h / 2);
     const params = definition ? deriveStructuredShapeParameters(definition, data, diagram.params) : diagram.params;
-    this.put({ ...diagram, data, params });
+    const updated = this.growDiagramTextBox({ ...diagram, data, params }, diagram.text ?? '', data);
+    this.put(updated);
+    if (diagram.shapeId === 'uml.frame') this.synchronizeEventsInSequenceFragment(diagram.id);
     if (commit) this.saveH();
   }
 
-  updateConnectorProperties(id: string, properties: Partial<Pick<ConnectorShape, 'lineStyle' | 'startMarker' | 'endMarker' | 'sourceCardinality' | 'targetCardinality' | 'label'>>, commit = true) {
+  updateDiagramBehavioralRole(id: string, role: BehavioralNodeRole): boolean {
     const shape = this.shapes.get(id);
-    if (!shape || shape.type !== 'connector') return;
-    const next = { ...shape, ...properties } as ConnectorShape;
-    this.put({ ...next, ...connectorBounds(next) });
+    if (!shape || shape.type !== 'diagram') return false;
+    const diagram = shape as DiagramShape, definition = getShapeDefinition(diagram.shapeId);
+    if (!definition?.semantic?.behavioralNodeRoles?.includes(role) || diagram.behavioralRole === role) return false;
+    const next = { ...diagram, behavioralRole: role };
+    const proposed = [...this.shapes.values()].map(candidate => candidate.id === id ? next : candidate);
+    if (diagnoseUmlGraph(proposed).some(issue => issue.severity === 'invalid' && issue.relatedIds.includes(id))) return false;
+    this.put(next);
+    this.saveH();
+    return true;
+  }
+
+  updateDiagramContext(id: string, context: UMLDiagramFamily | null, commit = true): boolean {
+    const shape = this.shapes.get(id);
+    if (!shape || (shape.type !== 'diagram' && shape.type !== 'connector')) return false;
+    const definition = this.definitionForEndpoint(shape);
+    if (definition?.semantic?.notation !== 'uml'
+      || (context !== null && !(definition.semantic.diagramFamilies ?? []).includes(context))) return false;
+    const next = { ...shape, diagramContext: context ?? undefined } as AnyShape;
+    const proposed = [...this.shapes.values()].map(candidate => candidate.id === id ? next : candidate);
+    if (diagnoseUmlGraph(proposed).some(issue => issue.severity === 'invalid' && issue.relatedIds.includes(id))) return false;
+    this.put(next as AnyShape);
     if (commit) this.saveH();
+    return true;
+  }
+
+  updateConnectorProperties(id: string, properties: Partial<Pick<ConnectorShape, 'lineStyle' | 'startMarker' | 'endMarker'
+    | 'sourceCardinality' | 'targetCardinality' | 'sourceMultiplicity' | 'targetMultiplicity' | 'label' | 'stateTransition' | 'activityFlow' | 'usecaseExtend'
+    | 'labelPosition' | 'labelOffset' | 'sourceLabel' | 'targetLabel' | 'sourceLabelPosition' | 'sourceLabelOffset'
+    | 'targetLabelPosition' | 'targetLabelOffset'>>, commit = true): boolean {
+    const shape = this.shapes.get(id);
+    if (!shape || shape.type !== 'connector') return false;
+    const definition = getShapeDefinition(shape.shapeId);
+    const capabilities = diagramCapabilitiesFor(definition, this.getSemanticContextForShape(id));
+    let next: ConnectorShape = { ...shape };
+    if (definition?.semantic?.notation === 'uml') {
+      const connectorCaps = capabilities.connector ?? {};
+      if (connectorCaps.lineStyleEditable && properties.lineStyle !== undefined) next.lineStyle = properties.lineStyle;
+      if (connectorCaps.markersEditable) {
+        if (properties.startMarker !== undefined) next.startMarker = properties.startMarker;
+        if (properties.endMarker !== undefined) next.endMarker = properties.endMarker;
+      }
+      if (connectorCaps.cardinalityEditable) {
+        if (properties.sourceCardinality !== undefined) next.sourceCardinality = properties.sourceCardinality;
+        if (properties.targetCardinality !== undefined) next.targetCardinality = properties.targetCardinality;
+      }
+      if (connectorCaps.multiplicityEditable) {
+        if (properties.sourceMultiplicity !== undefined) next.sourceMultiplicity = properties.sourceMultiplicity.slice(0, 200_000);
+        if (properties.targetMultiplicity !== undefined) next.targetMultiplicity = properties.targetMultiplicity.slice(0, 200_000);
+      }
+      if (connectorCaps.sourceLabelEditable && properties.sourceLabel !== undefined) next.sourceLabel = properties.sourceLabel.slice(0, 200_000);
+      if (connectorCaps.targetLabelEditable && properties.targetLabel !== undefined) next.targetLabel = properties.targetLabel.slice(0, 200_000);
+      if (connectorCaps.labelMode === 'plain' && properties.label !== undefined) next.label = properties.label.slice(0, 200_000);
+      if (connectorCaps.labelMode === 'structured' && properties.stateTransition !== undefined
+        && definition?.id === 'uml.state-transition') {
+        next.stateTransition = properties.stateTransition;
+        next.label = '';
+      }
+      if (connectorCaps.labelMode === 'structured' && properties.activityFlow !== undefined
+        && (definition?.id === 'uml.activity-flow' || definition?.id === 'uml.object-flow')) {
+        next.activityFlow = normalizeActivityFlowData(properties.activityFlow, definition.id);
+      }
+      if (properties.usecaseExtend !== undefined && definition?.id === 'uml.extend') {
+        next.usecaseExtend = normalizeExtendRelationshipData(properties.usecaseExtend);
+      }
+      if (connectorCaps.labelPositionEditable && properties.labelPosition !== undefined)
+        next.labelPosition = Math.round(Math.max(0, Math.min(1000, properties.labelPosition)));
+      if (connectorCaps.labelPositionEditable && properties.labelOffset !== undefined)
+        next.labelOffset = Math.round(Math.max(-2000, Math.min(2000, properties.labelOffset)));
+      if (connectorCaps.labelPositionEditable && connectorCaps.sourceLabelEditable) {
+        if (properties.sourceLabelPosition !== undefined) next.sourceLabelPosition = Math.round(Math.max(0, Math.min(1000, properties.sourceLabelPosition)));
+        if (properties.sourceLabelOffset !== undefined) next.sourceLabelOffset = Math.round(Math.max(-2000, Math.min(2000, properties.sourceLabelOffset)));
+      }
+      if (connectorCaps.labelPositionEditable && connectorCaps.targetLabelEditable) {
+        if (properties.targetLabelPosition !== undefined) next.targetLabelPosition = Math.round(Math.max(0, Math.min(1000, properties.targetLabelPosition)));
+        if (properties.targetLabelOffset !== undefined) next.targetLabelOffset = Math.round(Math.max(-2000, Math.min(2000, properties.targetLabelOffset)));
+      }
+    } else {
+      next = { ...next, ...properties } as ConnectorShape;
+    }
+    if (JSON.stringify(next) === JSON.stringify(shape)) return false;
+    this.put({ ...next, ...connectorBounds(next) }, { syncAttachments: false });
+    if (commit) this.saveH();
+    return true;
   }
 
   addConnectorWaypoint(id: string, x: number, y: number, index?: number) {
@@ -2718,10 +5733,35 @@ export class CanvasEngine {
     this.drawGrid();
 
     const vp = this.vpBox();
-    const visible = this.rtree.search(vp).sort((a,b) => a.id.localeCompare(b.id));
+    const diagramDepth = (shape: DiagramShape) => {
+      let depth = 0, parentId = shape.containerId;
+      const visited = new Set<string>([shape.id]);
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        const parent = this.shapes.get(parentId);
+        if (parent?.type !== 'diagram') break;
+        depth++;
+        parentId = (parent as DiagramShape).containerId;
+      }
+      return depth;
+    };
+    const paintDepth = (shape: AnyShape) => {
+      if (shape.type === 'diagram') return diagramDepth(shape as DiagramShape);
+      if (shape.type === 'connector') {
+        const parent = shape.containerId ? this.shapes.get(shape.containerId) : undefined;
+        return parent?.type === 'diagram' ? diagramDepth(parent as DiagramShape) + 0.5 : -0.5;
+      }
+      return 0;
+    };
+    // Containers paint first; their structurally-contained connectors paint over the frame but
+    // under the child nodes. Uncontained connectors remain behind root-level shape silhouettes.
+    const visible = this.rtree.search(vp).sort((a, b) => paintDepth(a) - paintDepth(b) || a.id.localeCompare(b.id));
     visible.forEach(s => {
-      if (s.id !== this.editingId) this.drawShape(s);
+      if (s.id !== this.editingId || !isDomOverlayShape(s)) {
+        this.drawShape(s);
+      }
     });
+    if (this.connectorTargetFeedback) this.drawConnectorTargetFeedback(this.connectorTargetFeedback);
 
     if (this.tool === 'eraser' && this.eraserCursorPoint) {
       const radius = ERASER_RADIUS_PX / cam.zoom;
@@ -2758,7 +5798,8 @@ export class CanvasEngine {
       const previewText = s.type === 'math' ? s.previewText ?? '' : '';
       const language = s.type === 'code' ? s.language ?? '' : '';
       const source = s.type === 'image' ? s.src : '';
-      stateSignature += `${s.id}:${text}:${previewText}:${language}:${s.w}:${s.h}:${s.x}:${s.y}:${s.rotation ?? 0}:${source}:sel${this.sel.has(s.id)}|`;
+      const stickyTime = s.type === 'sticky' ? (s as StickyShape).createdAt ?? '' : '';
+      stateSignature += `${s.id}:${text}:${previewText}:${language}:${s.w}:${s.h}:${s.x}:${s.y}:${s.rotation ?? 0}:${source}:${stickyTime}:sel${this.sel.has(s.id)}|`;
     });
     stateSignature += `editing:${this.editingId}`;
 
@@ -2771,7 +5812,10 @@ export class CanvasEngine {
           overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; pointer-events:auto;"><img src="${s.src}" style="width:100%; height:100%; display:block; pointer-events:none;" /></div>`;
         } else if (s.type === 'sticky') {
           content = s.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-          overlayHtml += `<div id="ol_${s.id}" class="board-sticky-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; color:rgba(15,15,15,0.8); padding:16px; box-sizing:border-box; overflow-y:auto; overflow-x:hidden; white-space:pre-wrap; word-break:break-word; border-radius:3px; background:${s.bg}; box-shadow:0 4px 16px rgba(0,0,0,0.1); pointer-events:auto;"><div style="position:absolute; top:0; right:0; width:14px; height:14px; background:rgba(0,0,0,0.08); clip-path:polygon(100% 0, 0 0, 100% 100%);"></div>${content}</div>`;
+          const timestamp = (s as StickyShape).createdAt;
+          const timeHtml = timestamp ? `<div class="board-sticky-timestamp" style="font-size:10.5px; opacity:0.65; margin-bottom:4px; font-variant-numeric:tabular-nums; line-height:1.2; user-select:none; display:flex; align-items:center; gap:4px; font-weight:550; color:rgba(15,23,42,0.85);"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.75; flex-shrink:0;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg><span>${timestamp}</span></div>` : '';
+          const padding = timestamp ? '12px 16px 14px 16px' : '14px 16px 14px 16px';
+          overlayHtml += `<div id="ol_${s.id}" class="board-sticky-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; border-radius:4px; background:${s.bg}; box-shadow:0 4px 16px rgba(0,0,0,0.1); pointer-events:auto; overflow:hidden;"><div class="sticky-dog-ear" style="position:absolute; top:0; right:0; width:16px; height:16px; background:rgba(0,0,0,0.10); clip-path:polygon(100% 0, 0 0, 100% 100%); z-index:5; pointer-events:none;"></div><div class="board-sticky-scroll-content" style="width:100%; height:100%; overflow-y:auto; overflow-x:hidden; padding:${padding}; box-sizing:border-box; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; line-height:1.35; color:rgba(15,15,15,0.88); white-space:pre-wrap; word-break:break-word;">${timeHtml}${content}</div></div>`;
         } else if (s.type === 'math') {
           const source = s.text;
           const storedPreview = s.previewText;
@@ -2780,13 +5824,13 @@ export class CanvasEngine {
           const stalePreview = hasValidPreview && previewSource !== source;
           try {
             const ast = parseTelex(previewSource);
-            content = renderFormulaStatic(ast, (s.fs || 14));
+            content = renderFormulaToHTML(ast, (s.fs || 14));
           } catch {
             content = '<span class="fm-render-error" role="status">Formula could not be parsed; source is preserved.</span>';
           }
           const status = stalePreview ? '<span class="fm-preview-stale" role="status" aria-label="Showing the last valid formula preview">Last valid preview</span>' : '';
           const boxWidth = Math.max(48, Number(s.w) || 0), boxHeight = Math.max(36, Number(s.h) || 0);
-          overlayHtml += `<div id="ol_${s.id}" class="board-math-preview" aria-label="Rendered mathematical formula${stalePreview ? '; showing the last valid preview while the draft is invalid' : ''}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${boxWidth}px; height:${boxHeight}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${(s.fs||14)}px; color:#000; padding:16px; box-sizing:border-box; overflow:visible; background:transparent; border-radius:4px; pointer-events:auto;">${content}${status}</div>`;
+          overlayHtml += `<div id="ol_${s.id}" class="board-math-preview" aria-label="Rendered mathematical formula${stalePreview ? '; showing the last valid preview while the draft is invalid' : ''}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${boxWidth}px; height:${boxHeight}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${(s.fs||14)}px; color:#000; padding:16px; box-sizing:border-box; overflow:visible; background:transparent; border-radius:4px; pointer-events:auto; display:flex; align-items:center; justify-content:center;">${content}${status}</div>`;
         } else if (s.type === 'code') {
           const language = normalizeCodeLanguage(s.language);
           const languageLabel = CODE_LANGUAGES.find(option => option.value === language)?.label ?? language;
@@ -2797,14 +5841,14 @@ export class CanvasEngine {
           overlayHtml += `<div id="ol_${s.id}" class="board-code-preview" role="region" tabindex="0" data-language="${language}" data-highlight-engine="${engine}" aria-label="${languageLabel} syntax-highlighted code preview; source spacing and line breaks are preserved${fallbackLabel}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${(s.fs||14)}px; font-family:'JetBrains Mono','SFMono-Regular',Consolas,monospace; line-height:1.5; color:#d4d4d4; box-sizing:border-box; overflow:auto; background:#1b2430; border-radius:6px; border:1px solid #344253; pointer-events:auto; overscroll-behavior:contain;"><div class="board-code-lines">${rows}</div></div>`;
         } else if (s.type === 'text') {
           content = s.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-          overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; color:${s.color || '#1e293b'}; padding:16px; box-sizing:border-box; overflow:hidden; white-space:pre-wrap; word-break:break-word; pointer-events:auto;">${content}</div>`;
+          overlayHtml += `<div id="ol_${s.id}" class="board-text-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; font-size:${s.fs || 14}px; font-family:'Inter',system-ui,sans-serif; line-height:1.35; color:${s.color || '#1e293b'}; padding:8px 12px; box-sizing:border-box; overflow:hidden; white-space:pre-wrap; word-break:break-word; pointer-events:auto;">${content}</div>`;
         }
 
         if (this.sel.has(s.id)) {
           const z = Math.max(0.04, this.cam.zoom), p = 4 / z, hs = 4 / z, border = 1.5 / z, rotation = s.rotation ?? 0;
           const handles = [[-p, -p], [s.w / 2, -p], [s.w + p, -p], [s.w + p, s.h / 2], [s.w + p, s.h + p],
             [s.w / 2, s.h + p], [-p, s.h + p], [-p, s.h / 2]];
-          overlayHtml += `<div style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${rotation}deg); transform-origin:center center; pointer-events:none;">
+          overlayHtml += `<div class="board-dom-selection-chrome" data-selection-for="${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${rotation}deg); transform-origin:center center; pointer-events:none;">
             <div style="position:absolute; left:${-p}px; top:${-p}px; width:${s.w + p * 2}px; height:${s.h + p * 2}px; border:${border}px solid #3b82f6; border-radius:${3 / z}px; box-sizing:border-box;"></div>
             ${handles.map(([x, y]) => `<div style="position:absolute; left:${x - hs}px; top:${y - hs}px; width:${hs * 2}px; height:${hs * 2}px; background:#fff; border:${border}px solid #3b82f6; border-radius:50%; box-sizing:border-box;"></div>`).join('')}
             <div style="position:absolute; left:${s.w / 2 - border / 2}px; top:${-22 / z}px; width:${border}px; height:${18 / z}px; background:#3b82f6;"></div>
@@ -2902,7 +5946,7 @@ export class CanvasEngine {
     const geometry = buildShapeGeometry(definition, shape.w, shape.h, params, definition.solid3d ? {
       scale, referenceWidth: definition.width, referenceHeight: definition.height, center: { x: 0, y: 0 },
     } : undefined);
-    const { outline, decorations, decorationStyles, intrinsicFills, hiddenEdges, visibleFaces = [], projection } = geometry;
+    const { outline, decorations, decorationStyles, intrinsicFills, intrinsicFillColors, hiddenEdges, visibleFaces = [], projection } = geometry;
     const makePath = (commands: PathCommand[]) => {
       if (typeof Path2D === 'undefined') return undefined;
       const path = new Path2D();
@@ -2916,7 +5960,7 @@ export class CanvasEngine {
       });
       return supportsCommands ? drawPathCommands(this.cx, commands, path) : undefined;
     };
-    const entry: CachedDiagramGeometry = { key, outline, decorations, decorationStyles, intrinsicFills, hiddenEdges, visibleFaces, projection, path: makePath(outline),
+    const entry: CachedDiagramGeometry = { key, outline, decorations, decorationStyles, intrinsicFills, intrinsicFillColors, hiddenEdges, visibleFaces, projection, path: makePath(outline),
       decorationPaths: decorations.map(makePath), intrinsicFillPaths: intrinsicFills.map(makePath), hiddenEdgePaths: hiddenEdges.map(makePath),
       visibleFacePaths: visibleFaces.map(face => makePath(face.commands)) };
     this.geometryCache.set(shape as object, entry);
@@ -2976,8 +6020,8 @@ export class CanvasEngine {
       else { drawPathCommands(cx, cached.outline); cx.fill(); }
     }
     if (cached.intrinsicFills.length) {
-      cx.fillStyle = shape.stroke;
       cached.intrinsicFills.forEach((commands, index) => {
+        cx.fillStyle = cached.intrinsicFillColors[index] === 'surface' ? '#f1f5f9' : shape.stroke;
         const path = cached.intrinsicFillPaths?.[index];
         if (path) cx.fill(path);
         else { drawPathCommands(cx, commands); cx.fill(); }
@@ -2999,26 +6043,138 @@ export class CanvasEngine {
       if (path) cx.stroke(path);
       else { drawPathCommands(cx, cached.decorations[index]); cx.stroke(); }
     }
+    if (shape.shapeId === 'uml.frame') {
+      const fragment = shape.data?.sequenceFragment as SequenceFragmentData | undefined;
+      const operands = fragment?.operands ?? [];
+      if (operands.length > 1) {
+        const contentTop = Math.min(shape.h, shape.h * 0.14);
+        const operandHeight = Math.max(1, (shape.h - contentTop) / operands.length);
+        cx.save(); cx.strokeStyle = shape.stroke; cx.lineWidth = Math.max(1, shape.sw) / zoom; cx.setLineDash([6 / zoom, 4 / zoom]);
+        for (let index = 1; index < operands.length; index++) {
+          const y = contentTop + operandHeight * index;
+          cx.beginPath(); cx.moveTo(0, y); cx.lineTo(shape.w, y); cx.stroke();
+        }
+        cx.restore();
+      }
+      if (fragment) {
+        const contentTop = Math.min(shape.h, shape.h * 0.14);
+        const operandHeight = Math.max(1, (shape.h - contentTop) / Math.max(1, operands.length));
+        cx.save(); cx.fillStyle = shape.textColor ?? '#1f2937'; cx.textAlign = 'left'; cx.textBaseline = 'top';
+        cx.font = `${12 / zoom}px Inter, 'Segoe UI', sans-serif`;
+        operands.forEach((operand, index) => {
+          const guard = operand.guard.trim();
+          if (guard) cx.fillText(`[${guard}]`, Math.max(8 / zoom, 8), contentTop + index * operandHeight + 5 / zoom,
+            Math.max(1, shape.w - 16 / zoom));
+        });
+        cx.restore();
+      }
+    }
+    if (shape.shapeId === 'uml.use-case' || shape.shapeId === 'uml.use-case-ext') {
+      const usecase = shape.data?.usecase as UMLUseCaseData | undefined;
+      const extensionPoints = usecase?.extensionPoints ?? [];
+      const textCapabilities = diagramCapabilitiesFor(definition).text;
+      const defW = definition.width ?? 160, defH = definition.height ?? 85;
+      const dimensionRatio = Math.sqrt((shape.w / defW) * (shape.h / defH));
+      const fontScale = Number.isFinite(shape.embeddedTextScale) && (shape.embeddedTextScale ?? 0) > 0
+        ? Math.max(0.25, Math.min(16, shape.embeddedTextScale!))
+        : Math.max(0.3, Math.min(16, dimensionRatio));
+      const scaledFs = Math.max(textCapabilities.minFontSize ?? 12, (shape.fs ?? 14) * fontScale);
+      const roleTypography = diagramTypography(textCapabilities.role ?? 'use-case', scaledFs, textCapabilities.minFontSize ?? 12);
+      const secondaryFs = roleTypography?.secondary ?? scaledFs * 0.75;
+      if (extensionPoints.length > 0) {
+        const epLineHeight = Math.max(14 * fontScale, secondaryFs * 1.35);
+        const epHeight = (extensionPoints.length + 1) * epLineHeight + 10 * fontScale;
+        const dividerY = Math.max(shape.h * 0.35, Math.min(shape.h * 0.70, shape.h - epHeight));
+        const dy = Math.abs(dividerY - shape.h / 2);
+        if (dy < shape.h / 2) {
+          const dx = (shape.w / 2) * Math.sqrt(Math.max(0, 1 - (dy / (shape.h / 2)) ** 2));
+          cx.save(); cx.strokeStyle = shape.stroke; cx.lineWidth = Math.max(1, shape.sw * 0.85);
+          cx.beginPath(); cx.moveTo(shape.w / 2 - dx, dividerY); cx.lineTo(shape.w / 2 + dx, dividerY); cx.stroke();
+          cx.restore();
+        }
+      }
+      const isBusiness = shape.params?.businessUseCase === true
+        || (typeof shape.params?.stereotype === 'string' && shape.params.stereotype.toLowerCase().includes('business'))
+        || usecase?.isBusinessUseCase === true;
+      if (isBusiness) {
+        cx.save(); cx.strokeStyle = shape.stroke; cx.lineWidth = Math.max(1.2, shape.sw);
+        cx.beginPath();
+        cx.moveTo(shape.w * 0.14, shape.h * 0.28);
+        cx.lineTo(shape.w * 0.26, shape.h * 0.72);
+        cx.moveTo(shape.w * 0.19, shape.h * 0.24);
+        cx.lineTo(shape.w * 0.31, shape.h * 0.76);
+        cx.stroke();
+        cx.restore();
+      }
+    }
+    if (definition.geometry === 'actor') {
+      const glyphH = shape.h * 0.68;
+      const radius = Math.min(shape.w * 0.18, glyphH * 0.14);
+      const headCenterY = radius + 3;
+      cx.save();
+      cx.fillStyle = shape.fill === 'transparent' ? '#ffffff' : shape.fill;
+      cx.beginPath();
+      cx.arc(shape.w / 2, headCenterY, radius, 0, Math.PI * 2);
+      cx.fill();
+      cx.restore();
+    }
     cx.setLineDash([]);
-    this.drawDiagramLabel(shape, definition);
+    if (definition.solid3d && cached.projection?.projectedBounds) {
+      const bounds = cached.projection.projectedBounds;
+      const labelShape = { ...shape, w: Math.max(1, bounds.maxX - bounds.minX), h: Math.max(1, bounds.maxY - bounds.minY) };
+      cx.save(); cx.translate(bounds.minX, bounds.minY);
+      this.drawDiagramLabel(labelShape, definition);
+      cx.restore();
+    } else this.drawDiagramLabel(shape, definition);
     cx.restore();
   }
 
   private drawDiagramLabel(shape: DiagramShape, definition: ShapeDefinition) {
     const params = shape.params ?? {};
     const text = typeof shape.text === 'string' ? shape.text.trim() : (typeof params.title === 'string' ? params.title : '');
-    const cx = this.cx, w = shape.w, h = shape.h, fs = Math.max(6, Math.min(96, shape.fs ?? 14));
+    const cx = this.cx, w = shape.w, h = shape.h;
+    const canonicalUml = definition.semantic?.notation === 'uml';
+    const textCapabilities = diagramCapabilitiesFor(definition).text;
+    const defW = definition.width ?? 160, defH = definition.height ?? 85;
+    const dimensionRatio = Math.sqrt((w / defW) * (h / defH));
+    const fontScale = Number.isFinite(shape.embeddedTextScale) && (shape.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, shape.embeddedTextScale!))
+      : Math.max(0.3, Math.min(16, dimensionRatio));
+    const minFontSize = textCapabilities.minFontSize ?? 12;
+    const scaledFs = Math.max(minFontSize, (shape.fs ?? 14) * fontScale);
+    const roleTypography = canonicalUml ? diagramTypography(textCapabilities.role ?? 'state', scaledFs, minFontSize) : null;
+    const minFont = (size: number) => Math.max(minFontSize, size * fontScale);
+    const fs = roleTypography?.body ?? scaledFs;
+    const titleFs = roleTypography?.title ?? fs * 1.15;
+    const secondaryFs = roleTypography?.secondary ?? fs * 0.75;
     cx.save();
     cx.beginPath(); cx.rect(0, 0, w, h); cx.clip();
     cx.fillStyle = shape.textColor ?? '#1f2937';
     cx.textAlign = 'center'; cx.textBaseline = 'middle';
     cx.font = `${params.italicName === true ? 'italic ' : ''}${fs}px Inter, 'Segoe UI', sans-serif`;
-    if (definition.geometry === 'table' && shape.data?.table && isRecord(shape.data.table) && Array.isArray(shape.data.table.columns)) {
+
+    const isStructuredShape = definition.geometry === 'table' && (
+      (Boolean(shape.data?.table) && Array.isArray((shape.data?.table as Record<string, unknown>)?.columns)) ||
+      (Boolean(shape.data?.classifier) && Array.isArray((shape.data?.classifier as Record<string, unknown>)?.compartments)) ||
+      (Boolean(shape.data?.instance) && Array.isArray((shape.data?.instance as Record<string, unknown>)?.values))
+    );
+    if (shape.id === this.editingId && !isStructuredShape && shape.shapeId !== 'uml.use-case-ext') {
+      cx.restore(); return;
+    }
+
+    if (definition.geometry === 'table' && definition.dataCapabilities?.includes('table')
+      && shape.data?.table && isRecord(shape.data.table) && Array.isArray(shape.data.table.columns)) {
       this.drawStructuredErTableLabel(shape, definition, shape.data.table.columns as unknown[]);
       cx.restore(); return;
     }
-    if (definition.geometry === 'table' && shape.data?.classifier && isRecord(shape.data.classifier) && Array.isArray(shape.data.classifier.compartments)) {
-      this.drawStructuredClassifierLabel(shape, definition, shape.data.classifier.compartments as unknown[]);
+    if (definition.geometry === 'table' && definition.dataCapabilities?.includes('classifier')
+      && shape.data?.classifier && isRecord(shape.data.classifier) && Array.isArray(shape.data.classifier.compartments)) {
+      this.drawStructuredClassifierLabel(shape, definition, shape.data.classifier as Record<string, unknown>);
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'table' && definition.dataCapabilities?.includes('instance')
+      && shape.data?.instance && isRecord(shape.data.instance) && Array.isArray(shape.data.instance.values)) {
+      this.drawStructuredInstanceLabel(shape, definition, shape.data.instance as Record<string, unknown>);
       cx.restore(); return;
     }
     if (definition.geometry === 'column' && shape.data?.column && isRecord(shape.data.column)) {
@@ -3026,55 +6182,330 @@ export class CanvasEngine {
       const key = column.key === 'primary' ? 'PK' : column.key === 'foreign' ? 'FK' : '';
       const name = typeof column.name === 'string' && column.name.trim() ? column.name.trim() : 'column';
       const type = typeof column.type === 'string' && column.type.trim() ? ` : ${column.type.trim()}` : '';
-      const pad = Math.max(2, Math.min(8, w * 0.05));
-      cx.font = `${Math.max(4, Math.min(fs, h * 0.42))}px Inter, 'Segoe UI', sans-serif`;
+      const pad = Math.max(minFont(2), Math.min(8 * fontScale, w * 0.05));
+      cx.font = `${Math.max(minFont(4), Math.min(fs, h * 0.42))}px Inter, 'Segoe UI', sans-serif`;
       if (key) { cx.textAlign = 'center'; cx.fillText(key, w * 0.16, h / 2, w * 0.25); }
       cx.textAlign = 'left'; cx.fillText(`${name}${type}`, w * 0.36 + pad * 0.25, h / 2, Math.max(1, w * 0.64 - pad));
       cx.restore(); return;
     }
     if (definition.geometry === 'umlLifeline') {
-      const headerHeight = h * 0.22;
-      cx.font = `600 ${Math.max(4, Math.min(fs, headerHeight * 0.58))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(text, w / 2, headerHeight / 2, Math.max(1, w - 10));
+      const headerHeight = Math.min(h, SEQUENCE_LIFELINE_HEADER_HEIGHT);
+      cx.font = `600 ${Math.max(minFont(4), Math.min(titleFs, headerHeight * 0.42))}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(text, w / 2, headerHeight / 2, Math.max(1, w - minFont(10)));
       cx.restore(); return;
     }
     if (definition.geometry === 'umlActorParticipant') {
-      cx.font = `600 ${Math.max(4, Math.min(fs, h * 0.075))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(text, w / 2, h * 0.35, Math.max(1, w - 8));
+      const headerHeight = Math.min(h, SEQUENCE_ACTOR_HEADER_HEIGHT);
+      const labelY = Math.min(headerHeight - 2, SEQUENCE_ACTOR_GLYPH_HEIGHT
+        + Math.max(4, (headerHeight - SEQUENCE_ACTOR_GLYPH_HEIGHT) * 0.52));
+      cx.font = `600 ${Math.max(minFont(4), Math.min(titleFs, Math.max(4, headerHeight - SEQUENCE_ACTOR_GLYPH_HEIGHT) * 0.72))}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(text, w / 2, labelY, Math.max(1, w - minFont(8)));
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'useCase') {
+      const usecase = shape.data?.usecase as UMLUseCaseData | undefined;
+      const extensionPoints = usecase?.extensionPoints ?? [];
+      const stereotype = typeof params.stereotype === 'string' ? params.stereotype.trim() : (usecase?.stereotype?.trim() ?? '');
+      if (extensionPoints.length > 0) {
+        const epLineHeight = Math.max(14 * fontScale, secondaryFs * 1.35);
+        const epHeight = (extensionPoints.length + 1) * epLineHeight + 10 * fontScale;
+        const dividerY = Math.max(h * 0.35, Math.min(h * 0.70, h - epHeight));
+        const upperCenterY = dividerY / 2;
+        const upperDy = Math.abs(upperCenterY - h / 2);
+        const upperChordW = w * Math.sqrt(Math.max(0, 1 - (upperDy / (h / 2)) ** 2));
+        const upperMaxW = Math.max(fs * 2, upperChordW * 0.78);
+
+        if (stereotype) {
+          cx.font = `600 ${Math.max(9, secondaryFs * 0.95)}px Inter, 'Segoe UI', sans-serif`;
+          cx.fillStyle = '#64748b';
+          cx.textAlign = 'center'; cx.textBaseline = 'middle';
+          cx.fillText(stereotype, w / 2, Math.max(secondaryFs, upperCenterY - fs * 0.65), upperMaxW);
+        }
+        cx.font = `${params.italicName === true ? 'italic ' : ''}600 ${fs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        const lines = this.wrapCanvasText(text, upperMaxW);
+        const lineHeight = fs * 1.25;
+        const startY = (stereotype ? upperCenterY + secondaryFs * 0.5 : upperCenterY) - (lines.length - 1) * lineHeight / 2;
+        lines.forEach((line, index) => { if (line) cx.fillText(line, w / 2, startY + index * lineHeight, upperMaxW); });
+
+        cx.font = `italic 600 ${Math.max(9, secondaryFs * 0.92)}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.fillText('«extension points»', w / 2, dividerY + epLineHeight * 0.55);
+
+        const lowerMidY = dividerY + epHeight / 2;
+        const lowerDy = Math.abs(lowerMidY - h / 2);
+        const lowerChordW = w * Math.sqrt(Math.max(0, 1 - (lowerDy / (h / 2)) ** 2));
+        const epLeft = Math.max(16 * fontScale, w / 2 - lowerChordW * 0.42);
+        const epMaxW = Math.max(20, lowerChordW * 0.84);
+
+        cx.textAlign = 'left'; cx.textBaseline = 'middle';
+        cx.font = `500 ${Math.max(9.5, secondaryFs * 0.95)}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#1e293b';
+        extensionPoints.forEach((ep, index) => {
+          const itemY = dividerY + (index + 1.5) * epLineHeight;
+          if (itemY < h - 4) {
+            const itemText = ep.explanation?.trim() ? `• ${ep.name} : ${ep.explanation.trim()}` : `• ${ep.name}`;
+            cx.fillText(itemText, epLeft, itemY, epMaxW);
+          }
+        });
+        cx.restore(); return;
+      }
+      if (stereotype) {
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.font = `600 ${Math.max(9.5, secondaryFs)}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.fillText(stereotype, w / 2, h * 0.32, Math.max(fs * 2, w * 0.72));
+        cx.font = `${params.italicName === true ? 'italic ' : ''}600 ${fs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        const lines = this.wrapCanvasText(text, Math.max(fs * 2, w * 0.72));
+        const lineHeight = fs * 1.25;
+        const firstY = h * 0.58 - (lines.length - 1) * lineHeight / 2;
+        lines.forEach((line, index) => { if (line) cx.fillText(line, w / 2, firstY + index * lineHeight, Math.max(fs * 2, w * 0.72)); });
+        cx.restore(); return;
+      }
+      cx.font = `${params.italicName === true ? 'italic ' : ''}600 ${fs}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillStyle = shape.textColor ?? '#0f172a';
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      const lines = this.wrapCanvasText(text, Math.max(fs * 2, w * 0.75));
+      const lineHeight = fs * 1.25;
+      const firstY = h / 2 - (lines.length - 1) * lineHeight / 2;
+      lines.forEach((line, index) => { if (line) cx.fillText(line, w / 2, firstY + index * lineHeight); });
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'actor') {
+      const stereotype = typeof params.stereotype === 'string' ? params.stereotype.trim() : '';
+      const glyphH = h * 0.68;
+      const labelBandTop = glyphH + 4;
+      const labelBandBottom = h - 2;
+      const maxWidth = Math.max(1, w * 0.95);
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+
+      if (stereotype) {
+        const stereoFs = Math.max(9, secondaryFs * 0.85);
+        const nameFs = Math.max(11, fs);
+        cx.font = `500 ${stereoFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.fillText(stereotype, w / 2, labelBandTop + stereoFs * 0.65, maxWidth);
+
+        cx.font = `${params.italicName === true ? 'italic ' : ''}600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        const lines = this.wrapCanvasText(text, maxWidth);
+        const lineHeight = nameFs * 1.2;
+        const startY = labelBandTop + stereoFs * 1.4 + nameFs * 0.6;
+        lines.slice(0, 2).forEach((val, idx) => {
+          if (val) cx.fillText(val, w / 2, startY + idx * lineHeight, maxWidth);
+        });
+      } else {
+        const nameFs = Math.max(11, fs);
+        cx.font = `${params.italicName === true ? 'italic ' : ''}600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        const lines = this.wrapCanvasText(text, maxWidth);
+        const lineHeight = nameFs * 1.25;
+        const centerY = (labelBandTop + labelBandBottom) / 2;
+        const startY = centerY - (lines.length - 1) * lineHeight / 2;
+        lines.slice(0, 2).forEach((val, idx) => {
+          if (val) cx.fillText(val, w / 2, startY + idx * lineHeight, maxWidth);
+        });
+      }
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'rightTriangle') {
+      const bandTop = h * 0.60, bandBottom = h * 0.98;
+      const fontSize = Math.max(minFont(3), Math.min(fs, h * 0.13, w * 0.11));
+      const lineHeight = Math.min(fontSize * 1.18, Math.max(minFont(3), (bandBottom - bandTop) / 2));
+      const maxWidth = Math.max(1, w * 0.44);
+      cx.font = `${fontSize}px Inter, 'Segoe UI', sans-serif`;
+      const lines: string[] = []; let line = '';
+      for (const word of text.split(/\s+/).filter(Boolean)) {
+        const next = line ? `${line} ${word}` : word;
+        if (line && cx.measureText(next).width > maxWidth) { lines.push(line); line = word; }
+        else line = next;
+      }
+      if (line) lines.push(line);
+      const visible = lines.slice(0, Math.max(1, Math.floor((bandBottom - bandTop) / lineHeight)));
+      const firstY = (bandTop + bandBottom - visible.length * lineHeight) / 2 + lineHeight / 2;
+      visible.forEach((value, index) => cx.fillText(value, w * 0.25, firstY + index * lineHeight, maxWidth));
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'internalStorage') {
+      const maxWidth = Math.max(1, w * 0.57), fontSize = Math.max(minFont(3), Math.min(fs, h * 0.17));
+      cx.font = `${fontSize}px Inter, 'Segoe UI', sans-serif`;
+      const words = text.split(/\s+/).filter(Boolean), lines: string[] = []; let line = '';
+      for (const word of words) {
+        const next = line ? `${line} ${word}` : word;
+        if (line && cx.measureText(next).width > maxWidth) { lines.push(line); line = word; }
+        else line = next;
+      }
+      if (line) lines.push(line);
+      const lineHeight = Math.min(fontSize * 1.18, h * 0.24), visible = lines.slice(0, 2);
+      const firstY = h * 0.62 - visible.length * lineHeight / 2 + lineHeight / 2;
+      visible.forEach((value, index) => cx.fillText(value, w * 0.64, firstY + index * lineHeight, maxWidth));
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'sort') {
+      cx.font = `${Math.max(minFont(3), Math.min(fs, h * 0.16))}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(text, w / 2, h * 0.30, Math.max(1, w * 0.30));
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'magneticDisk') {
+      cx.font = `${Math.max(minFont(3), Math.min(fs, h * 0.14))}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(text, w / 2, h * 0.75, Math.max(1, w * 0.72));
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'associativeEntity') {
+      cx.font = `${Math.max(minFont(3), Math.min(fs, Math.min(w, h) * 0.16))}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(text, w / 2, h / 2, Math.max(1, Math.min(w, h) * 0.66));
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'dataObject' && params.messageEnvelope === true) {
+      cx.font = `${Math.max(minFont(3), Math.min(fs, h * 0.24))}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(text, w / 2, h * 0.82, Math.max(1, w * 0.84));
       cx.restore(); return;
     }
     if (definition.geometry === 'umlRole') {
-      const stereotype = typeof params.stereotype === 'string' ? params.stereotype : '';
+      const stereotype = typeof params.stereotype === 'string' ? params.stereotype.trim() : '';
+      const headerHeight = Math.min(h, SEQUENCE_ROLE_HEADER_HEIGHT);
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
       if (stereotype) {
-        cx.font = `600 ${Math.max(4, Math.min(fs * 0.62, h * 0.10))}px Inter, 'Segoe UI', sans-serif`;
-        cx.fillText(stereotype, w / 2, h * 0.76, Math.max(1, w - 8));
+        cx.font = `600 ${Math.max(minFont(4), Math.min(secondaryFs, headerHeight * 0.16))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.fillText(stereotype, w / 2, headerHeight * 0.65, Math.max(1, w - minFont(8)));
+        cx.font = `600 ${Math.max(minFont(5), Math.min(titleFs, headerHeight * 0.20))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        cx.fillText(text, w / 2, headerHeight * 0.88, Math.max(1, w - minFont(8)));
+      } else {
+        const nameFs = Math.max(11, Math.min(14, fs));
+        cx.font = `600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        const labelCenterY = Math.round(headerHeight * 0.75);
+        cx.fillText(text, w / 2, labelCenterY, Math.max(1, w - minFont(8)));
       }
-      cx.font = `600 ${Math.max(5, Math.min(fs, h * 0.16))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(text, w / 2, h * 0.91, Math.max(1, w - 8));
       cx.restore(); return;
     }
-    if (definition.geometry === 'activityPartition' || definition.geometry === 'umlCompositeState') {
-      const titleHeight = definition.geometry === 'activityPartition' ? h * 0.24 : h * 0.29;
-      cx.font = `600 ${Math.max(4, Math.min(fs, titleHeight * 0.56))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(text, w / 2, titleHeight / 2, Math.max(1, w - 12));
+    if (definition.geometry === 'umlState' && shape.shapeId === 'uml.state') {
+      const behavior = shape.data?.stateBehavior as { entry?: string; doActivity?: string; exit?: string } | undefined;
+      const rows = [
+        typeof behavior?.entry === 'string' && behavior.entry.trim() ? `entry / ${behavior.entry.trim()}` : '',
+        typeof behavior?.doActivity === 'string' && behavior.doActivity.trim() ? `do / ${behavior.doActivity.trim()}` : '',
+        typeof behavior?.exit === 'string' && behavior.exit.trim() ? `exit / ${behavior.exit.trim()}` : '',
+      ].filter(Boolean);
+      if (!rows.length) {
+        cx.font = `${fs}px Inter, 'Segoe UI', sans-serif`;
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.fillText(text, w / 2, h / 2, Math.max(1, w - minFont(12)));
+      } else {
+        const divider = h * 0.40;
+        cx.font = `600 ${Math.max(minFont(4), Math.min(titleFs, divider * 0.45))}px Inter, 'Segoe UI', sans-serif`;
+        cx.textAlign = 'center'; cx.fillText(text, w / 2, divider * 0.20, Math.max(1, w - minFont(12)));
+        const bodyFont = Math.max(minFont(4), Math.min(secondaryFs, (h - divider - 8) / (rows.length * 1.15)));
+        cx.font = `${bodyFont}px Inter, 'Segoe UI', sans-serif`; cx.textAlign = 'left'; cx.textBaseline = 'top';
+        const lineHeight = bodyFont * 1.14, maxLines = Math.max(1, Math.floor((h - divider - 8) / lineHeight));
+        let drawn = 0;
+        for (const row of rows) {
+          const lines = this.wrapCanvasText(row, Math.max(1, w - 20));
+          for (const line of lines) {
+            if (drawn >= maxLines) break;
+            cx.fillText(line, 10, divider + 5 + drawn * lineHeight, Math.max(1, w - 20)); drawn++;
+          }
+        }
+      }
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'activityPartition') {
+      const horizontal = params.activityOrientation === 'horizontal';
+      if (horizontal) {
+        cx.save(); cx.translate(w * 0.12, h / 2); cx.rotate(-Math.PI / 2);
+        cx.font = `600 ${Math.max(minFont(4), Math.min(titleFs, w * 0.14))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(text, 0, 0, Math.max(1, h - minFont(12)));
+        cx.restore();
+      } else {
+        const titleHeight = h * 0.24;
+        cx.font = `600 ${Math.max(minFont(4), Math.min(titleFs, titleHeight * 0.56))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(text, w / 2, titleHeight / 2, Math.max(1, w - minFont(12)));
+      }
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'umlCompositeState') {
+      const behavior = shape.data?.stateBehavior as { entry?: string; doActivity?: string; exit?: string } | undefined;
+      const rows = [
+        typeof behavior?.entry === 'string' && behavior.entry.trim() ? `entry / ${behavior.entry.trim()}` : '',
+        typeof behavior?.doActivity === 'string' && behavior.doActivity.trim() ? `do / ${behavior.doActivity.trim()}` : '',
+        typeof behavior?.exit === 'string' && behavior.exit.trim() ? `exit / ${behavior.exit.trim()}` : '',
+      ].filter(Boolean);
+      const header = h * (typeof params.stateHeaderFraction === 'number' ? params.stateHeaderFraction : 0.29);
+      cx.font = `600 ${Math.max(minFont(4), Math.min(titleFs, header * (rows.length ? 0.30 : 0.56)))}px Inter, 'Segoe UI', sans-serif`;
+      cx.textAlign = 'center'; cx.fillText(text, w / 2, rows.length ? header * 0.18 : header / 2, Math.max(1, w - minFont(12)));
+      if (rows.length) {
+        const bodyFont = Math.max(minFont(4), Math.min(secondaryFs, header * 0.20));
+        cx.font = `${bodyFont}px Inter, 'Segoe UI', sans-serif`; cx.textAlign = 'left'; cx.textBaseline = 'top';
+        rows.forEach((row, index) => cx.fillText(row, w * 0.12, header * 0.40 + index * bodyFont * 1.18, Math.max(1, w * 0.76)));
+      }
       cx.restore(); return;
     }
     if (definition.geometry === 'ellipse' && params.key === 'foreign') {
       cx.textAlign = 'left';
-      cx.font = `750 ${Math.max(4, Math.min(fs * 0.62, h * 0.15))}px Inter, 'Segoe UI', sans-serif`;
+      cx.font = `750 ${Math.max(minFont(4), Math.min(fs * 0.62, h * 0.15))}px Inter, 'Segoe UI', sans-serif`;
       cx.fillText('FK', w * 0.22, h * 0.24, Math.max(1, w * 0.22));
       cx.textAlign = 'center';
-      cx.font = `${Math.max(5, Math.min(fs, h * 0.24))}px Inter, 'Segoe UI', sans-serif`;
+      cx.font = `${Math.max(minFont(5), Math.min(fs, h * 0.24))}px Inter, 'Segoe UI', sans-serif`;
       cx.fillText(text, w / 2, h * 0.55, Math.max(1, w * 0.78));
       cx.restore(); return;
     }
-    if (definition.geometry === 'umlBoundary' || (definition.geometry === 'frame' && params.componentGlyph !== true)) {
-      cx.textAlign = 'left'; cx.textBaseline = 'top'; cx.font = `600 ${Math.max(4, Math.min(fs, h * 0.22))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(text, Math.min(8, w * 0.06), Math.min(5, h * 0.06), Math.max(1, w - 16));
+    if (definition.geometry === 'package') {
+      // UML package/module names belong in the folder tab. Centering them in the body
+      // lets an owned classifier/package child erase the container's own label.
+      const tabCenterX = w * 0.23, tabTextWidth = Math.max(1, w * 0.44);
+      const stereotype = typeof params.stereotype === 'string' ? params.stereotype : '';
+      if (stereotype) {
+        cx.font = `600 ${Math.max(minFont(2.5), Math.min(secondaryFs, h * 0.085))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(stereotype, tabCenterX, h * 0.055, tabTextWidth);
+        cx.font = `600 ${Math.max(minFont(3), Math.min(titleFs * 0.90, h * 0.105))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(text, tabCenterX, h * 0.155, tabTextWidth);
+      } else {
+        cx.font = `600 ${Math.max(minFont(3), Math.min(titleFs, h * 0.18))}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(text, tabCenterX, h * 0.11, tabTextWidth);
+      }
       cx.restore(); return;
     }
-    const insetLeft = definition.geometry === 'pool' || definition.geometry === 'lane' ? w * 0.18 : Math.max(3, w * 0.05);
-    const insetRight = Math.max(3, w * 0.05), maxWidth = Math.max(1, w - insetLeft - insetRight);
+    if (definition.geometry === 'umlBoundary') {
+      const titleHeight = Math.min(h, UML_BOUNDARY_TITLE_HEIGHT);
+      const stereotype = typeof params.stereotype === 'string' ? params.stereotype.trim()
+        : (shape.data?.subjectBoundary as { stereotype?: string } | undefined)?.stereotype?.trim() || '';
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      if (stereotype) {
+        const stereoFs = Math.max(9, Math.min(titleHeight * 0.32, secondaryFs));
+        const nameFs = Math.max(11, Math.min(titleHeight * 0.42, fs));
+        cx.font = `600 ${stereoFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.fillText(stereotype.toUpperCase(), w / 2, titleHeight * 0.30, Math.max(1, w - 24));
+        cx.font = `600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        cx.fillText(text, w / 2, titleHeight * 0.70, Math.max(1, w - 24));
+      } else {
+        const nameFs = Math.max(11, Math.min(15, shape.fs ?? 14));
+        cx.font = `600 ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        cx.fillText(text, w / 2, titleHeight / 2, Math.max(1, w - 24));
+      }
+      cx.restore(); return;
+    }
+    if (definition.geometry === 'frame' && params.componentGlyph !== true) {
+      const fragment = shape.shapeId === 'uml.frame' ? shape.data?.sequenceFragment as SequenceFragmentData | undefined : undefined;
+      const frameFont = Math.max(minFont(4), Math.min(titleFs, h * 0.22));
+      cx.textAlign = 'left'; cx.textBaseline = 'middle'; cx.font = `600 ${frameFont}px Inter, 'Segoe UI', sans-serif`;
+      if (fragment) {
+        cx.fillText(fragment.operator, Math.min(8 * fontScale, w * 0.04), Math.min(h * 0.09, Math.max(frameFont, 8 * fontScale)));
+        cx.font = `600 ${frameFont}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(text, Math.max(w * 0.46, minFont(46)), Math.min(h * 0.09, Math.max(frameFont, 8 * fontScale)), Math.max(1, w * 0.52));
+      } else {
+        cx.textBaseline = 'top'; cx.fillText(text, Math.min(8 * fontScale, w * 0.06), Math.min(5 * fontScale, h * 0.06), Math.max(1, w - minFont(16)));
+      }
+      cx.restore(); return;
+    }
+    const insetLeft = definition.geometry === 'pool' || definition.geometry === 'lane' ? w * 0.18 : Math.max(minFont(3), w * 0.05);
+    const insetRight = Math.max(minFont(3), w * 0.05), maxWidth = Math.max(1, w - insetLeft - insetRight);
     const lines = text.split('\n').slice(0, 80).filter(line => !/^[-─━]{2,}$/.test(line.trim()));
     const wrapped: string[] = [];
     for (const line of lines) {
@@ -3089,12 +6520,12 @@ export class CanvasEngine {
     }
     const stereotype = typeof params.stereotype === 'string' ? params.stereotype : '';
     if (stereotype) wrapped.unshift(stereotype);
-    const lineHeight = Math.min(fs * 1.28, Math.max(4, h / Math.max(2, wrapped.length + 0.4)));
-    const visibleLines = Math.max(1, Math.floor((h - 4) / lineHeight));
+    const lineHeight = Math.min(fs * 1.28, Math.max(minFont(4), h / Math.max(2, wrapped.length + 0.4)));
+    const visibleLines = Math.max(1, Math.floor((h - minFont(4)) / lineHeight));
     const clipped = wrapped.slice(0, visibleLines);
     if (definition.geometry === 'pool' || definition.geometry === 'lane') {
       cx.translate(w * 0.075, h / 2); cx.rotate(-Math.PI / 2);
-      cx.fillText(clipped.join(' ').slice(0, 60), 0, 0, Math.max(1, h - 10));
+      cx.fillText(clipped.join(' ').slice(0, 60), 0, 0, Math.max(1, h - minFont(10)));
     } else {
       const totalHeight = clipped.length * lineHeight;
       let y = (h - totalHeight) / 2 + lineHeight / 2;
@@ -3108,75 +6539,275 @@ export class CanvasEngine {
   }
 
   private drawStructuredErTableLabel(shape: DiagramShape, definition: ShapeDefinition, rawColumns: unknown[]) {
-    const cx = this.cx, w = shape.w, h = shape.h, fs = Math.max(6, Math.min(96, shape.fs ?? 14));
+    const cx = this.cx, w = shape.w, h = shape.h;
+    const fontScale = Number.isFinite(shape.embeddedTextScale) ? Math.max(0.01, Math.min(64, shape.embeddedTextScale!)) : 1;
+    const minFont = (size: number) => Math.max(1.25, size * fontScale);
+    const fs = Math.max(1.25, Math.min(96, (shape.fs ?? 14) * fontScale));
     const columns = rawColumns.filter(isRecord).slice(0, 32);
     const layout = structuredTableLayout(h, columns.length + 1);
     const title = typeof shape.text === 'string' && shape.text.trim() ? shape.text.trim() : definition.label;
-    const left = Math.max(2, Math.min(8, w * 0.05)), maxWidth = Math.max(1, w - left * 2);
+    const left = Math.max(minFont(2), Math.min(8 * fontScale, w * 0.05)), maxWidth = Math.max(1, w - left * 2);
+
+    const isEditingThis = shape.id === this.editingId;
+    const editingTarget = isEditingThis ? this.editingClassifierContext?.target : undefined;
+    const editingColIdx = isEditingThis ? this.editingClassifierContext?.columnIndex : undefined;
+
     cx.textAlign = 'left'; cx.textBaseline = 'middle'; cx.fillStyle = shape.textColor ?? '#1f2937';
-    if (layout.rowHeight >= 4) {
-      cx.font = `600 ${Math.max(3.5, Math.min(fs, layout.rowHeight * 0.68))}px Inter, 'Segoe UI', sans-serif`;
+    if (layout.rowHeight >= minFont(4) && editingTarget !== 'header') {
+      cx.font = `600 ${Math.max(minFont(3.5), Math.min(fs, layout.rowHeight * 0.68))}px Inter, 'Segoe UI', sans-serif`;
       cx.fillText(title, left, layout.rowCenters[0], maxWidth);
     }
     columns.forEach((column, index) => {
+      if (editingTarget === 'member' && index === editingColIdx) return;
       const rowHeight = layout.rowHeight;
-      if (rowHeight < 4) return;
+      if (rowHeight < minFont(4)) return;
       const key = column.key === 'primary' ? 'PK  ' : column.key === 'foreign' ? 'FK  ' : '';
       const name = typeof column.name === 'string' && column.name.trim() ? column.name.trim() : `column ${index + 1}`;
       const type = typeof column.type === 'string' && column.type.trim() ? ` : ${column.type.trim()}` : '';
-      cx.font = `${Math.max(3.5, Math.min(fs, rowHeight * 0.66))}px Inter, 'Segoe UI', sans-serif`;
+      cx.font = `${Math.max(minFont(3.5), Math.min(fs, rowHeight * 0.66))}px Inter, 'Segoe UI', sans-serif`;
       cx.fillText(`${key}${name}${type}`, left, layout.rowCenters[index + 1], maxWidth);
     });
   }
 
-  private drawStructuredClassifierLabel(shape: DiagramShape, definition: ShapeDefinition, rawCompartments: unknown[]) {
-    const cx = this.cx, w = shape.w, h = shape.h, fs = Math.max(6, Math.min(96, shape.fs ?? 14));
-    const compartments = rawCompartments.filter(isRecord).slice(0, 4);
-    const layout = structuredTableLayout(h, compartments.length + 1), bandHeight = layout.rowHeight;
-    const title = typeof shape.text === 'string' && shape.text.trim() ? shape.text.trim() : definition.label;
+  private drawStructuredClassifierLabel(shape: DiagramShape, definition: ShapeDefinition, rawClassifier: Record<string, unknown>) {
+    const cx = this.cx, w = shape.w;
+    const textCapabilities = diagramCapabilitiesFor(definition, this.getSemanticContextForShape(shape.id)).text;
+    const fontScale = Number.isFinite(shape.embeddedTextScale) && (shape.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, shape.embeddedTextScale!))
+      : Math.sqrt((shape.w / Math.max(1, definition.width)) * (shape.h / Math.max(1, definition.height)));
+    const baseFs = (shape.fs ?? 14) * Math.min(4, Math.max(0.4, fontScale));
+    const typography = diagramTypography(textCapabilities.role ?? 'classifier', baseFs, textCapabilities.minFontSize ?? 12);
+    const name = typeof shape.text === 'string' && shape.text.trim() ? shape.text.trim() : definition.label;
     const stereotype = typeof shape.params?.stereotype === 'string' ? shape.params.stereotype : '';
-    const left = Math.max(3, Math.min(8, w * 0.05)), maxWidth = Math.max(1, w - left * 2);
+    const classifier = rawClassifier as unknown as UMLClassifierData;
+    const measure = (value: string) => {
+      cx.save();
+      cx.font = `${typography.title}px Inter, 'Segoe UI', sans-serif`;
+      const titleWidth = cx.measureText(value).width;
+      cx.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+      const bodyWidth = cx.measureText(value).width;
+      cx.restore();
+      return Math.max(titleWidth, bodyWidth);
+    };
+    const layout = classifierLayout(classifier, name, stereotype, typography.title, typography.body, measure);
+    const isAbstractClass = definition.id === 'uml.abstract-class'
+      || shape.params?.italicName === true
+      || (shape.data?.classifier as Record<string, unknown> | undefined)?.isAbstract === true;
+    const italicPrefix = isAbstractClass ? 'italic ' : '';
+
+    const isEditingThis = shape.id === this.editingId;
+    const editingTarget = isEditingThis ? this.editingClassifierContext?.target : undefined;
+    const editingMemberId = isEditingThis ? this.editingClassifierContext?.memberId : undefined;
+
     cx.fillStyle = shape.textColor ?? '#1f2937'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
     if (stereotype) {
-      const halfLine = bandHeight / 2;
-      if (halfLine >= 2.5) {
-        cx.font = `${Math.max(2.5, Math.min(fs * 0.68, halfLine * 0.78))}px Inter, 'Segoe UI', sans-serif`;
-        cx.fillText(stereotype, w / 2, bandHeight * 0.25, maxWidth);
-        cx.font = `${shape.params?.italicName === true ? 'italic ' : ''}${Math.max(3, Math.min(fs, halfLine * 0.82))}px Inter, 'Segoe UI', sans-serif`;
-        cx.fillText(title, w / 2, bandHeight * 0.72, maxWidth);
+      cx.font = `500 ${typography.secondary}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(stereotype, w / 2, 8 + typography.secondary / 2);
+      if (editingTarget !== 'header') {
+        cx.font = `${italicPrefix}600 ${typography.title}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillText(name, w / 2, layout.headerHeight - typography.title * 0.68);
       }
-    } else if (bandHeight >= 3) {
-      cx.font = `${shape.params?.italicName === true ? 'italic ' : ''}${Math.max(3, Math.min(fs, bandHeight * 0.72))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(title, w / 2, bandHeight / 2, maxWidth);
+    } else if (editingTarget !== 'header') {
+      cx.font = `${italicPrefix}600 ${typography.title}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(name, w / 2, layout.headerHeight / 2);
     }
-    if (shape.params?.underlineName === true && bandHeight >= 4) {
-      const lineWidth = Math.min(w * 0.75, cx.measureText(title).width);
-      cx.beginPath(); cx.moveTo(w / 2 - lineWidth / 2, bandHeight * 0.83); cx.lineTo(w / 2 + lineWidth / 2, bandHeight * 0.83);
-      cx.strokeStyle = shape.textColor ?? '#1f2937'; cx.lineWidth = Math.max(0.75, Math.min(1.5, fs / 14)); cx.stroke();
+
+    // UML 2.5 Template/Parameterized Class notation (dashed rectangle with template parameter e.g. <T>)
+    const rawClassRecord = shape.data?.classifier as Record<string, unknown> | undefined;
+    const templateParam = typeof shape.params?.template === 'string' && shape.params.template.trim()
+      ? shape.params.template.trim()
+      : typeof rawClassRecord?.templateParameter === 'string' && rawClassRecord.templateParameter.trim()
+        ? rawClassRecord.templateParameter.trim() : '';
+    if (templateParam) {
+      cx.save();
+      const tFs = Math.max(9.5, typography.body * 0.85);
+      cx.font = `500 ${tFs}px Inter, 'Segoe UI', sans-serif`;
+      const tPadX = 6, tPadY = 2;
+      const tW = cx.measureText(templateParam).width + tPadX * 2;
+      const tH = tFs * 1.3 + tPadY * 2;
+      const tX = w - tW - 2;
+      const tY = -tH * 0.45;
+      cx.fillStyle = '#ffffff';
+      cx.strokeStyle = shape.stroke ?? '#1f2937';
+      cx.lineWidth = Math.max(0.75, shape.sw ?? 1);
+      cx.setLineDash([3, 2.5]);
+      cx.beginPath();
+      cx.rect(tX, tY, tW, tH);
+      cx.fill();
+      cx.stroke();
+      cx.setLineDash([]);
+      cx.fillStyle = shape.textColor ?? '#1f2937';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillText(templateParam, tX + tW / 2, tY + tH / 2);
+      cx.restore();
     }
-    compartments.forEach((compartment, index) => {
-      const values = Array.isArray(compartment.items) ? compartment.items.filter((item: unknown): item is string => typeof item === 'string').slice(0, 20) : [];
-      if (!values.length) return;
-      const lineHeight = bandHeight / values.length;
-      if (lineHeight < 4) return;
-      cx.textAlign = 'left'; cx.font = `${Math.max(3, Math.min(fs, lineHeight * 0.78))}px Inter, 'Segoe UI', sans-serif`;
-      const pad = Math.max(3, Math.min(8, w * 0.05));
-      const bandTop = bandHeight * (index + 1);
-      values.forEach((value: string, lineIndex: number) => cx.fillText(value, pad, bandTop + lineHeight * (lineIndex + 0.5), Math.max(1, w - pad * 2)));
-    });
+
+    cx.strokeStyle = shape.stroke ?? '#1f2937'; cx.lineWidth = Math.max(0.75, shape.sw ?? 1);
+    for (const y of new Set(layout.dividers)) {
+      if (y > 0 && y < shape.h - 0.25) { cx.beginPath(); cx.moveTo(0, y); cx.lineTo(w, y); cx.stroke(); }
+    }
+    cx.textAlign = 'left'; cx.textBaseline = 'middle';
+    for (const row of layout.rows) {
+      if (editingTarget === 'member' && row.member.id === editingMemberId) continue;
+      const member = row.member;
+      const italic = member.kind === 'operation' && member.abstract === true;
+      cx.font = `${italic ? 'italic ' : ''}${typography.body}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillStyle = shape.textColor ?? '#1f2937';
+      cx.fillText(row.text, layout.paddingX, row.y);
+      if ((member.kind === 'attribute' || member.kind === 'operation') && member.static === true) {
+        const textWidth = cx.measureText(row.text).width;
+        const underlineY = row.y + typography.body * 0.48;
+        cx.beginPath(); cx.moveTo(layout.paddingX, underlineY); cx.lineTo(layout.paddingX + textWidth, underlineY);
+        cx.strokeStyle = shape.textColor ?? '#1f2937'; cx.lineWidth = Math.max(0.75, typography.body / 16); cx.stroke();
+      }
+    }
   }
 
-  private connectorLabelVisual(connector: ConnectorShape, route = getConnectorRoute(connector)): ConnectorLabelVisual | null {
-    if (!connector.label?.trim()) return null;
-    const cx = this.cx;
-    cx.save(); cx.font = '12px Inter, \'Segoe UI\', sans-serif';
-    const text = fitConnectorLabel(connector.label, value => cx.measureText(value).width);
-    const textWidth = Math.min(280, cx.measureText(text).width);
+  private drawStructuredInstanceLabel(shape: DiagramShape, definition: ShapeDefinition, rawInstance: Record<string, unknown>) {
+    const cx = this.cx, w = shape.w;
+    const textCapabilities = diagramCapabilitiesFor(definition).text;
+    const minimum = textCapabilities.minFontSize ?? 12;
+    const fontScale = Number.isFinite(shape.embeddedTextScale) && (shape.embeddedTextScale ?? 0) > 0
+      ? Math.max(0.25, Math.min(16, shape.embeddedTextScale!))
+      : Math.sqrt((shape.w / Math.max(1, definition.width)) * (shape.h / Math.max(1, definition.height)));
+    const baseFs = (shape.fs ?? 14) * Math.min(4, Math.max(0.4, fontScale));
+    const typography = diagramTypography(textCapabilities.role ?? 'classifier', baseFs, minimum);
+    const name = typeof shape.text === 'string' && shape.text.trim() ? shape.text.trim() : definition.label;
+    const instance = rawInstance as unknown as import('./shapes/types').UMLInstanceData;
+    const layout = instanceLayout(instance, name, typography.title, typography.body, value => cx.measureText(value).width);
+
+    const isEditingThis = shape.id === this.editingId;
+    const editingTarget = isEditingThis ? this.editingClassifierContext?.target : undefined;
+    const editingMemberId = isEditingThis ? this.editingClassifierContext?.memberId : undefined;
+
+    if (editingTarget !== 'header') {
+      cx.fillStyle = shape.textColor ?? '#1f2937'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.font = `600 ${typography.title}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(name, w / 2, layout.headerHeight / 2);
+      // UML 2.5: Object instance names are strictly underlined
+      const textWidth = cx.measureText(name).width;
+      const underlineY = layout.headerHeight / 2 + typography.title * 0.48;
+      cx.beginPath(); cx.moveTo(w / 2 - textWidth / 2, underlineY); cx.lineTo(w / 2 + textWidth / 2, underlineY);
+      cx.strokeStyle = shape.textColor ?? '#1f2937'; cx.lineWidth = Math.max(0.75, typography.title / 16); cx.stroke();
+    }
+    cx.strokeStyle = shape.stroke ?? '#1f2937'; cx.lineWidth = Math.max(0.75, shape.sw ?? 1);
+    cx.beginPath(); cx.moveTo(0, layout.headerHeight); cx.lineTo(w, layout.headerHeight); cx.stroke();
+    cx.textAlign = 'left'; cx.textBaseline = 'middle'; cx.font = `${typography.body}px Inter, 'Segoe UI', sans-serif`;
+    for (const row of layout.rows) {
+      if (editingTarget === 'member' && row.member.id === editingMemberId) continue;
+      cx.fillStyle = shape.textColor ?? '#1f2937';
+      cx.fillText(row.text, layout.paddingX, row.y);
+    }
+  }
+
+  private connectorLabelVisuals(connector: ConnectorShape, route = getConnectorRoute(connector)): ConnectorLabelVisual[] {
+    const cx = this.cx, definition = getShapeDefinition(connector.shapeId);
+    const capabilities = diagramCapabilitiesFor(definition, this.getSemanticContextForShape(connector.id));
+    const connectorCaps = capabilities.connector ?? {};
+    const fontSize = definition?.semantic?.notation === 'uml'
+      ? diagramTypography(capabilities.text.role ?? 'connector-label', 14, capabilities.text.minFontSize ?? 12).connector : 12;
+    cx.save(); cx.font = `${fontSize}px Inter, 'Segoe UI', sans-serif`;
+    const centerText = connectorCaps.labelMode === 'none' ? '' : connectorDisplayLabel(connector);
+    const legacyMultiplicity = (value: Cardinality | undefined) => value === 'one' ? '1'
+      : value === 'zero-or-one' ? '0..1' : value === 'many' ? '*' : value === 'one-or-many' ? '1..*'
+        : value === 'zero-or-many' ? '0..*' : '';
+    const sourceMultiplicity = connector.sourceMultiplicity ?? (connectorCaps.multiplicityEditable ? legacyMultiplicity(connector.sourceCardinality) : '');
+    const targetMultiplicity = connector.targetMultiplicity ?? (connectorCaps.multiplicityEditable ? legacyMultiplicity(connector.targetCardinality) : '');
+    const isUmlRelationship = definition?.semantic?.family === 'uml.relationship-edge'
+      || definition?.semantic?.family === 'uml.usecase-dependency';
+    const laneAwareOffset = (value: number) => parallelConnectorLabelOffset(value, connector.parallelLane, isUmlRelationship);
+    const entries: Array<{ kind: ConnectorLabelKind; raw: string; position?: number; offset?: number; editable: boolean }> = [
+      { kind: 'center', raw: centerText, position: connector.labelPosition,
+        offset: connector.labelOffset !== undefined ? laneAwareOffset(connector.labelOffset) : undefined,
+        editable: connectorCaps.labelMode === 'plain' },
+      { kind: 'source', raw: connector.sourceLabel ?? '', position: connector.sourceLabelPosition ?? 180,
+        offset: laneAwareOffset(connector.sourceLabelOffset ?? 12), editable: connectorCaps.sourceLabelEditable === true },
+      { kind: 'target', raw: connector.targetLabel ?? '', position: connector.targetLabelPosition ?? 820,
+        offset: laneAwareOffset(connector.targetLabelOffset ?? 12), editable: connectorCaps.targetLabelEditable === true },
+      { kind: 'source-multiplicity', raw: sourceMultiplicity, position: 100, offset: laneAwareOffset(-12), editable: false },
+      { kind: 'target-multiplicity', raw: targetMultiplicity, position: 900, offset: laneAwareOffset(-12), editable: false },
+    ];
+    const visuals = entries.filter(entry => entry.raw.trim()
+      && (entry.kind === 'center' && connectorCaps.labelMode !== 'none'
+        || entry.kind === 'source' && connectorCaps.sourceLabelEditable === true
+        || entry.kind === 'target' && connectorCaps.targetLabelEditable === true
+        || entry.kind === 'source-multiplicity' && connectorCaps.multiplicityEditable === true
+        || entry.kind === 'target-multiplicity' && connectorCaps.multiplicityEditable === true))
+      .map(entry => {
+        const text = fitConnectorLabel(entry.raw, value => cx.measureText(value).width);
+        const lines = text.split('\n');
+        const textWidth = Math.min(280, Math.max(12, ...lines.map(line => cx.measureText(line).width)));
+        const layout = connectorLabelLayout(route, { startMarker: connector.startMarker, endMarker: connector.endMarker,
+          sourceCardinality: connectorCaps.multiplicityEditable ? undefined : connector.sourceCardinality,
+          targetCardinality: connectorCaps.multiplicityEditable ? undefined : connector.targetCardinality,
+          strokeWidth: connector.sw, labelWidth: textWidth, labelHeight: Math.max(CONNECTOR_LABEL_HEIGHT, lines.length * fontSize * 1.25),
+          ...(entry.position !== undefined ? { labelPosition: entry.position } : {}),
+          ...(entry.offset !== undefined ? { labelOffset: entry.offset } : {}) });
+        const positionEditable = connectorCaps.labelPositionEditable === true
+          && (entry.kind === 'center' || entry.kind === 'source' || entry.kind === 'target');
+        return { kind: entry.kind, editable: entry.editable, positionEditable, text, x: layout.x, y: layout.y,
+          width: layout.width, height: layout.height, textWidth, fontSize };
+      });
     cx.restore();
-    const layout = connectorLabelLayout(route, { startMarker: connector.startMarker, endMarker: connector.endMarker,
-      sourceCardinality: connector.sourceCardinality, targetCardinality: connector.targetCardinality,
-      strokeWidth: connector.sw, labelWidth: textWidth, labelHeight: CONNECTOR_LABEL_HEIGHT });
-    return { text, x: layout.x, y: layout.y, width: layout.width, height: layout.height, textWidth };
+    return visuals;
+  }
+
+  private drawConnectorTargetFeedback(feedback: ConnectorTargetFeedback) {
+    const shape = this.shapes.get(feedback.shapeId);
+    if (!shape || !isConnectableShape(shape) || !('x' in shape && 'y' in shape && 'w' in shape && 'h' in shape)) return;
+    const definition = this.definitionForEndpoint(shape);
+    if (!definition) return;
+    const diagram = (shape.type === 'diagram' ? shape : {
+      ...shape, type: 'diagram', shapeId: definition.id,
+      params: { ...(definition.defaultParams ?? {}), ...((shape as BoxShape).params ?? {}) },
+      fill: 'transparent', stroke: definition.defaultStroke ?? '#2563eb', sw: 1.5,
+      text: '', fs: 14, textColor: '#1f2937',
+    }) as DiagramShape;
+    const cx = this.cx, zoom = Math.max(0.04, this.cam.zoom), color = feedback.valid ? '#15803d' : '#dc2626';
+    const solid = Boolean(getShapeDefinition(diagram.shapeId)?.solid3d);
+    cx.save();
+    if ((diagram.rotation ?? 0) !== 0) {
+      const centerX = solid ? diagram.x : diagram.x + diagram.w / 2;
+      const centerY = solid ? diagram.y : diagram.y + diagram.h / 2;
+      cx.translate(centerX, centerY); cx.rotate((diagram.rotation ?? 0) * Math.PI / 180); cx.translate(-centerX, -centerY);
+    }
+    const geometry = this.cachedDiagramGeometry(diagram);
+    cx.translate(diagram.x, diagram.y);
+    cx.save();
+    cx.strokeStyle = color; cx.lineWidth = 3 / zoom; cx.lineCap = 'round'; cx.lineJoin = 'round';
+    cx.setLineDash([]); cx.shadowColor = color; cx.shadowBlur = 8 / zoom;
+    if (geometry.path) cx.stroke(geometry.path);
+    else { drawPathCommands(cx, geometry.outline); cx.stroke(); }
+    geometry.decorationPaths?.forEach(path => { if (path) cx.stroke(path); });
+    cx.restore();
+    cx.restore();
+
+    const radius = 7 / zoom;
+    cx.save();
+    cx.beginPath(); cx.arc(feedback.point.x, feedback.point.y, radius, 0, Math.PI * 2);
+    cx.fillStyle = '#ffffff'; cx.fill(); cx.strokeStyle = color; cx.lineWidth = 2.5 / zoom; cx.stroke();
+    cx.beginPath();
+    if (feedback.valid) {
+      cx.moveTo(feedback.point.x - radius * 0.42, feedback.point.y + radius * 0.01);
+      cx.lineTo(feedback.point.x - radius * 0.08, feedback.point.y + radius * 0.36);
+      cx.lineTo(feedback.point.x + radius * 0.48, feedback.point.y - radius * 0.38);
+    } else {
+      cx.moveTo(feedback.point.x - radius * 0.34, feedback.point.y - radius * 0.34);
+      cx.lineTo(feedback.point.x + radius * 0.34, feedback.point.y + radius * 0.34);
+      cx.moveTo(feedback.point.x + radius * 0.34, feedback.point.y - radius * 0.34);
+      cx.lineTo(feedback.point.x - radius * 0.34, feedback.point.y + radius * 0.34);
+    }
+    cx.strokeStyle = color; cx.lineWidth = 1.8 / zoom; cx.lineCap = 'round'; cx.stroke();
+    const label = feedback.valid ? 'Compatible target' : 'Invalid endpoint';
+    cx.font = `${12 / zoom}px Inter, 'Segoe UI', sans-serif`;
+    const width = cx.measureText(label).width + 14 / zoom, height = 22 / zoom;
+    const left = feedback.point.x + 12 / zoom, top = feedback.point.y - height - 5 / zoom;
+    cx.fillStyle = '#ffffff'; cx.strokeStyle = color; cx.lineWidth = 1 / zoom;
+    cx.beginPath(); cx.roundRect(left, top, width, height, 5 / zoom); cx.fill(); cx.stroke();
+    cx.fillStyle = color; cx.textAlign = 'left'; cx.textBaseline = 'middle';
+    cx.fillText(label, left + 7 / zoom, top + height / 2, width - 12 / zoom);
+    cx.restore();
   }
 
   private drawConnectorShape(connector: ConnectorShape) {
@@ -3190,24 +6821,42 @@ export class CanvasEngine {
     cx.moveTo(points[0][0], points[0][1]);
     for (let index = 1; index < points.length; index++) cx.lineTo(points[index][0], points[index][1]);
     cx.stroke(); cx.setLineDash([]);
-    const label = this.connectorLabelVisual(connector, points);
-    if (label) {
-      // Keep the route visible around the glyphs: an opaque label plate can erase the line
-      // across short and waypoint routes. A board-colored text halo keeps the label legible
-      // without hiding the connector or its endpoints.
-      cx.save(); cx.font = '12px Inter, \'Segoe UI\', sans-serif'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
-      cx.strokeStyle = '#f8f8f5'; cx.lineWidth = 4; cx.lineJoin = 'round';
-      cx.strokeText(label.text, label.x, label.y, 280);
-      cx.fillStyle = connector.color; cx.fillText(label.text, label.x, label.y, 280);
+    const labelVisuals = this.connectorLabelVisuals(connector, points);
+    for (const label of labelVisuals) {
+      cx.save();
+      const lines = label.text.split('\n');
+      const isStereotypeOrCenter = connector.shapeId === 'uml.include' || connector.shapeId === 'uml.extend'
+        || connector.shapeId === 'uml-usage' || label.kind === 'center';
+
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      const lineHeight = label.fontSize * 1.28;
+      const startY = label.y - (lines.length - 1) * lineHeight / 2;
+
+      lines.forEach((lineText, lineIndex) => {
+        const lineY = startY + lineIndex * lineHeight;
+        if (isStereotypeOrCenter) {
+          cx.font = lineIndex === 0
+            ? `600 ${label.fontSize}px Inter, 'Segoe UI', sans-serif`
+            : `500 ${Math.max(9.5, label.fontSize * 0.88)}px Inter, 'Segoe UI', sans-serif`;
+        } else {
+          cx.font = `500 ${label.fontSize}px Inter, 'Segoe UI', sans-serif`;
+        }
+        cx.fillStyle = connector.color;
+        cx.fillText(lineText, label.x, lineY);
+      });
       cx.restore();
     }
-    // Markers are painted after the plate so a short-route label can never erase an arrowhead.
+    // Markers are painted after labels so a short-route glyph can never erase an endpoint.
     const firstNext = points[1] ?? [connector.x2, connector.y2];
     const lastPrevious = points.at(-2) ?? [connector.x1, connector.y1];
     const startAngle = Math.atan2(points[0][1] - firstNext[1], points[0][0] - firstNext[0]);
     const endAngle = Math.atan2(points.at(-1)![1] - lastPrevious[1], points.at(-1)![0] - lastPrevious[0]);
-    this.drawEndpointMarker(connector.startMarker, connector.x1, connector.y1, startAngle, connector.sw, connector.color, connector.sourceCardinality);
-    this.drawEndpointMarker(connector.endMarker, connector.x2, connector.y2, endAngle, connector.sw, connector.color, connector.targetCardinality);
+    const connectorCapabilities = diagramCapabilitiesFor(def, this.getSemanticContextForShape(connector.id)).connector;
+    const markerSourceCardinality = connectorCapabilities?.multiplicityEditable ? undefined : connector.sourceCardinality;
+    const markerTargetCardinality = connectorCapabilities?.multiplicityEditable ? undefined : connector.targetCardinality;
+    this.drawEndpointMarker(connector.startMarker, connector.x1, connector.y1, startAngle, connector.sw, connector.color, markerSourceCardinality);
+    this.drawEndpointMarker(connector.endMarker, connector.x2, connector.y2, endAngle, connector.sw, connector.color, markerTargetCardinality);
     cx.restore();
   }
 
@@ -3220,25 +6869,37 @@ export class CanvasEngine {
     if (marker === 'none') return;
     const size = Math.max(8, width * 3.1), ux = Math.cos(angle), uy = Math.sin(angle), nx = -uy, ny = ux;
     const baseX = x - ux * size, baseY = y - uy * size;
-    cx.save(); cx.lineWidth = Math.max(1, width); cx.strokeStyle = String(cx.strokeStyle); cx.fillStyle = ['hollowTriangle', 'diamond', 'circle', 'zeroOrOne'].includes(marker) ? '#ffffff' : String(cx.fillStyle);
+    cx.save(); cx.lineWidth = Math.max(1, width); cx.strokeStyle = String(cx.strokeStyle); cx.fillStyle = ['hollowTriangle', 'diamond', 'circle', 'zeroOrOne'].includes(marker) ? '#ffffff' : marker === 'filledCircle' ? color : String(cx.fillStyle);
     if (marker === 'bar') {
       cx.beginPath(); cx.moveTo(x + nx * size * 0.42, y + ny * size * 0.42); cx.lineTo(x - nx * size * 0.42, y - ny * size * 0.42); cx.stroke();
-    } else if (marker === 'circle' || marker === 'zeroOrOne') {
-      cx.beginPath(); cx.arc(x - ux * size * 0.5, y - uy * size * 0.5, size * 0.25, 0, Math.PI * 2); cx.fill(); cx.stroke();
+    } else if (marker === 'circle' || marker === 'filledCircle' || marker === 'zeroOrOne') {
+      if (marker === 'filledCircle') cx.fillStyle = color;
+      cx.beginPath(); cx.arc(x - ux * size * 0.5, y - uy * size * 0.5, size * 0.35, 0, Math.PI * 2); cx.fill(); cx.stroke();
       if (marker === 'zeroOrOne') drawEndpointMarkerAt(cx, 'bar', baseX - ux * size * 0.15, baseY - uy * size * 0.15, angle, size * 0.45);
     } else if (marker === 'crowFoot') {
       drawCrowFoot(cx, x, y, angle, size);
+    } else if (marker === 'openArrow') {
+      const half = size * 0.43;
+      const tip: [number, number] = [x, y];
+      const left: [number, number] = [baseX + nx * half, baseY + ny * half];
+      const right: [number, number] = [baseX - nx * half, baseY - ny * half];
+      cx.beginPath(); cx.moveTo(...left); cx.lineTo(...tip); cx.lineTo(...right); cx.stroke();
+    } else if (marker === 'diamond' || marker === 'filledDiamond') {
+      const tip: [number, number] = [x, y];
+      const nearLeft: [number, number] = [baseX + nx * size * 0.52, baseY + ny * size * 0.52];
+      const back: [number, number] = [x - ux * size * 1.7, y - uy * size * 1.7];
+      const nearRight: [number, number] = [baseX - nx * size * 0.52, baseY - ny * size * 0.52];
+      cx.beginPath(); cx.moveTo(...tip); cx.lineTo(...nearLeft); cx.lineTo(...back); cx.lineTo(...nearRight); cx.closePath();
+      if (marker === 'diamond') cx.fillStyle = '#ffffff';
+      cx.fill(); cx.stroke();
     } else {
       const half = size * 0.43;
       const tip: [number, number] = [x, y];
       const left: [number, number] = [baseX + nx * half, baseY + ny * half];
       const right: [number, number] = [baseX - nx * half, baseY - ny * half];
       cx.beginPath(); cx.moveTo(...tip); cx.lineTo(...left); cx.lineTo(...right); cx.closePath();
-      if (marker === 'arrow' || marker === 'blockArrow' || marker === 'filledDiamond') cx.fill();
-      else if (marker === 'diamond') {
-        const backX = x - ux * size * 1.8, backY = y - uy * size * 1.8;
-        cx.moveTo(backX, backY); cx.lineTo(...left); cx.lineTo(x, y); cx.lineTo(...right); cx.closePath(); cx.fill(); cx.stroke();
-      } else cx.stroke();
+      if (marker === 'arrow' || marker === 'blockArrow') cx.fill();
+      else { cx.fill(); cx.stroke(); }
     }
     cx.restore();
   }
@@ -3261,7 +6922,7 @@ export class CanvasEngine {
           params: { ...(definition.defaultParams ?? {}), ...(legacyShape.params ?? {}) },
           fill: legacyShape.fill, stroke: legacyShape.stroke, sw: legacyShape.sw ?? 2,
           text: legacyShape.text ?? '', fs: legacyShape.fs ?? this.style.fontSize,
-          textColor: legacyShape.textColor ?? '#1f2937',
+          textColor: legacyShape.textColor ?? '#1f2937', embeddedTextScale: legacyShape.embeddedTextScale,
         } as DiagramShape);
         cx.restore();
         return;
@@ -3432,7 +7093,9 @@ export class CanvasEngine {
         break;
       }
     }
-    if (s.type !== 'diagram' && isLabelEditableShape(s) && 'x' in s && 'w' in s
+    // DOM-backed content (text, sticky, math, code, image) has exactly one authoritative
+    // visual owner: the sibling overlay. Do not also paint its source/label onto this canvas.
+    if (!isDomOverlayShape(s) && s.type !== 'diagram' && isLabelEditableShape(s) && 'x' in s && 'w' in s
       && 'text' in s && typeof s.text === 'string' && s.text.length) {
       const box = s as BoxShape, fs = box.fs ?? 14;
       cx.fillStyle = box.textColor ?? '#1f2937'; cx.font = `${fs}px Inter, 'Segoe UI', sans-serif`;
@@ -3451,17 +7114,22 @@ export class CanvasEngine {
     cx.setLineDash([5 / zoom, 4 / zoom]);
     if (shape.type === 'connector') {
       const connector = shape as ConnectorShape, points = getConnectorRoute(connector);
+      const capabilities = diagramCapabilitiesFor(getShapeDefinition(connector.shapeId), this.getSemanticContextForShape(connector.id));
       cx.beginPath(); cx.moveTo(points[0][0], points[0][1]);
       for (let index = 1; index < points.length; index++) cx.lineTo(points[index][0], points[index][1]);
       cx.stroke(); cx.setLineDash([]);
-      const handles: [number, number][] = [[connector.x1, connector.y1], [connector.x2, connector.y2], ...connector.waypoints];
+      const handles: [number, number][] = [[connector.x1, connector.y1], [connector.x2, connector.y2],
+        ...(capabilities.connector?.routeEditable !== false ? connector.waypoints : [])];
       for (const [x, y] of handles) {
         cx.beginPath(); cx.arc(x, y, handleRadius, 0, Math.PI * 2); cx.fill(); cx.stroke();
       }
-      if (hasConnectorRotationHandle(connector)) {
+      if (capabilities.transform.rotate && hasConnectorRotationHandle(connector)) {
         const rotate = { x: (shape.minX + shape.maxX) / 2, y: shape.minY - 24 / zoom };
         cx.beginPath(); cx.moveTo((shape.minX + shape.maxX) / 2, shape.minY); cx.lineTo(rotate.x, rotate.y); cx.stroke();
         cx.setLineDash([]); cx.beginPath(); cx.arc(rotate.x, rotate.y, handleRadius, 0, Math.PI * 2); cx.fill(); cx.stroke();
+      }
+      for (const label of this.connectorLabelVisuals(connector).filter(visual => visual.positionEditable)) {
+        cx.beginPath(); cx.arc(label.x, label.y, handleRadius * 0.9, 0, Math.PI * 2); cx.fill(); cx.stroke();
       }
       cx.restore(); return;
     }
@@ -3476,6 +7144,7 @@ export class CanvasEngine {
     if ('x' in shape && 'w' in shape) {
       const box = shape as BoxShape;
       const diagramDefinition = box.type === 'diagram' ? getShapeDefinition((box as DiagramShape).shapeId) : undefined;
+      const capabilities = diagramCapabilitiesFor(diagramDefinition);
       const solidShape = box.type === 'diagram' && diagramDefinition?.solid3d ? box as DiagramShape : null;
       if (solidShape) {
         // 3D solids use their model-space XYZ gizmo only: no projected AABB frame or
@@ -3490,13 +7159,15 @@ export class CanvasEngine {
       cx.beginPath(); cx.moveTo(corners[0][0], corners[0][1]);
       for (let index = 1; index < corners.length; index++) cx.lineTo(corners[index][0], corners[index][1]);
       cx.closePath(); cx.stroke(); cx.setLineDash([]);
-      for (const [, x, y] of getBoxHandlePoints(box)) {
+      for (const [, x, y] of getNotationResizeHandles(box, capabilities)) {
         cx.beginPath(); cx.arc(x, y, handleRadius, 0, Math.PI * 2); cx.fill(); cx.stroke();
       }
-      const topMid = objectPointToWorld(box, { x: box.w / 2, y: 0 });
-      const rotate = getRotationHandlePoint(box, zoom);
-      cx.beginPath(); cx.moveTo(topMid.x, topMid.y); cx.lineTo(rotate[0], rotate[1]); cx.stroke();
-      cx.beginPath(); cx.arc(rotate[0], rotate[1], handleRadius, 0, Math.PI * 2); cx.fill(); cx.stroke();
+      if (capabilities.transform.rotate) {
+        const topMid = objectPointToWorld(box, { x: box.w / 2, y: 0 });
+        const rotate = getRotationHandlePoint(box, zoom);
+        cx.beginPath(); cx.moveTo(topMid.x, topMid.y); cx.lineTo(rotate[0], rotate[1]); cx.stroke();
+        cx.beginPath(); cx.arc(rotate[0], rotate[1], handleRadius, 0, Math.PI * 2); cx.fill(); cx.stroke();
+      }
       cx.restore(); return;
     }
     const width = Math.max(0, shape.maxX - shape.minX), height = Math.max(0, shape.maxY - shape.minY);
@@ -3567,7 +7238,7 @@ function createLegacyBoxShape(type: LegacyBoxToolType, seed: LegacyBoxSeed): Any
   }
 }
 
-function cloneShapeWithOffset(shape: AnyShape, id: string, offset: number, newIds: Map<string, string>): AnyShape {
+function cloneShapeWithOffset(shape: AnyShape, id: string, offset: number, newIds: Map<string, string>, existingIds: ReadonlySet<string>): AnyShape {
   if (shape.type === 'pen') {
     const pts = shape.pts.map(point => [point[0] + offset, point[1] + offset, point[2]]);
     return withComputedShapeBounds({ ...shape, id, pts });
@@ -3585,19 +7256,35 @@ function cloneShapeWithOffset(shape: AnyShape, id: string, offset: number, newId
       x2: shape.x2 + offset, y2: shape.y2 + offset });
   }
   if (shape.type === 'connector') {
-    const sourceRefId = shape.sourceRef ? newIds.get(shape.sourceRef.shapeId) : undefined;
-    const targetRefId = shape.targetRef ? newIds.get(shape.targetRef.shapeId) : undefined;
+    const remapRef = (side: EndpointSide) => {
+      const reference = side === 'source' ? shape.sourceRef : shape.targetRef;
+      if (!reference) return undefined;
+      const mapped = newIds.get(reference.shapeId);
+      if (mapped) return { ...reference, shapeId: mapped };
+      // Valid external links are detached in the copy; already-broken IDs remain broken so the
+      // validator can report them rather than disguising them as free coordinate endpoints.
+      return existingIds.has(reference.shapeId) ? undefined : reference;
+    };
+    const sourceRef = remapRef('source'), targetRef = remapRef('target');
     const next: ConnectorShape = {
       ...shape, id, x1: shape.x1 + offset, y1: shape.y1 + offset,
       x2: shape.x2 + offset, y2: shape.y2 + offset,
       waypoints: shape.waypoints.map(([x, y]) => [x + offset, y + offset]),
-      sourceRef: sourceRefId && shape.sourceRef ? { ...shape.sourceRef, shapeId: sourceRefId } : undefined,
-      targetRef: targetRefId && shape.targetRef ? { ...shape.targetRef, shapeId: targetRefId } : undefined,
+      sourceRef, targetRef,
+      sourceIntent: sourceRef ? shape.sourceIntent ?? 'attached' : 'free',
+      targetIntent: targetRef ? shape.targetIntent ?? 'attached' : 'free',
+      invalidEndpointRefs: { ...(shape.invalidEndpointRefs ?? {}) },
+      ...(shape.containerId ? (newIds.has(shape.containerId) ? { containerId: newIds.get(shape.containerId)! }
+        : existingIds.has(shape.containerId) ? { containerId: undefined } : {}) : {}),
     };
     return withComputedShapeBounds(next);
   }
   if (isPositionedShape(shape)) {
-    return withComputedShapeBounds({ ...shape, id, x: shape.x + offset, y: shape.y + offset });
+    const oldContainerId = 'containerId' in shape && typeof shape.containerId === 'string' ? shape.containerId : undefined;
+    const containerId = oldContainerId
+      ? newIds.get(oldContainerId) ?? (existingIds.has(oldContainerId) ? undefined : oldContainerId) : undefined;
+    return withComputedShapeBounds({ ...shape, id, x: shape.x + offset, y: shape.y + offset,
+      ...(containerId ? { containerId } : {}) } as AnyShape);
   }
   const unreachableShape: never = shape;
   return unreachableShape;
@@ -3621,15 +7308,7 @@ export function isLabelEditableShape(shape: AnyShape): boolean {
   return isBoxShapeTool(shape.type) && 'x' in shape && 'w' in shape;
 }
 
-/** Double-click editing is a Basic-shape affordance; direct text objects remain editable. */
-export function isDoubleClickTextEditableShape(shape: AnyShape): boolean {
-  if (['sticky', 'text', 'math', 'code'].includes(shape.type)) return true;
-  const definition = shape.type === 'diagram'
-    ? getShapeDefinition((shape as DiagramShape).shapeId)
-    : getShapeDefinitionForLegacyType(shape.type) ?? getShapeDefinitionByToolId(shape.type);
-  return definition?.category === 'Basic' && definition.kind === 'shape'
-    && 'x' in shape && 'w' in shape;
-}
+export { isDoubleClickTextEditableShape };
 
 export function isFixedShapeLabel(shape: AnyShape): boolean {
   if (shape.type === 'diagram') return Boolean(getShapeDefinition((shape as DiagramShape).shapeId));
@@ -3662,7 +7341,36 @@ function projectedSolidWorldCorners(shape: DiagramShape): [number, number][] {
 
 /** Ordinary 2D creation keeps its established aspect/free resize policy. */
 function getShapeCreationResizePolicy(definition?: ShapeDefinition): ShapeResizePolicy {
-  return definition?.solid3d ? { mode: 'free' } : getShapeResizePolicy(definition);
+  return definition?.solid3d ? { mode: 'free' } : getNotationResizePolicy(definition);
+}
+
+function getNotationResizePolicy(
+  definition: ShapeDefinition | undefined,
+  capabilities: ReturnType<typeof diagramCapabilitiesFor> = diagramCapabilitiesFor(definition),
+): ShapeResizePolicy {
+  const transform = capabilities.transform, legacyPolicy = getShapeResizePolicy(definition);
+  if (transform.aspectLocked) return { mode: 'aspect', aspectRatio: Number.isFinite(transform.aspectRatio) && (transform.aspectRatio ?? 0) > 0
+    ? transform.aspectRatio! : legacyPolicy.mode === 'aspect' ? legacyPolicy.aspectRatio : 1 };
+  if (transform.resizeX === false && transform.resizeY !== false) return { mode: 'vertical' };
+  if (transform.resizeY === false && transform.resizeX !== false) return { mode: 'horizontal' };
+  return legacyPolicy;
+}
+
+function getNotationResizeHandles(box: BoxShape, capabilities: ReturnType<typeof diagramCapabilitiesFor>): [string, number, number][] {
+  const transform = capabilities.transform;
+  if (transform.resize === false || transform.fixedSize) return [];
+  const definition = box.type === 'diagram' && box.shapeId ? getShapeDefinition(box.shapeId) : undefined;
+  const sequenceParticipant = definition?.semantic?.family === 'uml.sequence-participant';
+  return getBoxHandlePoints(box).filter(([handle]) => {
+    // Keep the participant head as its temporal origin: Sequence lifelines resize from the bottom,
+    // never by moving their header with a north-side handle (notably create-message occurrences).
+    if (sequenceParticipant && ['n', 'nw', 'ne'].includes(handle)) return false;
+    const hasHorizontalAxis = handle.includes('e') || handle.includes('w');
+    const hasVerticalAxis = handle.includes('n') || handle.includes('s');
+    if (transform.resizeX === false && hasHorizontalAxis) return false;
+    if (transform.resizeY === false && hasVerticalAxis) return false;
+    return true;
+  });
 }
 
 function withComputedShapeBounds<T extends AnyShape>(shape: T): T {
@@ -3702,8 +7410,19 @@ function getRotationHandlePoint(box: BoxShape, zoom: number): [number, number] {
 /** Public route wrapper; Canvas interaction and picker previews share one route builder. */
 export function getConnectorRoute(connector: ConnectorShape): [number, number][] {
   const definition = getShapeDefinition(connector.shapeId);
+  const sameOwner = Boolean(connector.sequenceEvent?.selfCall
+    || (connector.sequenceEvent?.sourceParticipantId && connector.sequenceEvent.sourceParticipantId === connector.sequenceEvent.targetParticipantId)
+    || (connector.sourceRef && connector.targetRef && connector.sourceRef.shapeId === connector.targetRef.shapeId));
+  const selfLoopKind = sameOwner && definition?.semantic?.family === 'uml.sequence-edge' ? 'sequence'
+    : sameOwner && (definition?.semantic?.family === 'uml.activity-edge' || definition?.semantic?.family === 'uml.state-edge') ? 'behavioral' : undefined;
+  const isSequenceEdge = definition?.semantic?.family === 'uml.sequence-edge';
+  const isUmlRelationship = definition?.semantic?.family === 'uml.relationship-edge'
+    || definition?.semantic?.family === 'uml.usecase-dependency';
   return buildConnectorRoute({ routeKind: definition?.routeKind, x1: connector.x1, y1: connector.y1,
-    x2: connector.x2, y2: connector.y2, waypoints: connector.waypoints });
+    x2: connector.x2, y2: connector.y2, waypoints: connector.waypoints, parallelLane: connector.parallelLane,
+    ...(isSequenceEdge ? { parallelLaneSpacing: UML_SEQUENCE_LANE_SPACING }
+      : isUmlRelationship ? { parallelLaneSpacing: UML_RELATIONSHIP_LANE_SPACING } : {}),
+    selfLoopKind, selfLoopSide: connector.sourceRef?.pointId });
 }
 
 /** Only non-collinear routes need a whole-path rotation handle; straight slopes are endpoint-edited. */
@@ -3825,15 +7544,21 @@ function pointTouchesDiagram(shape: DiagramShape, point: { x: number; y: number 
   const definition = getShapeDefinition(shape.shapeId);
   if (!definition) return false;
   const { outlines, decorations, intrinsicFills } = getDiagramPathGroups(shape);
+  if (definition.geometry === 'actor' && Boolean(shape.text?.trim())) {
+    const centerX = shape.x + shape.w / 2, centerY = shape.y + shape.h / 2;
+    const [localX, localY] = unrotatePoint(point.x, point.y, centerX, centerY, shape.rotation ?? 0);
+    const x = localX - shape.x, y = localY - shape.y;
+    if (x >= 0 && x <= shape.w && y >= shape.h * 0.76 && y <= shape.h) return true;
+  }
   if (definition.geometry === 'annotation' || definition.geometry === 'umlLifeline' || definition.geometry === 'umlActorParticipant' || definition.geometry === 'umlRole') {
     const centerX = shape.x + shape.w / 2, centerY = shape.y + shape.h / 2;
     const [localX, localY] = unrotatePoint(point.x, point.y, centerX, centerY, shape.rotation ?? 0);
     const x = localX - shape.x, y = localY - shape.y;
     if (definition.geometry === 'annotation') return x >= 0 && x <= shape.w && y >= 0 && y <= shape.h;
-    if (definition.geometry === 'umlActorParticipant' && x >= 0 && x <= shape.w && y >= shape.h * 0.28 && y <= shape.h * 0.42) return true;
-    if (definition.geometry === 'umlRole' && x >= 0 && x <= shape.w && y >= shape.h * 0.68 && y <= shape.h) return true;
-    const headerHeight = shape.h * 0.22;
+    const headerHeight = Math.min(shape.h, sequenceParticipantHeaderHeight(definition.geometry));
     if (x >= 0 && x <= shape.w && y >= 0 && y <= headerHeight) return true;
+    const stemHitWidth = Math.max(32, shape.w * 0.45);
+    if (Math.abs(x - shape.w / 2) <= stemHitWidth / 2 && y >= headerHeight && y <= shape.h) return true;
   }
   if (geometryUsesFill(definition.geometry) && outlines.some(path => path.length >= 3 && pointInsidePolygon(point, path))) return true;
   if (intrinsicFills.some(path => path.length >= 3 && pointInsidePolygon(point, path))) return true;
@@ -3847,6 +7572,13 @@ function segmentTouchesDiagram(shape: DiagramShape, from: { x: number; y: number
   if (!definition) return false;
   const { outlines, decorations, intrinsicFills } = getDiagramPathGroups(shape), strokeRadius = radius + Math.max(0, shape.sw) / 2;
   const filled = geometryUsesFill(definition.geometry) && fillIsVisible(shape.fill);
+  if (definition.geometry === 'actor' && Boolean(shape.text?.trim())) {
+    const centerX = shape.x + shape.w / 2, centerY = shape.y + shape.h / 2;
+    const band = [[shape.x, shape.y + shape.h * 0.76], [shape.x + shape.w, shape.y + shape.h * 0.76],
+      [shape.x + shape.w, shape.y + shape.h], [shape.x, shape.y + shape.h]].map(([x, y]) =>
+      rotatePoint(x, y, centerX, centerY, shape.rotation ?? 0) as [number, number]);
+    if (segmentTouchesPolygon(from, to, band, strokeRadius, true)) return true;
+  }
   for (const path of outlines) if (segmentTouchesPolygon(from, to, path, strokeRadius, filled)) return true;
   for (const path of intrinsicFills) if (segmentTouchesPolygon(from, to, path, strokeRadius, true)) return true;
   for (const path of decorations) {
@@ -4005,7 +7737,7 @@ function connectorMarkerPaths(marker: EndpointMarker | undefined, point: [number
   if (marker === 'openArrow') return [line(base(size * 1.55, 0.6), point), line(point, base(size * 1.55, -0.6))];
   if (marker === 'hollowTriangle') return [triangle];
   if (marker === 'diamond' || marker === 'filledDiamond') return [diamond];
-  if (marker === 'circle' || marker === 'zeroOrOne') return [circlePolygon([point[0] - ux * size * 0.5, point[1] - uy * size * 0.5], size * 0.25)];
+  if (marker === 'circle' || marker === 'filledCircle' || marker === 'zeroOrOne') return [circlePolygon([point[0] - ux * size * 0.5, point[1] - uy * size * 0.5], size * 0.35)];
   if (marker === 'bar') return [line([point[0] + nx * size * 0.45, point[1] + ny * size * 0.45],
     [point[0] - nx * size * 0.45, point[1] - ny * size * 0.45])];
   if (marker === 'crowFoot') return [line(point, base(size * 1.6, 0.62)), line(point, base(size * 1.6, 0)), line(point, base(size * 1.6, -0.62))];
@@ -4112,22 +7844,21 @@ function eraserSegmentTouchesShape(
   return false;
 }
 
-function normalizeDragBox(
-  origin: { x: number; y: number },
-  pointer: { x: number; y: number },
-  resizePolicy: ShapeResizePolicy = { mode: 'free' },
-) {
-  let x = Math.min(origin.x, pointer.x), y = Math.min(origin.y, pointer.y);
-  let w = Math.abs(pointer.x - origin.x), h = Math.abs(pointer.y - origin.y);
-  if (resizePolicy.mode === 'aspect') {
-    const ratio = resizePolicy.aspectRatio;
-    const width = Math.max(w, h * ratio, Math.max(1, ratio));
-    h = width / ratio;
-    x = pointer.x < origin.x ? origin.x - width : origin.x;
-    y = pointer.y < origin.y ? origin.y - h : origin.y;
-    w = width;
-  }
-  return { x, y, w, h };
+export { normalizeDragBox };
+
+const STICKY_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const STICKY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export function formatStickyTimestamp(date: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const dayOfWeek = STICKY_DAYS[date.getDay()];
+  const d = pad(date.getDate());
+  const monthName = STICKY_MONTHS[date.getMonth()];
+  const y = date.getFullYear();
+  const h = pad(date.getHours());
+  const min = pad(date.getMinutes());
+  const s = pad(date.getSeconds());
+  return `${dayOfWeek}, ${d} ${monthName} ${y} - ${h}:${min}:${s}`;
 }
 
 function uid() { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
@@ -4164,8 +7895,15 @@ function moveShape(s: AnyShape, nx: number, ny: number): AnyShape {
   }
   if (s.type==='connector') {
     const connector=s as ConnectorShape; const dx=nx-connector.x1, dy=ny-connector.y1;
-    const next={...connector,x1:nx,y1:ny,x2:connector.x2+dx,y2:connector.y2+dy,
-      waypoints:connector.waypoints.map(([x,y])=>[x+dx,y+dy] as [number,number]), sourceRef:undefined,targetRef:undefined};
+    // Whole-connector movement translates free ends and waypoints while snapped endpoints remain
+    // owned by their semantic nodes. Endpoint handles use the separate reconnect path.
+    const next={...connector,
+      x1:connector.sourceRef ? connector.x1 : nx,
+      y1:connector.sourceRef ? connector.y1 : ny,
+      x2:connector.targetRef ? connector.x2 : connector.x2+dx,
+      y2:connector.targetRef ? connector.y2 : connector.y2+dy,
+      waypoints:connector.waypoints.map(([x,y])=>[x+dx,y+dy] as [number,number]),
+    };
     return {...next,...connectorBounds(next)};
   }
   if (isPositionedShape(s)) return withComputedShapeBounds({ ...s, x: nx, y: ny });

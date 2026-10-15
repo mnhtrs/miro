@@ -2,13 +2,14 @@ import type { ToolType } from './CanvasEngine';
 
 export type CanvasShortcutAction =
   | { type: 'pan'; dx: number; dy: number }
-  | { type: 'undo' | 'redo' | 'duplicate' | 'delete' | 'clear-selection' | 'open-image' }
+  | { type: 'undo' | 'redo' | 'select-all' | 'duplicate' | 'delete' | 'clear-selection' | 'open-image' }
   | { type: 'tool'; tool: ToolType };
 
 interface ShortcutKeyInput {
   key: string;
   ctrlKey: boolean;
   metaKey: boolean;
+  shiftKey?: boolean;
 }
 
 /** Pure key-to-action mapping shared with the canvas listener and integration tests. */
@@ -28,8 +29,9 @@ export function getCanvasShortcutAction(
   }
 
   const ctrl = event.ctrlKey || event.metaKey;
-  if (ctrl && event.key === 'z') return { type: 'undo' };
-  if (ctrl && (event.key === 'y' || event.key === 'Z')) return { type: 'redo' };
+  if (ctrl && event.key.toLowerCase() === 'a') return { type: 'select-all' };
+  if (ctrl && event.key.toLowerCase() === 'z') return event.shiftKey ? { type: 'redo' } : { type: 'undo' };
+  if (ctrl && event.key.toLowerCase() === 'y') return { type: 'redo' };
   if (ctrl && event.key === 'd') return { type: 'duplicate' };
   if (event.key === 'Delete' || event.key === 'Backspace') return { type: 'delete' };
 

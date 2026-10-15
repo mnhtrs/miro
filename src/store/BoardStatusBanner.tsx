@@ -52,15 +52,5 @@ export default function BoardStatusBanner() {
     );
   }
 
-  if (status.unsyncedRemoteChanges) {
-    return (
-      <div role="status" aria-live="polite" style={{ position: 'fixed', top: 72, left: '50%', transform: 'translateX(-50%)', zIndex: 1500, pointerEvents: 'none',
-        padding: '8px 12px', color: '#854d0e', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 9,
-        boxShadow: '0 8px 24px rgba(15,23,42,.12)', font: '500 12px/1.35 Inter, Segoe UI, sans-serif' }}>
-        Realtime updates are still syncing; local recovery remains active.
-      </div>
-    );
-  }
-
   return null;
 }

@@ -77,6 +77,37 @@
 .formula-editor-done:focus-visible { outline: 2px solid var(--aw-blue, #3b82f6); outline-offset: 1px; }
 .formula-editor-done { min-width: 48px; color: #fff; background: #2563eb; border-color: #2563eb; }
 .formula-editor-done:hover { background: #1d4ed8; }
+.formula-editor-tools-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 9px;
+  color: #334155;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: 600 11px/1 Inter, "Segoe UI", system-ui, sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.formula-editor-tools-toggle:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+  color: #0f172a;
+}
+.formula-editor-tools-toggle.is-active {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #93c5fd;
+  box-shadow: 0 1px 2px rgba(37, 99, 235, 0.08);
+}
+.formula-editor-tools-toggle:focus-visible {
+  outline: 2px solid var(--aw-blue, #3b82f6);
+  outline-offset: 1px;
+}
 .formula-editor-content {
   position: relative;
   display: flex;
@@ -172,9 +203,9 @@
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  width: 640px;
+  width: 360px;
   max-width: calc(100vw - 16px);
-  max-height: calc(100dvh - 16px);
+  max-height: min(520px, calc(100dvh - 32px));
   min-width: 0;
   overflow: hidden;
   color: #26364a;
@@ -189,18 +220,48 @@
   display: flex;
   flex: 0 0 52px;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
   min-width: 0;
   min-height: 52px;
-  padding: 0 18px;
+  padding: 0 16px;
   color: #fff;
   background: #2457a7;
   cursor: grab;
   user-select: none;
 }
 .math-tools-header:active { cursor: grabbing; }
+.math-tools-header-left {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
 .math-tools-header .icon { flex: 0 0 auto; color: #dbeafe; }
 .math-tools-header .title { overflow: hidden; font: 700 15px/1.2 Inter, "Segoe UI", system-ui, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+.math-tools-close-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 6px;
+  font: 600 11.5px/1 Inter, "Segoe UI", system-ui, sans-serif;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+  backdrop-filter: blur(4px);
+}
+.math-tools-close-btn:hover {
+  background: #ef4444;
+  border-color: #dc2626;
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.35);
+}
 .math-tools-body {
   display: flex;
   flex: 1 1 auto;

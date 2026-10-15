@@ -3,6 +3,17 @@ import { buildSolid3DProjection, isSolid3DGeometry, type Solid3DProjection, type
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
 const n = (value: unknown, fallback: number) => typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+export const SEQUENCE_LIFELINE_HEADER_HEIGHT = 48;
+export const SEQUENCE_ACTOR_GLYPH_HEIGHT = 58;
+export const SEQUENCE_ACTOR_HEADER_HEIGHT = 88;
+export const SEQUENCE_ROLE_HEADER_HEIGHT = 88;
+export const UML_BOUNDARY_TITLE_HEIGHT = 40;
+
+/** A fixed board-space Sequence header shared by actor and ECB participants. */
+export function sequenceParticipantHeaderHeight(geometry?: GeometryKind): number {
+  return geometry === 'umlRole' ? SEQUENCE_ROLE_HEADER_HEIGHT
+    : geometry === 'umlActorParticipant' ? SEQUENCE_ACTOR_HEADER_HEIGHT : SEQUENCE_LIFELINE_HEADER_HEIGHT;
+}
 
 function command(op: PathCommand['op'], ...values: number[]): PathCommand { return { op, values }; }
 function poly(points: readonly (readonly [number, number])[], close = true): PathCommand[] {
@@ -19,16 +30,24 @@ function roundedRectPath(width: number, height: number, radius: number): PathCom
 
 function actorCommands(width: number, height: number): PathCommand[] {
   const w = Math.max(1, width), h = Math.max(1, height), cx = w / 2;
-  const radius = Math.min(w * 0.12, h * 0.085);
-  const headCenterY = radius + h * 0.06;
+  // Golden proportions for UML stick figure: arm span ~ 72% of figure height, leg spread ~ 56% of height
+  const figureSpan = Math.min(w * 0.85, h * 0.72);
+  const armHalf = figureSpan / 2;
+  const legHalf = (figureSpan * 0.78) / 2;
+  const radius = Math.min(h * 0.15, armHalf * 0.40);
+  const headCenterY = radius + 2;
   const neckY = headCenterY + radius;
-  const shoulderY = h * 0.36;
-  const torsoBottom = h * 0.70;
-  return [command('moveTo', cx + radius, headCenterY), command('ellipse', cx, headCenterY, radius, radius, 0, 0, Math.PI * 2, 0),
-    command('closePath'), command('moveTo', cx, neckY), command('lineTo', cx, torsoBottom),
-    command('moveTo', w * 0.12, h * 0.50), command('lineTo', cx, shoulderY), command('lineTo', w * 0.88, h * 0.50),
-    command('moveTo', cx, torsoBottom), command('lineTo', w * 0.20, h * 0.96),
-    command('moveTo', cx, torsoBottom), command('lineTo', w * 0.80, h * 0.96)];
+  const shoulderY = neckY + h * 0.08;
+  const torsoBottom = h * 0.65;
+  const handY = shoulderY + h * 0.12;
+  return [
+    command('moveTo', cx + radius, headCenterY), command('ellipse', cx, headCenterY, radius, radius, 0, 0, Math.PI * 2, 0),
+    command('closePath'),
+    command('moveTo', cx, neckY), command('lineTo', cx, torsoBottom),
+    command('moveTo', cx - armHalf, handY), command('lineTo', cx, shoulderY), command('lineTo', cx + armHalf, handY),
+    command('moveTo', cx, torsoBottom), command('lineTo', cx - legHalf, h * 0.98),
+    command('moveTo', cx, torsoBottom), command('lineTo', cx + legHalf, h * 0.98),
+  ];
 }
 
 function ellipsePath(cx: number, cy: number, rx: number, ry = rx): PathCommand[] {
@@ -48,8 +67,24 @@ export function buildGeometryCommands(
   const rect = () => poly([[0, 0], [w, 0], [w, h], [0, h]]);
   if (isSolid3DGeometry(geometry)) return buildSolid3DProjection(geometry, w, h, params, solidOptions).outline;
   switch (geometry) {
-    case 'rect': case 'table': case 'column': case 'pool': case 'lane': case 'umlBoundary': case 'activityPartition':
+    case 'rect': case 'table': case 'column': case 'pool': case 'lane': case 'activityPartition':
+    case 'associativeEntity':
       return rect();
+    case 'umlBoundary': {
+      const rx = Math.min(8, Math.min(w, h) * 0.06);
+      return [
+        command('moveTo', rx, 0),
+        command('lineTo', w - rx, 0),
+        command('quadraticCurveTo', w, 0, w, rx),
+        command('lineTo', w, h - rx),
+        command('quadraticCurveTo', w, h, w - rx, h),
+        command('lineTo', rx, h),
+        command('quadraticCurveTo', 0, h, 0, h - rx),
+        command('lineTo', 0, rx),
+        command('quadraticCurveTo', 0, 0, rx, 0),
+        command('closePath'),
+      ];
+    }
     case 'roundedRect': case 'umlState': case 'umlActivity': case 'group': case 'umlCompositeState': {
       const minSide = Math.min(w, h);
       const absoluteRadius = n(params.cornerRadius, Number.NaN);
@@ -147,13 +182,65 @@ export function buildGeometryCommands(
         command('quadraticCurveTo', w * 0.52, h, 0, h - dy * 0.14), command('closePath')];
       return commands;
     }
-    case 'actor': return actorCommands(w, h);
+    // Keep a real name band below the stick figure. UML actor labels belong under the
+    // glyph; drawing the figure through 96% of its box leaves no safe label space.
+    case 'actor': return actorCommands(w, h * 0.68);
     case 'umlActorParticipant': {
-      const actorHeight = h * 0.28;
+      const actorHeight = Math.min(h * 0.28, SEQUENCE_ACTOR_GLYPH_HEIGHT);
       return actorCommands(w, actorHeight);
     }
-    case 'umlRole':
-      return [command('moveTo', cx, h * 0.45), command('ellipse', cx, h * 0.24, w * 0.28, h * 0.22, 0, Math.PI, Math.PI * 2, 0), command('moveTo', cx, h * 0.46), command('lineTo', cx, h * 0.96)];
+    case 'umlRole': {
+      const header = Math.min(h, SEQUENCE_ROLE_HEADER_HEIGHT);
+      const role = String(params.ecbKind ?? (
+        params.stereotype === '«boundary»' ? 'boundary' :
+        params.stereotype === '«control»' ? 'control' :
+        params.stereotype === '«entity»' ? 'entity' : 'entity'
+      )).toLowerCase();
+
+      const r = Math.min(18, Math.max(14, Math.round(Math.min(w * 0.22, header * 0.23))));
+      const centerY = r + 8;
+
+      if (role === 'boundary') {
+        // UML Robustness Boundary (Draw.io SeqBoundaryShape: vertical bar on left, horizontal link, circle centered on lifeline)
+        const barX = cx - r - Math.round(r * 1.05);
+        const barHalfH = Math.round(r * 0.85);
+        return [
+          command('moveTo', cx + r, centerY),
+          command('ellipse', cx, centerY, r, r, 0, 0, Math.PI * 2, 0),
+          command('closePath'),
+          command('moveTo', barX, centerY - barHalfH),
+          command('lineTo', barX, centerY + barHalfH),
+          command('moveTo', barX, centerY),
+          command('lineTo', cx - r, centerY),
+        ];
+      }
+      if (role === 'control') {
+        // UML Robustness Control (Exact Draw.io UmlControlShape: circle with crisp chevron arrow at top curve)
+        const vx = cx - Math.round(r * 0.28);
+        const vy = centerY - Math.round(r * 0.96);
+        const legX = cx + Math.round(r * 0.32);
+        const upperY = centerY - Math.round(r * 1.30);
+        const lowerY = centerY - Math.round(r * 0.66);
+        return [
+          command('moveTo', cx + r, centerY),
+          command('ellipse', cx, centerY, r, r, 0, 0, Math.PI * 2, 0),
+          command('closePath'),
+          command('moveTo', legX, upperY),
+          command('lineTo', vx, vy),
+          command('lineTo', legX, lowerY),
+        ];
+      }
+      // UML Robustness Entity (Draw.io UmlEntityShape: circle resting on flat horizontal tangent baseline)
+      const baselineY = centerY + r;
+      const baseSpan = Math.round(r * 1.35);
+      return [
+        command('moveTo', cx + r, centerY),
+        command('ellipse', cx, centerY, r, r, 0, 0, Math.PI * 2, 0),
+        command('closePath'),
+        command('moveTo', cx - baseSpan, baselineY),
+        command('lineTo', cx + baseSpan, baselineY),
+      ];
+    }
     case 'frame':
       return [command('moveTo', 0, 0), command('lineTo', w * 0.38, 0), command('lineTo', w * 0.45, h * 0.14), command('lineTo', w, h * 0.14),
         command('lineTo', w, h), command('lineTo', 0, h), command('closePath')];
@@ -193,7 +280,7 @@ export function buildGeometryCommands(
     case 'extract': return poly([[0, 0], [w, 0], [cx, h]]);
     case 'merge': return poly([[cx, 0], [w, h], [0, h]]);
     case 'umlLifeline': {
-      const headH = h * 0.22;
+      const headH = Math.min(h, SEQUENCE_LIFELINE_HEADER_HEIGHT);
       return poly([[0, 0], [w, 0], [w, headH], [0, headH]]);
     }
     case 'umlActivation': return rect();
@@ -239,6 +326,8 @@ export interface ShapeGeometryPaths {
   decorationStyles: Array<StrokeStyle | undefined>;
   /** Semantic marks that are filled even while the shape's editable fill remains transparent. */
   intrinsicFills: PathCommand[][];
+  /** Intrinsic fill role; `surface` creates a notation cutout using the board paper color. */
+  intrinsicFillColors: Array<'outline' | 'surface'>;
   hiddenEdges: PathCommand[][];
   /** Polyhedral face-fill paths; curved solids fill the continuous outline silhouette instead. */
   visibleFaces?: Solid3DProjection['visibleFaces'];
@@ -274,12 +363,38 @@ export function buildGeometryIntrinsicFills(geometry: GeometryKind, width: numbe
     return [ellipsePath(cx, cy, radius)];
   }
   if (geometry === 'umlFork') return [buildGeometryCommands(geometry, w, h, params)];
+  if (geometry === 'bpmnTask' && params.taskMarker === 'send') {
+    const size = Math.min(w, h) * 0.20, x = w * 0.11, y = h * 0.13;
+    const envelope = [[x, y + size * 0.2], [x + size, y + size * 0.2], [x + size, y + size * 0.82], [x, y + size * 0.82]] as const;
+    const flap = [[x + size * 0.06, y + size * 0.24], [x + size * 0.94, y + size * 0.24], [x + size * 0.5, y + size * 0.55]] as const;
+    return [poly(envelope), poly(flap)];
+  }
+  if (geometry === 'umlBoundary') {
+    const rx = Math.min(8, Math.min(w, h) * 0.06);
+    const headerH = Math.min(h, UML_BOUNDARY_TITLE_HEIGHT);
+    return [[
+      command('moveTo', rx, 0),
+      command('lineTo', w - rx, 0),
+      command('quadraticCurveTo', w, 0, w, rx),
+      command('lineTo', w, headerH),
+      command('lineTo', 0, headerH),
+      command('lineTo', 0, rx),
+      command('quadraticCurveTo', 0, 0, rx, 0),
+      command('closePath'),
+    ]];
+  }
   return [];
+}
+
+function buildGeometryIntrinsicFillColors(geometry: GeometryKind, params: Readonly<Record<string, unknown>>, count: number): Array<'outline' | 'surface'> {
+  if (geometry === 'umlBoundary') return ['surface'];
+  if (geometry === 'bpmnTask' && params.taskMarker === 'send') return ['outline', 'surface'];
+  return Array.from({ length: count }, () => 'outline');
 }
 
 function buildGeometryDecorationStyles(geometry: GeometryKind, count: number): Array<StrokeStyle | undefined> {
   const styles: Array<StrokeStyle | undefined> = Array.from({ length: count }, () => undefined);
-  if (geometry === 'umlLifeline' || geometry === 'umlActorParticipant') styles[0] = 'dashed';
+  if (geometry === 'umlLifeline' || geometry === 'umlActorParticipant' || geometry === 'umlRole') styles[0] = 'dashed';
   return styles;
 }
 
@@ -295,18 +410,20 @@ export function buildShapeGeometry(
   if (isSolid3DGeometry(definition.geometry)) {
     const projection = buildSolid3DProjection(definition.geometry, safeWidth, safeHeight, params, solidOptions);
     return { width: safeWidth, height: safeHeight, outline: projection.outline, decorations: [projection.visibleEdges],
-      decorationStyles: [undefined], intrinsicFills: [], hiddenEdges: projection.hiddenEdges,
+      decorationStyles: [undefined], intrinsicFills: [], intrinsicFillColors: [], hiddenEdges: projection.hiddenEdges,
       visibleFaces: projection.visibleFaces, projection: projection.metadata };
   }
   const outline = buildGeometryCommands(definition.geometry, safeWidth, safeHeight, params);
   const decorations = buildGeometryDecorations(definition.geometry, safeWidth, safeHeight, params);
+  const intrinsicFills = buildGeometryIntrinsicFills(definition.geometry, safeWidth, safeHeight, params);
   return {
     width: safeWidth,
     height: safeHeight,
     outline,
     decorations,
     decorationStyles: buildGeometryDecorationStyles(definition.geometry, decorations.length),
-    intrinsicFills: buildGeometryIntrinsicFills(definition.geometry, safeWidth, safeHeight, params),
+    intrinsicFills,
+    intrinsicFillColors: buildGeometryIntrinsicFillColors(definition.geometry, params, intrinsicFills.length),
     hiddenEdges: [],
   };
 }
@@ -396,7 +513,8 @@ export function shapePreviewGeometry(
   };
   return { width: viewportWidth, height: viewportHeight, outline: source.outline.map(transform),
     decorations: source.decorations.map(path => path.map(transform)), decorationStyles: [...source.decorationStyles],
-    intrinsicFills: source.intrinsicFills.map(path => path.map(transform)), hiddenEdges: source.hiddenEdges.map(path => path.map(transform)),
+    intrinsicFills: source.intrinsicFills.map(path => path.map(transform)), intrinsicFillColors: [...source.intrinsicFillColors],
+    hiddenEdges: source.hiddenEdges.map(path => path.map(transform)),
     ...(source.visibleFaces ? { visibleFaces: source.visibleFaces.map(face => ({ ...face, commands: face.commands.map(transform) })) } : {}),
     ...(source.projection ? { projection: source.projection } : {}) };
 }
@@ -487,7 +605,7 @@ export function shapePreviewPath(definition: ShapeDefinition, width = 28, height
 }
 
 export function geometryUsesFill(geometry: GeometryKind): boolean {
-  return !['actor', 'umlActorParticipant', 'umlDestroy', 'annotation', 'umlLifeline', 'umlRole', 'umlRequiredInterface'].includes(geometry);
+  return !['actor', 'umlActorParticipant', 'umlDestroy', 'annotation', 'umlLifeline', 'umlRole', 'umlProvidedInterface', 'umlRequiredInterface'].includes(geometry);
 }
 
 /** Additional native Canvas paths reused by semantic families (not duplicated per shape id). */
@@ -521,7 +639,9 @@ export function buildGeometryDecorations(geometry: GeometryKind, width: number, 
     result.push(line(w * 0.12, h * 0.38, w * 0.24, h * 0.38));
     result.push(line(w * 0.12, h * 0.62, w * 0.24, h * 0.62));
   }
-  if (geometry === 'table') {
+  const isClassifierOrInstance = params.classifierLayout === true || params.instanceLayout === true
+    || typeof params.stereotype === 'string' || params.underlineName === true;
+  if (geometry === 'table' && !isClassifierOrInstance) {
     const requestedRows = Math.round(clamp(n(params.rowCount, 0), 0, 32));
     const compartments = Math.round(clamp(n(params.compartments, 2), 1, 5));
     const rowCount = requestedRows >= 2 ? requestedRows : compartments;
@@ -529,16 +649,35 @@ export function buildGeometryDecorations(geometry: GeometryKind, width: number, 
     layout.dividerYs.forEach(y => result.push(line(0, y, w, y)));
     if (params.keyColumns) result.push(line(w * 0.20, 0, w * 0.20, h));
   }
+  if (geometry === 'umlBoundary') result.push(line(0, Math.min(h, UML_BOUNDARY_TITLE_HEIGHT), w, Math.min(h, UML_BOUNDARY_TITLE_HEIGHT)));
   if (geometry === 'column') result.push(line(w * 0.32, 0, w * 0.32, h));
+  if (geometry === 'associativeEntity') {
+    const radius = Math.min(w, h) * 0.40;
+    result.push(poly([[cx, cy - radius], [cx + radius, cy], [cx, cy + radius], [cx - radius, cy]]));
+  }
   if (geometry === 'pool') result.push(line(w * 0.13, 0, w * 0.13, h));
   if (geometry === 'lane') result.push(line(w * 0.15, 0, w * 0.15, h));
-  if (geometry === 'activityPartition') result.push(line(0, h * 0.24, w, h * 0.24));
-  if (geometry === 'umlLifeline') result.push(line(cx, h * 0.22, cx, h));
-  if (geometry === 'umlActorParticipant') result.push(line(cx, h * 0.42, cx, h));
+  if (geometry === 'activityPartition') {
+    if (params.activityOrientation === 'horizontal') result.push(line(w * 0.24, 0, w * 0.24, h));
+    else result.push(line(0, h * 0.24, w, h * 0.24));
+  }
+  if (geometry === 'umlLifeline' || geometry === 'umlActorParticipant' || geometry === 'umlRole') {
+    const startY = Math.min(h, sequenceParticipantHeaderHeight(geometry));
+    const destroyedAt = clamp(n(params.sequenceDestroyPermille, 1000), 0, 1000);
+    const endY = startY + Math.max(0, h - startY) * (destroyedAt / 1000);
+    result.push(line(cx, startY, cx, endY));
+  }
   if (geometry === 'umlCompositeState') {
     const inset = Math.min(w, h) * 0.14;
-    result.push(line(inset, h * 0.29, w - inset, h * 0.29));
+    const header = clamp(n(params.stateHeaderFraction, 0.29), 0.29, 0.62);
+    const regionCount = Math.round(clamp(n(params.stateRegionCount, 1), 1, 64));
+    result.push(line(inset, h * header, w - inset, h * header));
+    for (let index = 1; index < regionCount; index++)
+      result.push(line(inset, h * header + h * (1 - header) * index / regionCount,
+        w - inset, h * header + h * (1 - header) * index / regionCount));
   }
+  if (geometry === 'umlState' && n(params.stateBehaviorRows, 0) > 0)
+    result.push(line(w * 0.06, h * 0.40, w * 0.94, h * 0.40));
   if (geometry === 'umlExitPoint') {
     const radius = Math.min(w, h) * 0.25;
     result.push(line(cx - radius * 0.52, cy - radius * 0.52, cx + radius * 0.52, cy + radius * 0.52));
@@ -578,8 +717,18 @@ export function buildGeometryDecorations(geometry: GeometryKind, width: number, 
       result.push(line(x + s * 0.12, y + s * 0.92, x + s * 0.88, y + s * 0.92));
       result.push([command('moveTo', x + s * 0.12, y + s * 0.92), command('quadraticCurveTo', x + s / 2, y + s * 0.42, x + s * 0.88, y + s * 0.92)]);
     } else if (marker === 'manual') {
-      result.push(line(x, y + s * 0.78, x + s, y + s * 0.18));
-      result.push(line(x + s * 0.1, y + s * 0.2, x + s * 0.88, y + s * 0.2));
+      // A compact palm-and-fingers outline, rather than the previous unrelated diagonal mark.
+      result.push([command('moveTo', x + s * 0.25, y + s * 0.92), command('lineTo', x + s * 0.10, y + s * 0.57),
+        command('quadraticCurveTo', x + s * 0.09, y + s * 0.43, x + s * 0.25, y + s * 0.48),
+        command('lineTo', x + s * 0.28, y + s * 0.12), command('quadraticCurveTo', x + s * 0.30, y - s * 0.02, x + s * 0.42, y + s * 0.10),
+        command('lineTo', x + s * 0.44, y + s * 0.46), command('lineTo', x + s * 0.48, y + s * 0.08),
+        command('quadraticCurveTo', x + s * 0.51, y - s * 0.02, x + s * 0.62, y + s * 0.10),
+        command('lineTo', x + s * 0.61, y + s * 0.48), command('lineTo', x + s * 0.70, y + s * 0.19),
+        command('quadraticCurveTo', x + s * 0.76, y + s * 0.08, x + s * 0.84, y + s * 0.20),
+        command('lineTo', x + s * 0.78, y + s * 0.57), command('lineTo', x + s * 0.89, y + s * 0.40),
+        command('quadraticCurveTo', x + s, y + s * 0.34, x + s * 0.98, y + s * 0.50),
+        command('lineTo', x + s * 0.82, y + s * 0.82), command('quadraticCurveTo', x + s * 0.74, y + s, x + s * 0.55, y + s),
+        command('closePath')]);
     } else if (marker === 'service') {
       result.push(ellipsePath(x + s / 2, y + s / 2, s * 0.3));
       for (let i = 0; i < 8; i++) {
@@ -587,14 +736,22 @@ export function buildGeometryDecorations(geometry: GeometryKind, width: number, 
         result.push(line(x + s / 2 + Math.cos(a) * s * 0.34, y + s / 2 + Math.sin(a) * s * 0.34,
           x + s / 2 + Math.cos(a) * s * 0.48, y + s / 2 + Math.sin(a) * s * 0.48));
       }
-    } else if (marker === 'script' || marker === 'rule') {
+    } else if (marker === 'script') {
       result.push(poly([[x, y], [x + s * 0.68, y], [x + s, y + s * 0.30], [x + s, y + s], [x, y + s]]));
       result.push(line(x + s * 0.16, y + s * 0.53, x + s * 0.82, y + s * 0.53));
       result.push(line(x + s * 0.16, y + s * 0.76, x + s * 0.72, y + s * 0.76));
-    } else if (marker === 'receive' || marker === 'send') {
+    } else if (marker === 'rule') {
+      result.push(poly([[x, y + s * 0.12], [x + s, y + s * 0.12], [x + s, y + s * 0.88], [x, y + s * 0.88]]));
+      result.push(line(x, y + s * 0.39, x + s, y + s * 0.39));
+      result.push(line(x, y + s * 0.64, x + s, y + s * 0.64));
+      result.push(line(x + s * 0.34, y + s * 0.12, x + s * 0.34, y + s * 0.88));
+      result.push(line(x + s * 0.67, y + s * 0.12, x + s * 0.67, y + s * 0.88));
+    } else if (marker === 'receive') {
       result.push(poly([[x, y + s * 0.2], [x + s, y + s * 0.2], [x + s, y + s * 0.82], [x, y + s * 0.82]]));
       result.push(line(x, y + s * 0.2, x + s / 2, y + s * 0.58));
       result.push(line(x + s, y + s * 0.2, x + s / 2, y + s * 0.58));
+    } else if (marker === 'send') {
+      result.push(poly([[x, y + s * 0.2], [x + s, y + s * 0.2], [x + s, y + s * 0.82], [x, y + s * 0.82]]));
     }
     if (params.subprocess === true) {
       const px = cx, py = h * 0.88, r = Math.min(w, h) * 0.06;
@@ -626,7 +783,7 @@ export function buildGeometryDecorations(geometry: GeometryKind, width: number, 
     const halfWidth = Math.min(w * 0.12, h * 0.40), y = cy + h * 0.16;
     result.push(line(cx - halfWidth, y, cx + halfWidth, y));
   }
-  if (params.doubleBorder === true || params.innerDiamond === true) {
+  if (params.doubleBorder === true || (params.innerDiamond === true && geometry === 'diamond')) {
     if (geometry === 'diamond') {
       const inset = Math.min(w, h) * 0.15;
       result.push(poly([[cx, inset], [w - inset, cy], [cx, h - inset], [inset, cy]]));
