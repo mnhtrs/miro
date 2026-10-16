@@ -6,7 +6,7 @@ import {
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
   Copy, Trash2, Palette, X, ChevronDown, Check, Search,
-  Code, Calculator, LassoSelect, Star, Clock
+  Code, Calculator, LassoSelect, Star, Clock, Database, Plus, ArrowUp, ArrowDown
 } from 'lucide-react';
 import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
@@ -14,7 +14,8 @@ import { listShapePickerDefinitions, getShapeDefinition, getShapeDefinitionForLe
 import { geometryCommandsToSvg, shapePreviewGeometry, UML_BOUNDARY_TITLE_HEIGHT } from './engine/shapes/geometry';
 import { buildConnectorPreviewGeometry, connectorDisplayLabel } from './engine/shapes/connectors';
 import { SHAPE_CATEGORIES } from './engine/shapes/types';
-import type { Cardinality, DiagramShape, EndpointMarker, SequenceFragmentData, SequenceFragmentOperator, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle, UMLClassifierData, UMLClassifierMember, UMLDiagramFamily, UMLExtensionPoint, UMLInstanceData, UMLInstanceValue, UMLSubjectBoundaryData, UMLUseCaseData, UMLVisibility } from './engine/shapes/types';
+import type { Cardinality, DiagramShape, EndpointMarker, SequenceFragmentData, SequenceFragmentOperator, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle, TableColumnModel, UMLClassifierData, UMLClassifierMember, UMLDiagramFamily, UMLExtensionPoint, UMLInstanceData, UMLInstanceValue, UMLSubjectBoundaryData, UMLUseCaseData, UMLVisibility } from './engine/shapes/types';
+import { generateTableDdl, type DdlDialect } from './engine/shapes/erdDdl';
 import { diagramCapabilitiesFor, familyForDefinition, UML_FAMILY_LABELS, umlFamilyForCategory } from './engine/shapes/diagramContext';
 import type { DiagramGraphDiagnostic } from './engine/shapes/diagramContext';
 import { createClassifierMember, formatOperationParameters, parseOperationParameters } from './engine/shapes/classifier';
@@ -389,6 +390,9 @@ export default function App() {
   const [shapePropertiesOpen, setShapePropertiesOpen] = useState(false);
   const shapePropertiesPanelRef = useRef<HTMLElement>(null);
   const shapePropertiesTriggerRef = useRef<HTMLButtonElement>(null);
+  const [ddlModalData, setDdlModalData] = useState<{ tableName: string; columns: TableColumnModel[] } | null>(null);
+  const [ddlDialect, setDdlDialect] = useState<DdlDialect>('postgresql');
+  const [ddlCopied, setDdlCopied] = useState(false);
 
   // text/sticky edit overlay
   const [editShape, setEditShape] = useState<AnyShape | null>(null);
@@ -717,6 +721,7 @@ export default function App() {
     // Apply the current UI values at construction so new shapes use Antiwhite defaults.
     eng.style = { ...engineStyleRef.current };
     engRef.current = eng;
+    (window as unknown as { eng?: CanvasEngine }).eng = eng;
 
     eng.onSel = ids => {
       setSelIds(ids);
@@ -861,7 +866,7 @@ export default function App() {
           boxW = localBounds.w * eng.cam.zoom;
           boxH = localBounds.h * eng.cam.zoom;
           text = shape.text || def.defaultText || 'Use Case';
-        } else if (def?.id === 'erd.er-table' || def?.id === 'erd.table') {
+        } else if (def?.id === 'erd.er-table' || def?.id === 'erd.table' || def?.id === 'erd.view') {
           const hit = eng.getErTableHit(shape.id, cx, cy);
           if (hit) {
             boxL = hit.clientBounds.l;
@@ -975,6 +980,24 @@ export default function App() {
           boxH = localBounds.h * eng.cam.zoom;
           boxL = sp.x + 8 * eng.cam.zoom;
           boxW = localBounds.w * eng.cam.zoom;
+        } else if (def?.geometry === 'diamond' || def?.geometry === 'associativeEntity') {
+          const isIdentifying = shape.params?.doubleBorder === true;
+          const safeW = shape.w * (isIdentifying ? 0.72 : 0.78);
+          const safeH = shape.h * (isIdentifying ? 0.58 : 0.64);
+          localBounds = { x: (shape.w - safeW) / 2, y: (shape.h - safeH) / 2, w: safeW, h: safeH };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+        } else if (def?.geometry === 'ellipse') {
+          const isDouble = shape.params?.doubleBorder === true;
+          const safeW = shape.w * (isDouble ? 0.72 : 0.80);
+          const safeH = shape.h * (isDouble ? 0.64 : 0.72);
+          localBounds = { x: (shape.w - safeW) / 2, y: (shape.h - safeH) / 2, w: safeW, h: safeH };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
         }
       }
 
@@ -1054,6 +1077,7 @@ export default function App() {
       eng.cancelPointer();
       eng.destroy();
       engRef.current = null;
+      (window as unknown as { eng?: CanvasEngine | null }).eng = null;
     };
   }, [boardReady]);
 
@@ -1263,6 +1287,105 @@ export default function App() {
     });
   }, [commitEdit]);
 
+  const commitAndAdvanceErTableColumn = useCallback(() => {
+    const shape = editShapeRef.current;
+    const eng = engRef.current;
+    const erContext = editingErContextRef.current;
+    if (!shape || !eng || !erContext || erContext.target === 'header' || erContext.columnIndex === undefined) {
+      commitEdit();
+      return;
+    }
+
+    const currentText = editTextRef.current;
+    let nextIdx = erContext.columnIndex + 1;
+
+    if (!currentText.trim()) {
+      eng.removeErTableColumn(shape.id, erContext.columnIndex);
+      nextIdx = erContext.columnIndex;
+    } else {
+      eng.updateErTableColumn(shape.id, erContext.columnIndex, currentText);
+    }
+
+    const insertedIdx = eng.addErTableColumn(shape.id, nextIdx, 'column_name : varchar(255)');
+    if (insertedIdx === null) {
+      commitEdit();
+      return;
+    }
+
+    const nextBounds = eng.getErTableColumnBounds(shape.id, insertedIdx);
+    if (!nextBounds) {
+      commitEdit();
+      return;
+    }
+
+    const updatedShape = eng.getShape(shape.id);
+    if (updatedShape) internalSetEditShape(updatedShape);
+
+    editingErContextRef.current = {
+      shapeId: shape.id,
+      target: 'column',
+      columnIndex: insertedIdx,
+      fontSize: nextBounds.fontSize,
+    };
+    editingLocalBoundsRef.current = nextBounds.localBounds;
+
+    editTextRef.current = nextBounds.initialText;
+    setEditText(nextBounds.initialText);
+    setEditBox(nextBounds.clientBounds);
+
+    window.requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>('.board-text-editor');
+      if (textarea) {
+        textarea.focus();
+        textarea.select();
+      }
+    });
+  }, [commitEdit]);
+
+  const navigateErTableColumn = useCallback((direction: 'up' | 'down') => {
+    const shape = editShapeRef.current;
+    const eng = engRef.current;
+    const erContext = editingErContextRef.current;
+    if (!shape || !eng || !erContext || erContext.target === 'header' || erContext.columnIndex === undefined) {
+      return false;
+    }
+
+    const currentText = editTextRef.current;
+    if (currentText.trim()) {
+      eng.updateErTableColumn(shape.id, erContext.columnIndex, currentText);
+    }
+
+    const targetIdx = direction === 'up' ? erContext.columnIndex - 1 : erContext.columnIndex + 1;
+    const nextBounds = eng.getErTableColumnBounds(shape.id, targetIdx);
+    if (!nextBounds) {
+      return false;
+    }
+
+    const updatedShape = eng.getShape(shape.id);
+    if (updatedShape) internalSetEditShape(updatedShape);
+
+    editingErContextRef.current = {
+      shapeId: shape.id,
+      target: 'column',
+      columnIndex: targetIdx,
+      fontSize: nextBounds.fontSize,
+    };
+    editingLocalBoundsRef.current = nextBounds.localBounds;
+
+    editTextRef.current = nextBounds.initialText;
+    setEditText(nextBounds.initialText);
+    setEditBox(nextBounds.clientBounds);
+
+    window.requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>('.board-text-editor');
+      if (textarea) {
+        textarea.focus();
+        textarea.select();
+      }
+    });
+    return true;
+  }, []);
+
   // Keyboard context priority: native editor/form controls first, then application dialogs and
   // toolbars, then the focused board. A text editor's native history/select-all must never reach
   // the board's Yjs history manager.
@@ -1393,7 +1516,7 @@ export default function App() {
   const classifierCompartments = Array.isArray(classifierModel?.compartments) ? classifierModel.compartments : [];
   const instanceModel = selectedDiagram?.data?.instance as UMLInstanceData | undefined;
   const instanceValues = Array.isArray(instanceModel?.values) ? instanceModel.values : [];
-  const tableModel = selectedDiagram?.data?.table as { columns?: Array<{ id?: string; name?: string; type?: string; key?: string }> } | undefined;
+  const tableModel = selectedDiagram?.data?.table as { columns?: Array<TableColumnModel> } | undefined;
   const tableColumns = Array.isArray(tableModel?.columns) ? tableModel.columns : [];
   const columnModel = selectedDiagram?.data?.column as { name?: string; type?: string; key?: string } | undefined;
   const sequenceFragment = selectedDiagram?.shapeId === 'uml.frame'
@@ -1464,8 +1587,91 @@ export default function App() {
     updateInstanceData({ ...instanceModel, values: [...instanceModel.values,
       createClassifierMember('values', instanceModel.values.length) as UMLInstanceValue] }, true);
   };
-  const updateTableData = (columns: Array<{ id?: string; name?: string; type?: string; key?: string }>, commit = false) => {
-    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { table: { ...(tableModel ?? {}), columns } }, commit);
+  const updateTableData = (columns: Array<{ id?: string; name?: string; type?: string; key?: string; nullable?: boolean; default?: string }>, commit = false) => {
+    if (selectedDiagram) {
+      engRef.current?.updateDiagramData(selectedDiagram.id, { table: { ...(tableModel ?? {}), columns } }, commit);
+      if (commit) {
+        const neededHeight = Math.max(selectedDiagram.h, (columns.length + 1) * 32);
+        if (neededHeight > selectedDiagram.h) {
+          engRef.current?.updateSize(selectedDiagram.id, selectedDiagram.w, neededHeight);
+        }
+      }
+    }
+  };
+
+  const addTableColumn = () => {
+    const newCol: TableColumnModel = {
+      id: `column-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: `column_${tableColumns.length + 1}`,
+      type: 'varchar(255)',
+      key: 'none',
+      nullable: true,
+    };
+    updateTableData([...tableColumns, newCol], true);
+  };
+
+  const addSurrogateIdKey = () => {
+    const hasPk = tableColumns.some(col => col.key === 'primary' || col.key === 'primary_foreign');
+    if (hasPk) return;
+    const idCol: TableColumnModel = {
+      id: `col-id-${Date.now()}`,
+      name: 'id',
+      type: 'bigint',
+      key: 'primary',
+      nullable: false,
+    };
+    updateTableData([idCol, ...tableColumns], true);
+  };
+
+  const addTimestampsPreset = () => {
+    const existingNames = new Set(tableColumns.map(col => col.name?.toLowerCase()));
+    const toAdd: TableColumnModel[] = [];
+    if (!existingNames.has('created_at')) {
+      toAdd.push({
+        id: `col-created-at-${Date.now()}`,
+        name: 'created_at',
+        type: 'timestamp',
+        key: 'none',
+        nullable: false,
+        default: 'CURRENT_TIMESTAMP',
+      });
+    }
+    if (!existingNames.has('updated_at')) {
+      toAdd.push({
+        id: `col-updated-at-${Date.now()}`,
+        name: 'updated_at',
+        type: 'timestamp',
+        key: 'none',
+        nullable: false,
+        default: 'CURRENT_TIMESTAMP',
+      });
+    }
+    if (toAdd.length > 0) {
+      updateTableData([...tableColumns, ...toAdd], true);
+    }
+  };
+
+  const addSoftDeletePreset = () => {
+    const existingNames = new Set(tableColumns.map(col => col.name?.toLowerCase()));
+    if (!existingNames.has('deleted_at')) {
+      const col: TableColumnModel = {
+        id: `col-deleted-at-${Date.now()}`,
+        name: 'deleted_at',
+        type: 'timestamp',
+        key: 'none',
+        nullable: true,
+      };
+      updateTableData([...tableColumns, col], true);
+    }
+  };
+
+  const moveTableColumn = (index: number, delta: -1 | 1) => {
+    const target = index + delta;
+    if (target < 0 || target >= tableColumns.length) return;
+    const updated = [...tableColumns];
+    const [moved] = updated.splice(index, 1);
+    updated.splice(target, 0, moved);
+    updateTableData(updated, true);
   };
   const updateColumnData = (column: { name?: string; type?: string; key?: string }, commit = false) => {
     if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { column }, commit);
@@ -2012,7 +2218,38 @@ export default function App() {
                     }}
                     onBlur={() => commitEdit()}
                     onKeyDown={event => {
-                      if (event.key === 'Escape') { event.preventDefault(); commitEdit(); }
+                      if (event.key === 'Escape') { event.preventDefault(); commitEdit(); return; }
+                      if (editingErContextRef.current && editingErContextRef.current.target === 'column') {
+                        if (event.key === 'Enter' && !event.shiftKey) {
+                          event.preventDefault();
+                          commitAndAdvanceErTableColumn();
+                          return;
+                        }
+                        if (event.key === 'Tab') {
+                          event.preventDefault();
+                          if (event.shiftKey) {
+                            navigateErTableColumn('up');
+                          } else {
+                            const advanced = navigateErTableColumn('down');
+                            if (!advanced) {
+                              commitAndAdvanceErTableColumn();
+                            }
+                          }
+                          return;
+                        }
+                        if (event.key === 'ArrowUp') {
+                          if (navigateErTableColumn('up')) {
+                            event.preventDefault();
+                            return;
+                          }
+                        }
+                        if (event.key === 'ArrowDown') {
+                          if (navigateErTableColumn('down')) {
+                            event.preventDefault();
+                            return;
+                          }
+                        }
+                      }
                       if (event.key === 'Enter' && !event.shiftKey && editShape.type === 'diagram'
                         && !['uml.note', 'uml.use-case-ext'].includes((editShape as DiagramShape).shapeId)) {
                         event.preventDefault();
@@ -2032,13 +2269,11 @@ export default function App() {
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
                         ? '#ffffff'
-                        : editShape.type === 'diagram'
-                        ? 'rgba(255, 255, 255, 0.92)'
                         : 'transparent',
                       fontSize: editingClassifierContextRef.current
-                        ? Math.round(editingClassifierContextRef.current.fontSize * zoom)
+                        ? editingClassifierContextRef.current.fontSize
                         : editingErContextRef.current?.fontSize
-                        ? Math.round(editingErContextRef.current.fontSize * zoom)
+                        ? editingErContextRef.current.fontSize
                         : shapeFontSize(editShape),
                       padding: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
@@ -2058,6 +2293,12 @@ export default function App() {
                         ? '4px 6px'
                         : editShape.type === 'diagram' && ['uml.package', 'uml.module', 'uml.frame'].includes((editShape as DiagramShape).shapeId)
                         ? '2px 6px'
+                        : editShape.type === 'diagram' && (
+                            ['erd.identifying-relationship', 'erd.relationship', 'erd.entity', 'erd.weak-entity', 'erd.associative-entity'].includes((editShape as DiagramShape).shapeId)
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'diamond'
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'ellipse'
+                          )
+                        ? `${Math.max(2, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 6px`
                         : editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.note'
                         ? '8px 8px'
                         : editShape.type === 'sticky'
@@ -2078,8 +2319,6 @@ export default function App() {
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
                         ? '1.5px solid #2563eb'
-                        : editShape.type === 'diagram'
-                        ? '1.5px dashed #3b82f6'
                         : 'none',
                       borderRadius: 3,
                       boxShadow: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
@@ -2092,11 +2331,16 @@ export default function App() {
                         : editingErContextRef.current && editingErContextRef.current.target === 'column' ? 'left'
                         : editShape.type === 'diagram' && ['uml.note', 'uml.package', 'uml.module', 'uml.frame'].includes((editShape as DiagramShape).shapeId)
                         ? 'left'
-                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && [
-                            'uml.system-boundary', 'uml.actor', 'uml.use-case',
-                            'uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity',
-                            'uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'
-                          ].includes((editShape as DiagramShape).shapeId)) ? 'center' : 'left',
+                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && (
+                            [
+                              'uml.system-boundary', 'uml.actor', 'uml.use-case',
+                              'uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity',
+                              'uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object',
+                              'erd.identifying-relationship', 'erd.relationship', 'erd.entity', 'erd.weak-entity', 'erd.associative-entity'
+                            ].includes((editShape as DiagramShape).shapeId)
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'diamond'
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'ellipse'
+                          )) ? 'center' : 'left',
                       overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
                     }}
                   />
@@ -2433,26 +2677,138 @@ export default function App() {
                   </section>}
 
                   {selectedDefinition.dataCapabilities?.includes('table') && Array.isArray(tableModel?.columns) && <section className="shape-property-section">
-                    <h4>Table columns</h4>
-                    {tableColumns.map((column, index) => <div className="shape-property-column" key={column.id ?? index}>
-                      <div className="shape-property-column-fields">
-                        <input aria-label={`Column ${index + 1} name`} value={column.name ?? ''} placeholder="column name"
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <h4>Table columns ({tableColumns.length})</h4>
+                      <button
+                        type="button"
+                        className="shape-preset-btn is-action"
+                        onClick={() => {
+                          const tableName = selectedDiagram?.text || selectedDefinition?.label || 'my_table';
+                          setDdlModalData({ tableName, columns: tableColumns as TableColumnModel[] });
+                        }}
+                        title="Generate SQL DDL (PostgreSQL, MySQL, SQLite)"
+                      >
+                        <Database size={11} />
+                        SQL DDL
+                      </button>
+                    </div>
+
+                    <div className="shape-property-presets">
+                      <button type="button" className="shape-preset-btn" onClick={addTableColumn}>
+                        <Plus size={11} /> Column
+                      </button>
+                      <button
+                        type="button"
+                        className="shape-preset-btn"
+                        onClick={addSurrogateIdKey}
+                        disabled={tableColumns.some(col => col.key === 'primary' || col.key === 'primary_foreign')}
+                        title={tableColumns.some(col => col.key === 'primary' || col.key === 'primary_foreign') ? 'Table already has a primary key' : 'Add surrogate id (bigint PK)'}
+                      >
+                        + ID (PK)
+                      </button>
+                      <button type="button" className="shape-preset-btn" onClick={addTimestampsPreset} title="Add created_at and updated_at timestamps">
+                        + Timestamps
+                      </button>
+                      <button type="button" className="shape-preset-btn" onClick={addSoftDeletePreset} title="Add deleted_at nullable timestamp">
+                        + Soft Delete
+                      </button>
+                    </div>
+
+                    <datalist id="sql-column-types-datalist">
+                      <option value="bigint" />
+                      <option value="integer" />
+                      <option value="smallint" />
+                      <option value="serial" />
+                      <option value="varchar(255)" />
+                      <option value="varchar(100)" />
+                      <option value="text" />
+                      <option value="boolean" />
+                      <option value="timestamp" />
+                      <option value="timestamptz" />
+                      <option value="date" />
+                      <option value="time" />
+                      <option value="numeric(12,2)" />
+                      <option value="decimal(10,2)" />
+                      <option value="uuid" />
+                      <option value="jsonb" />
+                      <option value="json" />
+                    </datalist>
+
+                    {tableColumns.map((column, index) => <div className="shape-property-column" key={column.id ?? index} style={{ marginBottom: 6 }}>
+                      <div className="shape-property-column-fields-v2">
+                        <input aria-label={`Column ${index + 1} name`} value={column.name ?? ''} placeholder="column_name"
                           onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item), false)}
                           onBlur={() => updateTableData(tableColumns, true)} />
-                        <input aria-label={`Column ${index + 1} type`} value={column.type ?? ''} placeholder="type"
+                        <input aria-label={`Column ${index + 1} type`} value={column.type ?? ''} placeholder="varchar(255)"
+                          list="sql-column-types-datalist"
                           onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, type: event.target.value } : item), false)}
                           onBlur={() => updateTableData(tableColumns, true)} />
                         <select aria-label={`Column ${index + 1} key type`} value={column.key ?? 'none'}
-                          onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, key: event.target.value } : item), true)}>
-                          <option value="none">No key</option><option value="primary">Primary key</option><option value="foreign">Foreign key</option>
+                          onChange={event => {
+                            const newKey = event.target.value;
+                            const autoNotNull = newKey === 'primary' || newKey === 'primary_foreign';
+                            updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? {
+                              ...item,
+                              key: newKey,
+                              nullable: autoNotNull ? false : item.nullable,
+                            } : item), true);
+                          }}>
+                          <option value="none">Regular</option>
+                          <option value="primary">PK</option>
+                          <option value="foreign">FK</option>
+                          <option value="primary_foreign">PK, FK</option>
+                          <option value="unique">UK</option>
                         </select>
+                        <div className="shape-property-column-subfields">
+                          <label title="Not Null constraint">
+                            <input
+                              type="checkbox"
+                              checked={column.nullable === false || column.key === 'primary' || column.key === 'primary_foreign'}
+                              disabled={column.key === 'primary' || column.key === 'primary_foreign'}
+                              onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, nullable: !event.target.checked } : item), true)}
+                            />
+                            <span>NN</span>
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="DEFAULT expr"
+                            value={column.default ?? ''}
+                            title="Default expression (e.g. CURRENT_TIMESTAMP, 0, 'active')"
+                            onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, default: event.target.value } : item), false)}
+                            onBlur={() => updateTableData(tableColumns, true)}
+                          />
+                        </div>
                       </div>
-                      <button type="button" onClick={() => updateTableData(tableColumns.filter((_, itemIndex) => itemIndex !== index), true)}
-                        aria-label={`Remove column ${index + 1}`} title="Remove column"><X size={13} /></button>
+                      <div className="shape-property-column-actions">
+                        <button
+                          type="button"
+                          disabled={index === 0}
+                          onClick={() => moveTableColumn(index, -1)}
+                          title="Move column up"
+                          aria-label={`Move column ${index + 1} up`}
+                        >
+                          <ArrowUp size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={index === tableColumns.length - 1}
+                          onClick={() => moveTableColumn(index, 1)}
+                          title="Move column down"
+                          aria-label={`Move column ${index + 1} down`}
+                        >
+                          <ArrowDown size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateTableData(tableColumns.filter((_, itemIndex) => itemIndex !== index), true)}
+                          aria-label={`Remove column ${index + 1}`}
+                          title="Remove column"
+                          style={{ color: '#ef4444' }}
+                        >
+                          <X size={11} />
+                        </button>
+                      </div>
                     </div>)}
-                    <button type="button" className="shape-property-add" onClick={() => updateTableData([...tableColumns, {
-                      id: `column-${Date.now()}`, name: `column_${tableColumns.length + 1}`, type: 'text', key: 'none',
-                    }], true)}>Add column</button>
                   </section>}
 
                   {(selectedDiagram?.shapeId === 'uml.use-case' || selectedDiagram?.shapeId === 'uml.use-case-ext') && <section className="shape-property-section uml-usecase-editor" data-uml-usecase-editor>
@@ -2865,6 +3221,65 @@ export default function App() {
             </div>
           </div>
         </>
+      )}
+
+      {ddlModalData && createPortal(
+        <div className="ddl-modal-backdrop" onClick={() => setDdlModalData(null)}>
+          <div className="ddl-modal-card" onClick={e => e.stopPropagation()}>
+            <div className="ddl-modal-header">
+              <h3>
+                <Database size={16} color="#2563eb" />
+                SQL DDL Generator — {ddlModalData.tableName}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setDdlModalData(null)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b' }}
+                aria-label="Close DDL modal"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="ddl-modal-tabs">
+              {(['postgresql', 'mysql', 'sqlite'] as const).map(d => (
+                <button
+                  key={d}
+                  type="button"
+                  className={`ddl-modal-tab ${ddlDialect === d ? 'active' : ''}`}
+                  onClick={() => setDdlDialect(d)}
+                >
+                  {d === 'postgresql' ? 'PostgreSQL' : d === 'mysql' ? 'MySQL' : 'SQLite'}
+                </button>
+              ))}
+            </div>
+            <pre className="ddl-modal-code">
+              {generateTableDdl(ddlModalData.tableName, ddlModalData.columns, ddlDialect)}
+            </pre>
+            <div className="ddl-modal-footer">
+              <button
+                type="button"
+                className="shape-preset-btn"
+                onClick={() => setDdlModalData(null)}
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                className="shape-preset-btn is-action"
+                onClick={() => {
+                  const sql = generateTableDdl(ddlModalData.tableName, ddlModalData.columns, ddlDialect);
+                  navigator.clipboard.writeText(sql);
+                  setDdlCopied(true);
+                  setTimeout(() => setDdlCopied(false), 2000);
+                }}
+              >
+                {ddlCopied ? <Check size={12} /> : <Copy size={12} />}
+                {ddlCopied ? 'Copied!' : 'Copy SQL'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       <BoardStatusBanner />

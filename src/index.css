@@ -762,6 +762,176 @@ button:disabled { cursor: not-allowed; }
 .shape-property-column-fields { display: grid; flex: 1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 5px; }
 .shape-property-column-fields select { grid-column: 1 / -1; }
 .shape-property-column-fields input, .shape-property-column-fields select { min-height: 30px; padding: 5px 7px; font-size: 11px; }
+
+.shape-property-column-fields-v2 {
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 0.9fr);
+  gap: 5px;
+}
+.shape-property-column-subfields {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.shape-property-column-subfields label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--aw-ink-soft);
+  cursor: pointer;
+}
+.shape-property-column-subfields input[type="text"] {
+  flex: 1;
+  min-height: 26px;
+  padding: 3px 6px;
+  font-size: 10.5px;
+}
+.shape-property-column-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.shape-property-column-actions button {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--aw-ink-soft);
+  background: #fff;
+  border: 1px solid var(--aw-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.shape-property-column-actions button:hover:not(:disabled) {
+  background: var(--aw-surface-soft);
+}
+.shape-property-column-actions button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.shape-property-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+}
+.shape-preset-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 550;
+  color: #1e293b;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.shape-preset-btn:hover {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+}
+.shape-preset-btn.is-action {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+}
+.shape-preset-btn.is-action:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
+/* DDL Modal */
+.ddl-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(4px);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.ddl-modal-card {
+  width: 100%;
+  max-width: 640px;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+}
+.ddl-modal-header {
+  padding: 14px 18px;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #f8fafc;
+}
+.ddl-modal-header h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: #0f172a;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ddl-modal-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 18px;
+  background: #f1f5f9;
+  border-bottom: 1px solid #e2e8f0;
+}
+.ddl-modal-tab {
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 550;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+}
+.ddl-modal-tab.active {
+  background: #ffffff;
+  color: #2563eb;
+  border-color: #cbd5e1;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+}
+.ddl-modal-code {
+  margin: 0;
+  padding: 16px 18px;
+  background: #0f172a;
+  color: #f8fafc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-x: auto;
+  max-height: 380px;
+}
+.ddl-modal-footer {
+  padding: 12px 18px;
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  background: #f8fafc;
+}
+
 .uml-classifier-compartment { display: flex; flex-direction: column; gap: 8px; padding: 8px; background: var(--aw-surface-soft); border: 1px solid var(--aw-border); border-radius: 9px; }
 .uml-classifier-compartment-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--aw-ink); font-size: 12px; }
 .uml-classifier-member { display: flex; flex-direction: column; gap: 8px; padding: 8px; background: #fff; border: 1px solid var(--aw-border); border-radius: 8px; }
