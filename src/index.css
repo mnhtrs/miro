@@ -314,6 +314,50 @@ button:disabled { cursor: not-allowed; }
   color: #64748b;
   padding-right: 4px;
 }
+.presence-alone-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 4px;
+}
+.presence-alone-dot {
+  width: 6.5px;
+  height: 6.5px;
+  border-radius: 50%;
+  background-color: #10b981;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25);
+}
+.presence-alone-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+/* ── Miro-style Realtime Remote Cursors ── */
+.remote-cursor-container {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  user-select: none;
+}
+.remote-cursor-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 1px;
+  margin-left: 12px;
+  padding: 2.5px 8px 2.5px 8px;
+  border-radius: 0 8px 8px 8px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  pointer-events: none;
+}
+
 
 .header-actions {
   display: flex;

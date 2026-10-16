@@ -2695,6 +2695,10 @@ export class CanvasEngine {
     this.setCamera(this.cam.x+dx/this.cam.zoom, this.cam.y+dy/this.cam.zoom, this.cam.zoom);
   }
 
+  panTo(worldX: number, worldY: number) {
+    this.setCamera(worldX, worldY, this.cam.zoom);
+  }
+
   // ─── public API ──────────────────────────────────────────────────────────
   private cursorForTool(): string {
     if (this.tool === 'select') return 'default';

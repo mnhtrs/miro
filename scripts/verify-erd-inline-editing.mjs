@@ -5,7 +5,8 @@ async function main() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
-  await page.goto('http://localhost:5175/', { waitUntil: 'networkidle' });
+  const baseUrl = (process.env.APP_URL || process.env.BASE_URL || `http://127.0.0.1:${process.env.PORT || 5175}`).replace(/\/$/, '');
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
   await page.waitForSelector('.canvas-workspace', { timeout: 10000 });
   await page.waitForFunction(() => Boolean(window.eng), { timeout: 10000 });
   await page.waitForTimeout(500);

@@ -25,6 +25,15 @@ import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
   continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, subscribeBoardRuntimeStatus, yShapes,
 } from './store/useBoardStore';
+import { RemoteCursorsOverlay } from './components/collab/RemoteCursorsOverlay';
+import {
+  broadcastCollabCursor,
+  getCollabPeers,
+  getLocalCollabUser,
+  subscribeCollabPresence,
+  type CollabPeer,
+  type CollabUser,
+} from './store/collabPresence';
 import BoardStatusBanner from './store/BoardStatusBanner';
 import FormulaEditor from './formula/FormulaEditor';
 import FormulaEditorBoundary from './formula/FormulaEditorBoundary';
@@ -393,6 +402,17 @@ export default function App() {
   const [ddlModalData, setDdlModalData] = useState<{ tableName: string; columns: TableColumnModel[] } | null>(null);
   const [ddlDialect, setDdlDialect] = useState<DdlDialect>('postgresql');
   const [ddlCopied, setDdlCopied] = useState(false);
+
+  // Real-time Anonymous User & Presence
+  const [collabUser, setCollabUser] = useState<CollabUser | null>(() => getLocalCollabUser());
+  const [collabPeers, setCollabPeers] = useState<CollabPeer[]>(() => getCollabPeers());
+
+  useEffect(() => {
+    return subscribeCollabPresence(() => {
+      setCollabUser(getLocalCollabUser());
+      setCollabPeers(getCollabPeers());
+    });
+  }, []);
 
   // text/sticky edit overlay
   const [editShape, setEditShape] = useState<AnyShape | null>(null);
@@ -1049,10 +1069,31 @@ export default function App() {
     wrap.addEventListener('wheel', onWheel, { passive: false });
 
     // Window listeners keep drawing, erasing, and panning coherent outside the canvas bounds.
-    const onMove = (e: PointerEvent) => eng.pointerMove(e);
+    const onMove = (e: PointerEvent) => {
+      eng.pointerMove(e);
+      if (wrap) {
+        const rect = wrap.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          const world = eng.clientToWorld(e.clientX, e.clientY);
+          broadcastCollabCursor(world);
+        } else {
+          broadcastCollabCursor(null);
+        }
+      }
+    };
     const onUp = (e: PointerEvent) => eng.pointerUp(e);
-    const onCancel = (e: PointerEvent) => eng.cancelPointer(e);
-    const onBlur = () => eng.cancelPointer();
+    const onCancel = (e: PointerEvent) => {
+      eng.cancelPointer(e);
+      broadcastCollabCursor(null);
+    };
+    const onBlur = () => {
+      eng.cancelPointer();
+      broadcastCollabCursor(null);
+    };
+    const onLeave = () => {
+      broadcastCollabCursor(null);
+    };
+    wrap.addEventListener('pointerleave', onLeave);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onCancel);
@@ -1070,6 +1111,7 @@ export default function App() {
       ro.disconnect();
       window.removeEventListener('mousedown', h, true);
       wrap.removeEventListener('wheel', onWheel);
+      wrap.removeEventListener('pointerleave', onLeave);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onCancel);
@@ -1796,13 +1838,42 @@ export default function App() {
 
         <div className="header-spacer" />
 
-        <div className="header-presence" role="img" aria-label="Collaborators presence">
-          <div className="presence-avatars" aria-hidden="true">
-            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #6366f1, #4338ca)', zIndex: 3 }} title="Alex Rivera (Active)">AR</div>
-            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #10b981, #059669)', zIndex: 2 }} title="Sarah Chen (Active)">SC</div>
-            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #f59e0b, #d97706)', zIndex: 1 }} title="David Kim (Active)">DK</div>
-          </div>
-          <span className="presence-badge">+2</span>
+        <div className="header-presence" role="region" aria-label="Online collaborators">
+          {collabPeers.length === 0 ? (
+            <div className="presence-alone-indicator" title="You are currently the only collaborator in this room">
+              <span className="presence-alone-dot" />
+              <span className="presence-alone-label">Solo</span>
+            </div>
+          ) : (
+            <div className="presence-avatars">
+              {collabPeers.slice(0, 4).map((peer, idx) => (
+                <button
+                  key={peer.clientId}
+                  type="button"
+                  className="presence-avatar"
+                  style={{
+                    background: peer.user.gradient,
+                    zIndex: collabPeers.length - idx,
+                    border: '2px solid #ffffff',
+                    cursor: peer.cursor ? 'pointer' : 'default',
+                  }}
+                  title={`${peer.user.name} (Active)${peer.cursor ? ' — Click to jump to cursor' : ''}`}
+                  onClick={() => {
+                    if (peer.cursor && engRef.current) {
+                      engRef.current.panTo(peer.cursor.x, peer.cursor.y);
+                    }
+                  }}
+                >
+                  {peer.user.avatarLabel}
+                </button>
+              ))}
+            </div>
+          )}
+          {collabPeers.length > 4 && (
+            <span className="presence-badge" title={`${collabPeers.length - 4} more collaborators online`}>
+              +{collabPeers.length - 4}
+            </span>
+          )}
         </div>
 
         <span className="header-action-divider" aria-hidden="true" />
@@ -1818,8 +1889,16 @@ export default function App() {
             <Share2 size={13} strokeWidth={2.4} />
             <span className="header-action-label">Share</span>
           </button>
-          <div className="header-user-avatar" title="Your Profile (Online)" aria-hidden="true">
-            <span>U</span>
+          <div
+            className="header-user-avatar"
+            style={{
+              background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)',
+              color: '#ffffff',
+            }}
+            title={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
+            aria-label={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
+          >
+            <span>{collabUser ? collabUser.avatarLabel : 'U'}</span>
             <span className="header-user-online-dot" />
           </div>
         </div>
@@ -2071,6 +2150,8 @@ export default function App() {
             aria-label="Whiteboard canvas. Use the tool rail or keyboard shortcuts to choose tools. Right-drag to pan, scroll to zoom at the pointer, and use arrow keys to pan when no object is selected."
             style={{ cursor: renderedCursor, position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
           />
+
+          <RemoteCursorsOverlay engine={engRef.current} camera={cam} />
 
           {(!boardReady || boardRestoreError) && (
             <div role={boardRestoreError ? 'alert' : 'status'} aria-live="polite" style={{ position: 'absolute', inset: 0, zIndex: 2000,
