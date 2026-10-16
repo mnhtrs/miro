@@ -17,15 +17,35 @@ export interface CollabCursor {
   lastUpdate: number;
 }
 
+export interface CollabReaction {
+  id: string;
+  emoji: string;
+  x: number;
+  y: number;
+  timestamp: number;
+}
+
+export interface CollabPresenter {
+  active: boolean;
+  x: number;
+  y: number;
+  zoom: number;
+  presenterName: string;
+}
+
 export interface CollabAwarenessState {
   user?: CollabUser;
   cursor?: CollabCursor | null;
+  reaction?: CollabReaction | null;
+  presenter?: CollabPresenter | null;
 }
 
 export interface CollabPeer {
   clientId: number;
   user: CollabUser;
   cursor: CollabCursor | null;
+  reaction?: CollabReaction | null;
+  presenter?: CollabPresenter | null;
 }
 
 export const COLLAB_PALETTE = [
@@ -307,6 +327,18 @@ export function getLocalCollabUser(): CollabUser | null {
   return localCollabUser;
 }
 
+export function getLocalCollabReaction(): CollabReaction | null {
+  if (!activeAwareness) return null;
+  const s = activeAwareness.getLocalState() as CollabAwarenessState | undefined;
+  return s?.reaction ?? null;
+}
+
+export function getLocalCollabPresenter(): CollabPresenter | null {
+  if (!activeAwareness) return null;
+  const s = activeAwareness.getLocalState() as CollabAwarenessState | undefined;
+  return s?.presenter ?? null;
+}
+
 export function getCollabPeers(): CollabPeer[] {
   if (!activeAwareness) return [];
   const myId = activeAwareness.clientID;
@@ -321,12 +353,36 @@ export function getCollabPeers(): CollabPeer[] {
         clientId,
         user: s.user,
         cursor: s.cursor ?? null,
+        reaction: s.reaction ?? null,
+        presenter: s.presenter ?? null,
       });
     }
   });
 
   peers.sort((a, b) => a.user.anonymousNumber - b.user.anonymousNumber);
   return peers;
+}
+
+export function broadcastCollabReaction(emoji: string, worldPos: { x: number; y: number }) {
+  if (!activeAwareness) return;
+  const reaction: CollabReaction = {
+    id: `react-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    emoji,
+    x: Math.round(worldPos.x * 10) / 10,
+    y: Math.round(worldPos.y * 10) / 10,
+    timestamp: Date.now(),
+  };
+  activeAwareness.setLocalStateField('reaction', reaction);
+  setTimeout(() => {
+    if (activeAwareness?.getLocalState()?.reaction?.id === reaction.id) {
+      activeAwareness.setLocalStateField('reaction', null);
+    }
+  }, 2800);
+}
+
+export function broadcastCollabPresenter(state: CollabPresenter | null) {
+  if (!activeAwareness) return;
+  activeAwareness.setLocalStateField('presenter', state);
 }
 
 export function broadcastCollabCursor(worldPos: { x: number; y: number } | null) {

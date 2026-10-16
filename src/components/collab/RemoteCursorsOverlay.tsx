@@ -1,6 +1,12 @@
 import { useEffect, useState, useMemo } from 'react';
 import type { CanvasEngine } from '../../engine/CanvasEngine';
-import { getCollabPeers, subscribeCollabPresence, type CollabPeer } from '../../store/collabPresence';
+import {
+  getCollabPeers,
+  getLocalCollabReaction,
+  subscribeCollabPresence,
+  type CollabPeer,
+  type CollabReaction,
+} from '../../store/collabPresence';
 
 export interface RemoteCursorsOverlayProps {
   engine: CanvasEngine | null;
@@ -9,10 +15,12 @@ export interface RemoteCursorsOverlayProps {
 
 export function RemoteCursorsOverlay({ engine, camera }: RemoteCursorsOverlayProps) {
   const [peers, setPeers] = useState<CollabPeer[]>(() => getCollabPeers());
+  const [localReaction, setLocalReaction] = useState<CollabReaction | null>(() => getLocalCollabReaction());
 
   useEffect(() => {
     return subscribeCollabPresence(() => {
       setPeers(getCollabPeers());
+      setLocalReaction(getLocalCollabReaction());
     });
   }, []);
 
@@ -42,7 +50,39 @@ export function RemoteCursorsOverlay({ engine, camera }: RemoteCursorsOverlayPro
       .filter(item => item.isVisible);
   }, [peers, engine, camera]);
 
-  if (activeCursors.length === 0) return null;
+  const activeReactions = useMemo(() => {
+    if (!engine) return [];
+    const now = Date.now();
+    const list: Array<{ id: string; emoji: string; screenX: number; screenY: number }> = [];
+
+    // Peer reactions
+    for (const p of peers) {
+      if (p.reaction && now - p.reaction.timestamp < 2800) {
+        const clientPos = engine.worldToClient(p.reaction.x, p.reaction.y);
+        list.push({
+          id: p.reaction.id,
+          emoji: p.reaction.emoji,
+          screenX: clientPos.x,
+          screenY: clientPos.y,
+        });
+      }
+    }
+
+    // Local reaction
+    if (localReaction && now - localReaction.timestamp < 2800) {
+      const clientPos = engine.worldToClient(localReaction.x, localReaction.y);
+      list.push({
+        id: localReaction.id,
+        emoji: localReaction.emoji,
+        screenX: clientPos.x,
+        screenY: clientPos.y,
+      });
+    }
+
+    return list;
+  }, [peers, localReaction, engine, camera]);
+
+  if (activeCursors.length === 0 && activeReactions.length === 0) return null;
 
   return (
     <div
@@ -102,6 +142,22 @@ export function RemoteCursorsOverlay({ engine, camera }: RemoteCursorsOverlayPro
           >
             <span className="remote-cursor-name">{peer.user.name}</span>
           </div>
+        </div>
+      ))}
+
+      {/* Miro-style Floating Animated Reactions */}
+      {activeReactions.map(r => (
+        <div
+          key={r.id}
+          className="floating-reaction"
+          style={{
+            position: 'absolute',
+            left: r.screenX,
+            top: r.screenY,
+            pointerEvents: 'none',
+          }}
+        >
+          <span className="floating-reaction-emoji">{r.emoji}</span>
         </div>
       ))}
     </div>

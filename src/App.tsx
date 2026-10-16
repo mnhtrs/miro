@@ -6,7 +6,7 @@ import {
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
   Copy, Trash2, Palette, X, ChevronDown, Check, Search,
-  Code, Calculator, LassoSelect, Star, Clock, Database, Plus, ArrowUp, ArrowDown
+  Code, Calculator, LassoSelect, Star, Clock, Database, Plus, ArrowUp, ArrowDown, Smile
 } from 'lucide-react';
 import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
@@ -28,6 +28,8 @@ import {
 import { RemoteCursorsOverlay } from './components/collab/RemoteCursorsOverlay';
 import {
   broadcastCollabCursor,
+  broadcastCollabPresenter,
+  broadcastCollabReaction,
   getCollabPeers,
   getLocalCollabUser,
   subscribeCollabPresence,
@@ -405,13 +407,85 @@ export default function App() {
 
   // Real-time Anonymous User & Presence
   const [collabUser, setCollabUser] = useState<CollabUser | null>(() => getLocalCollabUser());
+  const collabUserRef = useRef(collabUser);
+  collabUserRef.current = collabUser;
   const [collabPeers, setCollabPeers] = useState<CollabPeer[]>(() => getCollabPeers());
+
+  // Miro-standard Follow Collaborator Mode ("Screen Following")
+  const [followingPeerId, setFollowingPeerId] = useState<number | null>(null);
+  const followingPeerIdRef = useRef(followingPeerId);
+  followingPeerIdRef.current = followingPeerId;
+
+  // Miro-standard Presenter Mode ("Bring Everyone to Me")
+  const [isPresenting, setIsPresenting] = useState(false);
+  const isPresentingRef = useRef(isPresenting);
+  isPresentingRef.current = isPresenting;
+  const [followingPresenter, setFollowingPresenter] = useState(true);
+
+  // Live Floating Emoji Reactions
+  const [showReactionPicker, setShowReactionPicker] = useState(false);
+  const lastMouseWorldPosRef = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     return subscribeCollabPresence(() => {
       setCollabUser(getLocalCollabUser());
       setCollabPeers(getCollabPeers());
     });
+  }, []);
+
+  const followingPeer = collabPeers.find(p => p.clientId === followingPeerId);
+  const activeRemotePresenter = collabPeers.find(p => p.presenter && p.presenter.active);
+
+  // Auto track followed collaborator's cursor/position
+  useEffect(() => {
+    if (!followingPeerId || !engRef.current) return;
+    const target = collabPeers.find(p => p.clientId === followingPeerId);
+    if (!target) {
+      setFollowingPeerId(null);
+      return;
+    }
+    if (target.cursor) {
+      engRef.current.panTo(target.cursor.x, target.cursor.y);
+    }
+  }, [followingPeerId, collabPeers]);
+
+  // Auto track remote presenter's camera
+  useEffect(() => {
+    if (!activeRemotePresenter?.presenter || !followingPresenter || !engRef.current) return;
+    const p = activeRemotePresenter.presenter;
+    engRef.current.setCamera(p.x, p.y, p.zoom);
+  }, [activeRemotePresenter?.presenter, followingPresenter]);
+
+  const togglePresenting = useCallback(() => {
+    setIsPresenting(prev => {
+      const next = !prev;
+      if (next) {
+        if (engRef.current && collabUserRef.current) {
+          broadcastCollabPresenter({
+            active: true,
+            x: Math.round(engRef.current.cam.x * 10) / 10,
+            y: Math.round(engRef.current.cam.y * 10) / 10,
+            zoom: Math.round(engRef.current.cam.zoom * 100) / 100,
+            presenterName: collabUserRef.current.name,
+          });
+        }
+      } else {
+        broadcastCollabPresenter(null);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSendReaction = useCallback((emoji: string) => {
+    const eng = engRef.current;
+    let worldPos = lastMouseWorldPosRef.current;
+    if (!worldPos && eng) {
+      worldPos = eng.clientToWorld(window.innerWidth / 2, window.innerHeight / 2);
+    }
+    if (worldPos) {
+      broadcastCollabReaction(emoji, worldPos);
+    }
+    setShowReactionPicker(false);
   }, []);
 
   // text/sticky edit overlay
@@ -758,8 +832,35 @@ export default function App() {
     eng.onGraphUpdate = diagnostics => setGraphDiagnostics(diagnostics);
     setGraphDiagnostics(eng.getDiagramGraphDiagnostics());
     eng.onCursor = setCursor;
-    eng.onCameraChange = (c) => { setCam(c); setZoom(c.zoom); };
-    eng.onZoom = (z) => { setZoom(z); setCam(prev => ({ ...prev, zoom: z })); };
+    eng.onCameraChange = (c) => {
+      setCam(c);
+      setZoom(c.zoom);
+      if (isPresentingRef.current && collabUserRef.current) {
+        broadcastCollabPresenter({
+          active: true,
+          x: Math.round(c.x * 10) / 10,
+          y: Math.round(c.y * 10) / 10,
+          zoom: Math.round(c.zoom * 100) / 100,
+          presenterName: collabUserRef.current.name,
+        });
+      }
+    };
+    eng.onZoom = (z) => {
+      setZoom(z);
+      setCam(prev => {
+        const next = { ...prev, zoom: z };
+        if (isPresentingRef.current && collabUserRef.current) {
+          broadcastCollabPresenter({
+            active: true,
+            x: Math.round(next.x * 10) / 10,
+            y: Math.round(next.y * 10) / 10,
+            zoom: Math.round(z * 100) / 100,
+            presenterName: collabUserRef.current.name,
+          });
+        }
+        return next;
+      });
+    };
     eng.onTool = t => {
       setToolSt(t);
       if (t === 'select' || t === 'lasso-select') setLastSelectTool(t);
@@ -1060,6 +1161,7 @@ export default function App() {
       const target = e.target as HTMLElement | null;
       if (target?.closest('.no-canvas, .panel-ui, .toolbar, .popover, .formula-editor-panel, .math-tools-panel, .code-editor-shell, .board-sticky-overlay, .board-code-preview, input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
       if (!e.deltaY) return;
+      if (followingPeerIdRef.current) setFollowingPeerId(null);
       const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? wrap.clientHeight : 1;
       const delta = Math.max(-160, Math.min(160, e.deltaY * unit));
       const factor = Math.max(0.8, Math.min(1.25, Math.exp(-delta * 0.00125)));
@@ -1075,6 +1177,7 @@ export default function App() {
         const rect = wrap.getBoundingClientRect();
         if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
           const world = eng.clientToWorld(e.clientX, e.clientY);
+          lastMouseWorldPosRef.current = world;
           broadcastCollabCursor(world);
         } else {
           broadcastCollabCursor(null);
@@ -1846,27 +1949,37 @@ export default function App() {
             </div>
           ) : (
             <div className="presence-avatars">
-              {collabPeers.slice(0, 4).map((peer, idx) => (
-                <button
-                  key={peer.clientId}
-                  type="button"
-                  className="presence-avatar"
-                  style={{
-                    background: peer.user.gradient,
-                    zIndex: collabPeers.length - idx,
-                    border: '2px solid #ffffff',
-                    cursor: peer.cursor ? 'pointer' : 'default',
-                  }}
-                  title={`${peer.user.name} (Active)${peer.cursor ? ' — Click to jump to cursor' : ''}`}
-                  onClick={() => {
-                    if (peer.cursor && engRef.current) {
-                      engRef.current.panTo(peer.cursor.x, peer.cursor.y);
-                    }
-                  }}
-                >
-                  {peer.user.avatarLabel}
-                </button>
-              ))}
+              {collabPeers.slice(0, 4).map((peer, idx) => {
+                const isFollowed = followingPeerId === peer.clientId;
+                return (
+                  <button
+                    key={peer.clientId}
+                    type="button"
+                    className={`presence-avatar ${isFollowed ? 'is-following' : ''}`}
+                    style={{
+                      background: peer.user.gradient,
+                      zIndex: collabPeers.length - idx,
+                      border: isFollowed ? '2px solid #3b82f6' : '2px solid #ffffff',
+                      cursor: 'pointer',
+                    }}
+                    title={`${peer.user.name} (Active) — ${isFollowed ? 'Click to stop following' : 'Click to follow screen'}`}
+                    aria-label={`${peer.user.name} — ${isFollowed ? 'Stop following' : 'Follow screen'}`}
+                    aria-pressed={isFollowed}
+                    onClick={() => {
+                      if (isFollowed) {
+                        setFollowingPeerId(null);
+                      } else {
+                        setFollowingPeerId(peer.clientId);
+                        if (peer.cursor && engRef.current) {
+                          engRef.current.panTo(peer.cursor.x, peer.cursor.y);
+                        }
+                      }
+                    }}
+                  >
+                    {peer.user.avatarLabel}
+                  </button>
+                );
+              })}
             </div>
           )}
           {collabPeers.length > 4 && (
@@ -1879,10 +1992,16 @@ export default function App() {
         <span className="header-action-divider" aria-hidden="true" />
 
         <div className="header-actions">
-          <button type="button" disabled title="Presentation is not available yet" aria-label="Present (not available yet)"
-            className="header-action header-action-secondary">
+          <button
+            type="button"
+            onClick={togglePresenting}
+            title={isPresenting ? 'Stop presenting board to collaborators' : 'Present board to everyone (Bring everyone to me)'}
+            aria-label={isPresenting ? 'Stop presenting' : 'Start presenting'}
+            aria-pressed={isPresenting}
+            className={`header-action header-action-secondary ${isPresenting ? 'is-presenting' : ''}`}
+          >
             <Play size={13} strokeWidth={2.4} className="fill-current" />
-            <span className="header-action-label">Present</span>
+            <span className="header-action-label">{isPresenting ? 'Stop' : 'Present'}</span>
           </button>
           <button type="button" disabled title="Sharing is not available yet" aria-label="Share (not available yet)"
             className="header-action header-action-share">
@@ -1903,6 +2022,52 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Miro-style Collaborative Follow & Presenter Floating Overlays */}
+      {followingPeer && (
+        <div className="following-collab-pill" role="status" aria-live="polite">
+          <span className="following-pulse-dot" style={{ backgroundColor: followingPeer.user.color }} />
+          <span>Following <strong>{followingPeer.user.name}</strong></span>
+          <button
+            type="button"
+            className="following-stop-btn"
+            onClick={() => setFollowingPeerId(null)}
+            aria-label="Stop following collaborator"
+          >
+            Stop
+          </button>
+        </div>
+      )}
+
+      {isPresenting && (
+        <div className="presenting-indicator-pill" role="status" aria-live="polite">
+          <span className="presenting-pulse-dot" />
+          <span>You are presenting to everyone</span>
+          <button
+            type="button"
+            className="presenting-stop-btn"
+            onClick={togglePresenting}
+            aria-label="Stop presenting"
+          >
+            Stop
+          </button>
+        </div>
+      )}
+
+      {!isPresenting && activeRemotePresenter?.presenter && followingPresenter && (
+        <div className="presenting-indicator-pill" role="status" aria-live="polite">
+          <span className="presenting-pulse-dot" />
+          <span><strong>{activeRemotePresenter.user.name}</strong> is presenting</span>
+          <button
+            type="button"
+            className="presenting-stop-btn"
+            onClick={() => setFollowingPresenter(false)}
+            aria-label="Leave presentation"
+          >
+            Leave
+          </button>
+        </div>
+      )}
 
       {/* ══ BODY ════════════════════════════════════════════════════════════ */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -2136,6 +2301,7 @@ export default function App() {
               const rect = sticky.getBoundingClientRect();
               if (e.clientX >= rect.right - 20) return;
             }
+            if (followingPeerIdRef.current) setFollowingPeerId(null);
             eng.pointerDown(e.nativeEvent);
           }}
           onDoubleClick={e => engRef.current?.doubleClick(e.nativeEvent)}
@@ -3173,15 +3339,46 @@ export default function App() {
               )}
             </div>
 
-            <div className="zoom-controls flex items-center bg-white rounded-lg border border-gray-200 overflow-hidden">
-              <button type="button" onClick={resetZoom} title="Reset zoom to 100%" aria-label="Reset zoom to 100 percent"
-                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors border-r border-gray-200"><Maximize2 size={14} /></button>
-              <button type="button" onClick={() => zoomBy(-0.2)} title="Zoom out" aria-label="Zoom out"
-                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors"><ZoomOut size={15} /></button>
-              <button type="button" onClick={resetZoom} aria-label={`Zoom level ${Math.round(zoom * 100)} percent; reset zoom`}
-                className="zoom-percent-button h-9 px-2 min-w-[52px] text-[12px] font-semibold text-gray-800 hover:bg-gray-50 transition-colors tabular-nums">{Math.round(zoom * 100)}%</button>
-              <button type="button" onClick={() => zoomBy(0.2)} title="Zoom in" aria-label="Zoom in"
-                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors border-l border-gray-200"><ZoomIn size={15} /></button>
+            <div className="hud-zoom-group">
+              {/* Live Floating Reaction Picker */}
+              <div className="reaction-trigger-container relative">
+                <button
+                  type="button"
+                  onClick={() => setShowReactionPicker(prev => !prev)}
+                  title="Send emoji reaction"
+                  aria-label="Send emoji reaction"
+                  aria-expanded={showReactionPicker}
+                  className="reaction-trigger-btn"
+                >
+                  <Smile size={16} strokeWidth={2} />
+                </button>
+                {showReactionPicker && (
+                  <div className="reaction-picker-bar absolute bottom-11 right-0 z-50">
+                    {['❤️', '👍', '🔥', '🎉', '🚀', '👏', '😂', '💡', '✨'].map(emoji => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        className="reaction-emoji-btn"
+                        onClick={() => handleSendReaction(emoji)}
+                        aria-label={`Send ${emoji} reaction`}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="zoom-controls flex items-center bg-white rounded-lg border border-gray-200 overflow-hidden">
+                <button type="button" onClick={resetZoom} title="Reset zoom to 100%" aria-label="Reset zoom to 100 percent"
+                  className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors border-r border-gray-200"><Maximize2 size={14} /></button>
+                <button type="button" onClick={() => zoomBy(-0.2)} title="Zoom out" aria-label="Zoom out"
+                  className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors"><ZoomOut size={15} /></button>
+                <button type="button" onClick={resetZoom} aria-label={`Zoom level ${Math.round(zoom * 100)} percent; reset zoom`}
+                  className="zoom-percent-button h-9 px-2 min-w-[52px] text-[12px] font-semibold text-gray-800 hover:bg-gray-50 transition-colors tabular-nums">{Math.round(zoom * 100)}%</button>
+                <button type="button" onClick={() => zoomBy(0.2)} title="Zoom in" aria-label="Zoom in"
+                  className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors border-l border-gray-200"><ZoomIn size={15} /></button>
+              </div>
             </div>
           </div>
         </div>
