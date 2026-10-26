@@ -339,6 +339,22 @@ export class CanvasEngine {
   public onCursor?:   (cursor:string) => void;
   public onTool?:     (tool:ToolType) => void;
 
+  // Dedicated high-frequency render-frame camera listeners (decoupled from React state updates)
+  private cameraFrameListeners = new Set<(cam: Camera) => void>();
+
+  public addCameraFrameListener(cb: (cam: Camera) => void): () => void {
+    this.cameraFrameListeners.add(cb);
+    return () => {
+      this.cameraFrameListeners.delete(cb);
+    };
+  }
+
+  private notifyCameraFrame() {
+    for (const cb of this.cameraFrameListeners) {
+      try { cb(this.cam); } catch (e) { console.error('Camera frame listener error:', e); }
+    }
+  }
+
   private undoManager!: Y.UndoManager;
   private readonly loadMigrationOrigin = { source: 'uml-foundation-load-migration' };
   private readonly remoteRepairOrigin = { source: 'canvas-engine-remote-repair' };
@@ -506,6 +522,41 @@ export class CanvasEngine {
   worldToClient(worldX: number, worldY: number) {
     const pixel = this.worldToCanvas(worldX, worldY);
     return this.canvasToClient(pixel.x, pixel.y);
+  }
+
+  // world → CSS coordinates relative to an overlay container element inside the canvas workspace.
+  // Directly projects through the camera transform, scales backing buffer coordinates to display CSS pixels,
+  // and compensates for any origin offset between canvas and overlay.
+  worldToOverlay(worldX: number, worldY: number, overlayElement?: HTMLElement | null): { x: number; y: number } {
+    const pixel = this.worldToCanvas(worldX, worldY);
+    const cvRect = this.cv.getBoundingClientRect();
+    const scaleX = this.cv.width > 0 ? cvRect.width / this.cv.width : 1;
+    const scaleY = this.cv.height > 0 ? cvRect.height / this.cv.height : 1;
+
+    let originOffsetX = 0;
+    let originOffsetY = 0;
+    if (overlayElement) {
+      const oRect = overlayElement.getBoundingClientRect();
+      originOffsetX = cvRect.left - oRect.left;
+      originOffsetY = cvRect.top - oRect.top;
+    }
+
+    return {
+      x: pixel.x * scaleX + originOffsetX,
+      y: pixel.y * scaleY + originOffsetY,
+    };
+  }
+
+  /**
+   * Returns true only when a continuous drawing/creation gesture is actively in progress.
+   * Explicitly excludes selection dragging, shape resizing, box selection, lasso, and panning.
+   */
+  public isDrawingActive(): boolean {
+    if (!this.isDown) return false;
+    if (this.tool === 'pen' && this.currId !== null) return true;
+    if (this.currId !== null && (isBoxShapeTool(this.tool) || isConnectorTool(this.tool))) return true;
+    if (this.solidCreationGesture !== null) return true;
+    return false;
   }
 
   // ─── pointer events (called with raw DOM events from window listener) ───
@@ -1173,6 +1224,7 @@ export class CanvasEngine {
       this.isPanning = false;
       this.panButton = null;
       this.activePointerId = null;
+      this.onCameraChange?.(this.cam);
       this.onCursor?.(this.cursorForTool());
       return;
     }
@@ -2688,6 +2740,7 @@ export class CanvasEngine {
     this.onZoom?.(zoom);
     this.onCam?.(this.cam);
     this.onCameraChange?.(this.cam);
+    this.notifyCameraFrame();
     this.dirty = true;
   }
 
@@ -2749,7 +2802,12 @@ export class CanvasEngine {
   cancelPointer(event?: PointerEvent) {
     if (event && this.activePointerId !== null && Number.isFinite(event.pointerId) && event.pointerId !== this.activePointerId) return;
     if (this.isErasing) this.finishErasing();
-    if (this.isPanning) { this.isPanning = false; this.panButton = null; }
+    if (this.isPanning) {
+      this.isPanning = false;
+      this.panButton = null;
+      this.onCameraChange?.(this.cam);
+      this.onCam?.(this.cam);
+    }
     if (this.solidTransformGesture) this.put(this.solidTransformGesture.original);
     if (this.isResizing && this.resizeRef?.s) this.put(this.resizeRef.s as AnyShape);
     if (this.isDragging) {
@@ -4038,19 +4096,24 @@ export class CanvasEngine {
     return true;
   }
 
-  updateFormulaLive(id: string, source: string, lastValidPreview: string, notify = true) {
+  updateFormulaLive(id: string, source: string, lastValidPreview: string, size?: { width: number; height: number }, notify = true) {
     const shape = this.shapes.get(id);
-    if (!shape || shape.type !== 'math' || (shape.text === source && shape.previewText === lastValidPreview)) return;
-    this.put({ ...shape, text: source, previewText: lastValidPreview }, {
+    if (!shape || shape.type !== 'math') return;
+    const width = size && Number.isFinite(size.width) && size.width > 0 ? size.width : shape.w;
+    const height = size && Number.isFinite(size.height) && size.height > 0 ? size.height : shape.h;
+    if (shape.text === source && shape.previewText === lastValidPreview && shape.w === width && shape.h === height) return;
+    this.put({ ...shape, text: source, previewText: lastValidPreview, w: width, h: height }, {
       redraw: id !== this.editingId,
       notify,
     });
   }
 
-  updateFormula(id: string, source: string, lastValidPreview: string) {
+  updateFormula(id: string, source: string, lastValidPreview: string, size?: { width: number; height: number }) {
     const shape = this.shapes.get(id);
     if (!shape || shape.type !== 'math') return;
-    this.put({ ...shape, text: source, previewText: lastValidPreview });
+    const width = size && Number.isFinite(size.width) && size.width > 0 ? size.width : shape.w;
+    const height = size && Number.isFinite(size.height) && size.height > 0 ? size.height : shape.h;
+    this.put({ ...shape, text: source, previewText: lastValidPreview, w: width, h: height });
     // Keep the edit session open for a final formula-layout measurement from the overlay.
     // The first unrelated tracked write starts a new item; undo/redo may also close it.
     this.pendingFormulaCaptureId = id;
@@ -5881,6 +5944,7 @@ export class CanvasEngine {
     this.undoManager.clear();
     this.remoteDeletedKeys.clear();
     this.codePreviewCache.clear();
+    this.cameraFrameListeners.clear();
     this.overlayDiv?.remove();
   }
 
@@ -5954,7 +6018,7 @@ export class CanvasEngine {
 
     // Update overlay transforms
     this.wrapperDiv.style.transform = `translate(${cv.width/2}px, ${cv.height/2}px) scale(${cam.zoom}) translate(${-cam.x}px, ${-cam.y}px)`;
-    this.onCameraChange?.(this.cam);
+    this.notifyCameraFrame();
     
     // Rebuild overlays only if necessary
     let overlayHtml = '';
@@ -5997,8 +6061,9 @@ export class CanvasEngine {
         } else if (s.type === 'math') {
           const source = s.text;
           const storedPreview = s.previewText;
+          const isNewDraft = storedPreview === '';
           const hasValidPreview = typeof storedPreview === 'string' && storedPreview.trim().length > 0;
-          const previewSource = hasValidPreview ? storedPreview : source;
+          const previewSource = hasValidPreview ? storedPreview : (isNewDraft ? '\\square' : (source || '\\square'));
           const stalePreview = hasValidPreview && previewSource !== source;
           try {
             const ast = parseTelex(previewSource);

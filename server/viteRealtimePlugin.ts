@@ -1,3 +1,4 @@
+import os from 'node:os';
 import { Hocuspocus } from '@hocuspocus/server';
 import { WebSocketServer } from 'ws';
 import type { Plugin } from 'vite';
@@ -8,6 +9,25 @@ export function hocuspocusPlugin(): Plugin {
   return {
     name: 'antiwhite-hocuspocus',
     configureServer(viteServer) {
+      viteServer.middlewares.use('/api/network-info', (_req, res) => {
+        try {
+          const interfaces = os.networkInterfaces();
+          const ips: string[] = [];
+          for (const devName of Object.keys(interfaces)) {
+            for (const iface of interfaces[devName] || []) {
+              if (iface.family === 'IPv4' && !iface.internal) {
+                ips.push(iface.address);
+              }
+            }
+          }
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ips, port: viteServer.config.server.port ?? 5175 }));
+        } catch {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ips: [], port: 5175 }));
+        }
+      });
+
       const httpServer = viteServer.httpServer;
       // Middleware-only Vite instances (for tests/tools) have no HTTP listener to attach to.
       if (!httpServer) return;

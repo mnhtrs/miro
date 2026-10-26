@@ -23,9 +23,11 @@ import { searchShapeDefinitions } from './engine/shapes/search';
 import { solid3DLocalAxisSpans, solid3DLocalDimensions, solid3DScaleFromBounds, solid3DSizeSemantics, type Solid3DGeometry, type Solid3DScale } from './engine/shapes/solid3d';
 import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
+  BOARD_ID,
   continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, subscribeBoardRuntimeStatus, yShapes,
 } from './store/useBoardStore';
 import { RemoteCursorsOverlay } from './components/collab/RemoteCursorsOverlay';
+import { ShareModal } from './components/collab/ShareModal';
 import {
   broadcastCollabCursor,
   broadcastCollabPresenter,
@@ -426,6 +428,9 @@ export default function App() {
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const lastMouseWorldPosRef = useRef<{ x: number; y: number } | null>(null);
 
+  // Share Board Modal
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+
   useEffect(() => {
     return subscribeCollabPresence(() => {
       setCollabUser(getLocalCollabUser());
@@ -815,7 +820,9 @@ export default function App() {
     // Apply the current UI values at construction so new shapes use Antiwhite defaults.
     eng.style = { ...engineStyleRef.current };
     engRef.current = eng;
-    (window as unknown as { eng?: CanvasEngine }).eng = eng;
+    if (import.meta.env.DEV || (typeof window !== 'undefined' && Boolean((window as unknown as { __ENABLE_TEST_ENGINE__?: boolean }).__ENABLE_TEST_ENGINE__))) {
+      (window as unknown as { eng?: CanvasEngine }).eng = eng;
+    }
 
     eng.onSel = ids => {
       setSelIds(ids);
@@ -1175,26 +1182,42 @@ export default function App() {
       eng.pointerMove(e);
       if (wrap) {
         const rect = wrap.getBoundingClientRect();
-        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+        const inside = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+        const drawing = eng.isDrawingActive();
+        if (inside || drawing) {
           const world = eng.clientToWorld(e.clientX, e.clientY);
           lastMouseWorldPosRef.current = world;
-          broadcastCollabCursor(world);
+          broadcastCollabCursor(world, drawing);
         } else {
-          broadcastCollabCursor(null);
+          broadcastCollabCursor(null, false);
         }
       }
     };
-    const onUp = (e: PointerEvent) => eng.pointerUp(e);
+    const onUp = (e: PointerEvent) => {
+      eng.pointerUp(e);
+      if (wrap) {
+        const rect = wrap.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          const world = eng.clientToWorld(e.clientX, e.clientY);
+          lastMouseWorldPosRef.current = world;
+          broadcastCollabCursor(world, false);
+        } else {
+          broadcastCollabCursor(null, false);
+        }
+      }
+    };
     const onCancel = (e: PointerEvent) => {
       eng.cancelPointer(e);
-      broadcastCollabCursor(null);
+      broadcastCollabCursor(null, false);
     };
     const onBlur = () => {
       eng.cancelPointer();
-      broadcastCollabCursor(null);
+      broadcastCollabCursor(null, false);
     };
     const onLeave = () => {
-      broadcastCollabCursor(null);
+      if (!eng.isDrawingActive()) {
+        broadcastCollabCursor(null, false);
+      }
     };
     wrap.addEventListener('pointerleave', onLeave);
     window.addEventListener('pointermove', onMove);
@@ -1222,7 +1245,9 @@ export default function App() {
       eng.cancelPointer();
       eng.destroy();
       engRef.current = null;
-      (window as unknown as { eng?: CanvasEngine | null }).eng = null;
+      if (import.meta.env.DEV || (typeof window !== 'undefined' && Boolean((window as unknown as { __ENABLE_TEST_ENGINE__?: boolean }).__ENABLE_TEST_ENGINE__))) {
+        (window as unknown as { eng?: CanvasEngine | null }).eng = null;
+      }
     };
   }, [boardReady]);
 
@@ -1262,14 +1287,14 @@ export default function App() {
     }
   }, [zoom]);
 
-  const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string) => {
+  const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string, measuredSize?: { width: number; height: number }) => {
     editTextRef.current = source;
     const current = editShapeRef.current;
     if (current?.type !== 'math') return;
     const stored = yShapes.get(current.id);
     const fallbackPreview = stored?.type === 'math' ? stored.previewText : current.previewText;
     // Source remains authoritative; only a valid preview is allowed to update the board projection.
-    engRef.current?.updateFormulaLive(current.id, source, lastValidPreview ?? fallbackPreview ?? '', false);
+    engRef.current?.updateFormulaLive(current.id, source, lastValidPreview ?? fallbackPreview ?? '', measuredSize, true);
   }, []);
 
   const getLastValidFormulaPreview = useCallback(() => {
@@ -1281,7 +1306,7 @@ export default function App() {
 
   // Math Auto-Replace đã được chuyển sang FormulaEditor component.
 
-  const commitEdit = useCallback((formulaSource?: string, lastValidPreview?: string) => {
+  const commitEdit = useCallback((formulaSource?: string, lastValidPreview?: string, measuredSize?: { width: number; height: number }) => {
     const shape = editShapeRef.current;
     const eng = engRef.current;
     const session = activeEditSessionRef.current;
@@ -1327,7 +1352,7 @@ export default function App() {
       const previewText = lastValidPreview ?? storedPreview;
       const finalSource = committedText.trim() ? committedText : '\\square';
       const finalPreview = previewText.trim() ? previewText : '\\square';
-      eng.updateFormula(shape.id, finalSource, finalPreview);
+      eng.updateFormula(shape.id, finalSource, finalPreview, measuredSize);
     } else if (committedText.trim() === '' && !isFixedShapeLabel(shape) && shape.type !== 'sticky') {
       eng.deleteShape(shape.id);
     } else if (shape.type === 'code') {
@@ -1942,46 +1967,54 @@ export default function App() {
         <div className="header-spacer" />
 
         <div className="header-presence" role="region" aria-label="Online collaborators">
-          {collabPeers.length === 0 ? (
-            <div className="presence-alone-indicator" title="You are currently the only collaborator in this room">
-              <span className="presence-alone-dot" />
-              <span className="presence-alone-label">Solo</span>
+          <div className="presence-avatars">
+            {/* The Local User (You) - Always visible in the presence stack like Miro */}
+            <div
+              className="presence-avatar is-self"
+              style={{
+                background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)',
+                zIndex: 20,
+              }}
+              title={`You (${collabUser ? collabUser.name : 'Active'})`}
+              aria-label={`You (${collabUser ? collabUser.name : 'Active'})`}
+            >
+              <span>{collabUser ? collabUser.avatarLabel : 'U'}</span>
+              <span className="presence-self-dot" />
             </div>
-          ) : (
-            <div className="presence-avatars">
-              {collabPeers.slice(0, 4).map((peer, idx) => {
-                const isFollowed = followingPeerId === peer.clientId;
-                return (
-                  <button
-                    key={peer.clientId}
-                    type="button"
-                    className={`presence-avatar ${isFollowed ? 'is-following' : ''}`}
-                    style={{
-                      background: peer.user.gradient,
-                      zIndex: collabPeers.length - idx,
-                      border: isFollowed ? '2px solid #3b82f6' : '2px solid #ffffff',
-                      cursor: 'pointer',
-                    }}
-                    title={`${peer.user.name} (Active) — ${isFollowed ? 'Click to stop following' : 'Click to follow screen'}`}
-                    aria-label={`${peer.user.name} — ${isFollowed ? 'Stop following' : 'Follow screen'}`}
-                    aria-pressed={isFollowed}
-                    onClick={() => {
-                      if (isFollowed) {
-                        setFollowingPeerId(null);
-                      } else {
-                        setFollowingPeerId(peer.clientId);
-                        if (peer.cursor && engRef.current) {
-                          engRef.current.panTo(peer.cursor.x, peer.cursor.y);
-                        }
+
+            {/* Remote Peers in Overlapping Stack */}
+            {collabPeers.slice(0, 4).map((peer, idx) => {
+              const isFollowed = followingPeerId === peer.clientId;
+              return (
+                <button
+                  key={peer.clientId}
+                  type="button"
+                  className={`presence-avatar ${isFollowed ? 'is-following' : ''}`}
+                  style={{
+                    background: peer.user.gradient,
+                    zIndex: 19 - idx,
+                    cursor: 'pointer',
+                  }}
+                  title={`${peer.user.name} (Active) — ${isFollowed ? 'Click to stop following' : 'Click to follow screen'}`}
+                  aria-label={`${peer.user.name} — ${isFollowed ? 'Stop following' : 'Follow screen'}`}
+                  aria-pressed={isFollowed}
+                  onClick={() => {
+                    if (isFollowed) {
+                      setFollowingPeerId(null);
+                    } else {
+                      setFollowingPeerId(peer.clientId);
+                      if (peer.cursor && engRef.current) {
+                        engRef.current.panTo(peer.cursor.x, peer.cursor.y);
                       }
-                    }}
-                  >
-                    {peer.user.avatarLabel}
-                  </button>
-                );
-              })}
-            </div>
-          )}
+                    }
+                  }}
+                >
+                  <span>{peer.user.avatarLabel}</span>
+                </button>
+              );
+            })}
+          </div>
+
           {collabPeers.length > 4 && (
             <span className="presence-badge" title={`${collabPeers.length - 4} more collaborators online`}>
               +{collabPeers.length - 4}
@@ -2003,25 +2036,27 @@ export default function App() {
             <Play size={13} strokeWidth={2.4} className="fill-current" />
             <span className="header-action-label">{isPresenting ? 'Stop' : 'Present'}</span>
           </button>
-          <button type="button" disabled title="Sharing is not available yet" aria-label="Share (not available yet)"
-            className="header-action header-action-share">
+          <button
+            type="button"
+            onClick={() => setIsShareModalOpen(true)}
+            title="Share board with collaborators"
+            aria-label="Share board"
+            className="header-action header-action-share"
+          >
             <Share2 size={13} strokeWidth={2.4} />
             <span className="header-action-label">Share</span>
           </button>
-          <div
-            className="header-user-avatar"
-            style={{
-              background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)',
-              color: '#ffffff',
-            }}
-            title={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
-            aria-label={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
-          >
-            <span>{collabUser ? collabUser.avatarLabel : 'U'}</span>
-            <span className="header-user-online-dot" />
-          </div>
         </div>
       </header>
+
+      {/* Share Board Dialog */}
+      <ShareModal
+        isOpen={isShareModalOpen}
+        onClose={() => setIsShareModalOpen(false)}
+        boardId={BOARD_ID}
+        collabPeers={collabPeers}
+        collabUser={collabUser}
+      />
 
       {/* Miro-style Collaborative Follow & Presenter Floating Overlays */}
       {followingPeer && (
@@ -2303,6 +2338,11 @@ export default function App() {
             }
             if (followingPeerIdRef.current) setFollowingPeerId(null);
             eng.pointerDown(e.nativeEvent);
+            if (eng.isDrawingActive()) {
+              const world = eng.clientToWorld(e.clientX, e.clientY);
+              lastMouseWorldPosRef.current = world;
+              broadcastCollabCursor(world, true);
+            }
           }}
           onDoubleClick={e => engRef.current?.doubleClick(e.nativeEvent)}
           onContextMenu={e => {
@@ -2605,6 +2645,8 @@ export default function App() {
                 key={editShape.id}
                 initialText={editText}
                 initialPreviewText={editShape.previewText ?? editText}
+                initialWidth={editShape.w}
+                initialHeight={editShape.h}
                 fontSize={formulaFontSize}
                 zoom={cam.zoom}
                 worldX={editShape.x}

@@ -287,6 +287,7 @@ button:disabled { cursor: not-allowed; }
   align-items: center;
 }
 .presence-avatar {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -298,15 +299,40 @@ button:disabled { cursor: not-allowed; }
   border-radius: 50%;
   font-size: 9.5px;
   font-weight: 750;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
-  transition: transform 0.14s ease, z-index 0.14s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  transition: transform 0.14s ease, box-shadow 0.14s ease, z-index 0.14s ease;
+  padding: 0;
+  outline: none;
 }
 .presence-avatars .presence-avatar:first-child {
   margin-left: 0;
 }
 .presence-avatar:hover {
   transform: translateY(-2px) scale(1.12);
-  z-index: 10 !important;
+  z-index: 25 !important;
+}
+.presence-avatar.is-self {
+  cursor: default;
+}
+.presence-avatar.is-self:hover {
+  transform: translateY(-2px) scale(1.12);
+  z-index: 25 !important;
+}
+.presence-self-dot {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 7.5px;
+  height: 7.5px;
+  background-color: #10b981;
+  border: 1.5px solid #ffffff;
+  border-radius: 50%;
+  box-shadow: 0 0 3px rgba(16, 185, 129, 0.8);
+  pointer-events: none;
+}
+.presence-avatar.is-following {
+  box-shadow: 0 0 0 2px #2563eb, 0 2px 6px rgba(37, 99, 235, 0.45);
+  transform: translateY(-2px) scale(1.08);
 }
 .presence-badge {
   font-size: 11px;
@@ -335,27 +361,39 @@ button:disabled { cursor: not-allowed; }
 
 /* ── Miro-style Realtime Remote Cursors ── */
 .remote-cursor-container {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
+  position: absolute;
   user-select: none;
+  pointer-events: none;
+}
+.remote-cursor-pointer {
+  display: block;
+  width: 24px;
+  height: 24px;
+  pointer-events: none;
 }
 .remote-cursor-badge {
+  position: absolute;
+  left: 12px;
+  top: 11px;
   display: inline-flex;
   align-items: center;
-  margin-top: 1px;
-  margin-left: 12px;
-  padding: 2.5px 8px 2.5px 8px;
-  border-radius: 0 8px 8px 8px;
+  padding: 2px 7px 3px 7px;
+  border-radius: 0 4px 4px 4px;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 11px;
   font-weight: 650;
   letter-spacing: -0.01em;
-  line-height: 1.35;
+  line-height: 1.25;
   white-space: nowrap;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.45);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.35);
   pointer-events: none;
+}
+.remote-cursor-name {
+  display: inline-block;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 
@@ -1805,4 +1843,434 @@ button:disabled { cursor: not-allowed; }
 .presenting-stop-btn:hover {
   background: rgba(0, 0, 0, 0.5);
 }
+
+/* ─── Miro / Figma Native Share Modal ────────────────────────────────────────── */
+.share-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(15, 23, 42, 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  animation: shareFade 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes shareFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.share-modal-card {
+  width: 100%;
+  max-width: 470px;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow:
+    0 16px 40px -8px rgba(15, 23, 42, 0.18),
+    0 0 0 1px rgba(15, 23, 42, 0.08);
+  padding: 20px 22px 16px 22px;
+  color: #1e293b;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: shareCardPop 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes shareCardPop {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.share-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.share-modal-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.share-modal-heading {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: #0f172a;
+  letter-spacing: -0.01em;
+}
+
+.share-modal-room-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid #e2e8f0;
+}
+
+.share-modal-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #059669;
+  background: #ecfdf5;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid #a7f3d0;
+  letter-spacing: 0.01em;
+}
+
+.share-modal-close {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #64748b;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.share-modal-close:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+/* General access row */
+.share-access-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px solid #f1f5f9;
+}
+
+.share-access-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.share-access-icon-box {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  background: #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #475569;
+}
+
+.share-access-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.share-access-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.share-access-desc {
+  font-size: 11.5px;
+  color: #64748b;
+}
+
+.share-permission-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 550;
+  color: #334155;
+  cursor: default;
+}
+
+/* Link input & copy button */
+.share-link-input-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.share-link-field {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.share-link-icon {
+  position: absolute;
+  left: 10px;
+  color: #94a3b8;
+  pointer-events: none;
+}
+
+.share-link-input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px 0 32px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  color: #334155;
+  background: #f8fafc;
+  transition: all 0.15s ease;
+}
+
+.share-link-input:focus {
+  outline: none;
+  border-color: #3b82f6;
+  background: #ffffff;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+  color: #0f172a;
+}
+
+.share-action-copy-btn {
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 6px;
+  background: #4262ff;
+  color: #ffffff;
+  border: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.share-action-copy-btn:hover {
+  background: #3251ee;
+}
+
+.share-action-copy-btn.is-copied {
+  background: #059669;
+}
+
+/* Network subtext */
+.share-network-subtext {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: #64748b;
+  padding: 0 2px;
+}
+
+.share-network-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.share-network-toggle-btn {
+  background: none;
+  border: none;
+  color: #2563eb;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+.share-network-toggle-btn:hover {
+  color: #1d4ed8;
+}
+
+/* Collaborators list */
+.share-collaborators-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid #f1f5f9;
+  padding-top: 12px;
+}
+
+.share-collaborators-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.share-online-count {
+  font-size: 11px;
+  font-weight: 500;
+  color: #10b981;
+  background: #ecfdf5;
+  padding: 1px 6px;
+  border-radius: 9999px;
+}
+
+.share-collaborators-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.share-collaborator-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: background 0.12s ease;
+}
+
+.share-collaborator-item:hover {
+  background: #f8fafc;
+}
+
+.share-avatar-circle {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.share-collab-info {
+  flex: 1;
+  margin-left: 10px;
+  display: flex;
+  flex-direction: column;
+}
+
+.share-collab-name {
+  font-size: 12.5px;
+  font-weight: 550;
+  color: #0f172a;
+}
+
+.share-you-badge {
+  font-size: 11px;
+  font-weight: 400;
+  color: #64748b;
+  margin-left: 3px;
+}
+
+.share-collab-status {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.share-role-text {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 500;
+}
+
+/* Help drawer */
+.share-help-drawer {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  color: #475569;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: shareFade 0.15s ease;
+}
+
+.share-help-tip {
+  line-height: 1.45;
+}
+
+.share-help-tip code {
+  font-family: ui-monospace, monospace;
+  background: #e2e8f0;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+  color: #0f172a;
+}
+
+/* Footer */
+.share-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid #f1f5f9;
+  padding-top: 12px;
+}
+
+.share-help-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.12s ease;
+}
+
+.share-help-trigger:hover {
+  color: #0f172a;
+}
+
+.share-done-button {
+  padding: 6px 16px;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #ffffff;
+  border: none;
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.share-done-button:hover {
+  background: #334155;
+}
+
+
 

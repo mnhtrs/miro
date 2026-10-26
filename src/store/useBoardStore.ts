@@ -4,16 +4,27 @@ import type { AnyShape } from '../engine/CanvasEngine';
 import { IndexedDbYjsUpdateStorage, LocalYjsPersistence, type LocalPersistenceStatus, type YjsUpdateStorage } from './localYjsPersistence';
 import { initCollabPresence } from './collabPresence';
 
+import { resolveBoardIdFromUrl, encodeBoardToken } from './boardSecurity';
+
 export function getBoardId(): string {
-  if (typeof window !== 'undefined') {
-    const params = new URLSearchParams(window.location.search);
-    const custom = params.get('board')?.trim();
-    if (custom) return custom;
-  }
-  return 'board-1';
+  return resolveBoardIdFromUrl();
 }
 
 export const BOARD_ID = getBoardId();
+
+// Ensure the browser URL explicitly contains the encrypted token parameter so manual URL copying retains the exact room safely
+if (typeof window !== 'undefined') {
+  try {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.get('board') && !url.searchParams.get('token')) {
+      url.searchParams.set('token', encodeBoardToken(BOARD_ID));
+      window.history.replaceState(null, '', url.toString());
+    }
+  } catch {
+    // Ignore URL parse errors in SSR or restricted environments
+  }
+}
+
 export const ydoc = new Y.Doc();
 export const yShapes = ydoc.getMap<AnyShape>('shapes');
 
