@@ -1,4 +1,5 @@
 import type { Awareness } from 'y-protocols/awareness';
+import { type BoardUserRole, resolveBoardRoleFromUrl } from './boardSecurity';
 
 export interface CollabUser {
   id: string;
@@ -9,6 +10,7 @@ export interface CollabUser {
   gradient: string;
   textColor: string;
   joinedAt: number;
+  role?: BoardUserRole;
 }
 
 export interface CollabCursor {
@@ -28,6 +30,8 @@ export interface CollabReaction {
 
 export interface CollabPresenter {
   active: boolean;
+  startedAt?: number;
+  clientId?: number;
   x: number;
   y: number;
   zoom: number;
@@ -39,6 +43,7 @@ export interface CollabAwarenessState {
   cursor?: CollabCursor | null;
   reaction?: CollabReaction | null;
   presenter?: CollabPresenter | null;
+  roleOverrides?: Record<number, BoardUserRole>;
 }
 
 export interface CollabPeer {
@@ -279,6 +284,7 @@ export function resolveAnonymousUser(
     gradient: selectedPalette.gradient,
     textColor: selectedPalette.text,
     joinedAt: preserveJoinedAt ?? Date.now(),
+    role: resolveBoardRoleFromUrl(),
   };
 }
 
@@ -412,6 +418,38 @@ export function getLocalCollabPresenter(): CollabPresenter | null {
   return s?.presenter ?? null;
 }
 
+export function getEffectivePeerRole(peerClientId: number, fallbackRole: BoardUserRole = 'editor'): BoardUserRole {
+  if (!activeAwareness) return fallbackRole;
+  const states = activeAwareness.getStates();
+  for (const [, st] of states) {
+    const overrides = (st as CollabAwarenessState)?.roleOverrides;
+    if (overrides && overrides[peerClientId]) {
+      return overrides[peerClientId];
+    }
+  }
+  return fallbackRole;
+}
+
+export function broadcastCollabRoleOverride(targetClientId: number, role: BoardUserRole) {
+  if (!activeAwareness) return;
+  const current = (activeAwareness.getLocalState() as CollabAwarenessState)?.roleOverrides || {};
+  activeAwareness.setLocalStateField('roleOverrides', {
+    ...current,
+    [targetClientId]: role,
+  });
+  notifyListeners();
+}
+
+export function updateLocalCollabRole(role: BoardUserRole) {
+  if (localCollabUser) {
+    localCollabUser = { ...localCollabUser, role };
+  }
+  if (activeAwareness) {
+    activeAwareness.setLocalStateField('user', localCollabUser);
+  }
+  notifyListeners();
+}
+
 export function getCollabPeers(): CollabPeer[] {
   if (!activeAwareness) return [];
   const myId = activeAwareness.clientID;
@@ -422,9 +460,10 @@ export function getCollabPeers(): CollabPeer[] {
     if (clientId === myId) return;
     const s = state as CollabAwarenessState | undefined;
     if (s && s.user) {
+      const effectiveRole = getEffectivePeerRole(clientId, s.user.role ?? 'editor');
       peers.push({
         clientId,
-        user: s.user,
+        user: { ...s.user, role: effectiveRole },
         cursor: s.cursor ?? null,
         reaction: s.reaction ?? null,
         presenter: s.presenter ?? null,

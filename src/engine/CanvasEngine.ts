@@ -80,9 +80,22 @@ export interface ArrowShape   extends BaseShape { type:'arrow';    x1:number;y1:
 export interface StickyShape  extends BoxShape  { type:'sticky';   text:string; bg:string; fs:number; createdAt?: string; }
 export interface TextShape    extends BoxShape  { type:'text'|'math'|'code'; text:string; color:string; fs:number; language?: CodeLanguage; previewText?: string; autoHeight?: boolean; }
 export interface ImageShape   extends BoxShape  { type:'image';    src:string; naturalW:number; naturalH:number; }
+export interface VideoShape   extends BoxShape  { type:'video';    src:string; title?: string; }
+export interface LinkCardShape extends BoxShape {
+  type: 'link-card';
+  url: string;
+  title?: string;
+  description?: string;
+  image?: string;
+  favicon?: string;
+  siteName?: string;
+  mediaType?: 'website' | 'video' | 'article' | 'image';
+  embedUrl?: string;
+  status?: 'loading' | 'ready' | 'error';
+}
 export type DiagramShape = DiagramShapeObject;
 export type ConnectorShape = ConnectorShapeObject;
-export type AnyShape = PenShape|LineShape|CurveShape|RectShape|EllipseShape|TriShape|DiamShape|StarShape|CalloutShape|PolygonShape|ArrowShape|StickyShape|TextShape|ImageShape|DiagramShape|ConnectorShape;
+export type AnyShape = PenShape|LineShape|CurveShape|RectShape|EllipseShape|TriShape|DiamShape|StarShape|CalloutShape|PolygonShape|ArrowShape|StickyShape|TextShape|ImageShape|VideoShape|LinkCardShape|DiagramShape|ConnectorShape;
 type RotatableShape = Exclude<AnyShape, PenShape | LineShape | CurveShape | ArrowShape | ConnectorShape>;
 
 export interface StyleOptions {
@@ -177,7 +190,7 @@ interface ActiveSolidTransform {
 interface ResizeRef { wx: number; wy: number; s: AnyShape; }
 interface ConnectorTargetFeedback { shapeId: string; point: { x: number; y: number }; valid: boolean; }
 type PositionedShape = Extract<AnyShape, { x: number; y: number; w: number; h: number }>;
-type DomOverlayShape = StickyShape | TextShape | ImageShape;
+type DomOverlayShape = StickyShape | TextShape | ImageShape | VideoShape | LinkCardShape;
 
 type LegacyBoxToolType = 'rect' | 'rounded-rect' | 'ellipse' | 'triangle' | 'right-triangle' | 'diamond'
   | 'parallelogram' | 'trapezoid' | 'pentagon' | 'hexagon' | 'star';
@@ -338,6 +351,7 @@ export class CanvasEngine {
   public onEditSemantic?: (s: AnyShape) => void;
   public onCursor?:   (cursor:string) => void;
   public onTool?:     (tool:ToolType) => void;
+  public isReadOnly: boolean = false;
 
   // Dedicated high-frequency render-frame camera listeners (decoupled from React state updates)
   private cameraFrameListeners = new Set<(cam: Camera) => void>();
@@ -576,6 +590,17 @@ export class CanvasEngine {
       return;
     }
     if (e.button !== 0) return;
+
+    if (this.isReadOnly) {
+      e.preventDefault();
+      this.activePointerId = Number.isFinite(e.pointerId) ? e.pointerId : null;
+      this.isPanning = true;
+      this.panButton = e.button;
+      const pointer = this.clientToCanvas(e.clientX, e.clientY);
+      this.panRef = { sx: pointer.x, sy: pointer.y, cx: this.cam.x, cy: this.cam.y };
+      this.onCursor?.('grabbing');
+      return;
+    }
 
     const w = this.clientToWorld(e.clientX, e.clientY);
 
@@ -1441,6 +1466,7 @@ export class CanvasEngine {
   }
 
   doubleClick(e: MouseEvent) {
+    if (this.isReadOnly) return;
     const w = this.clientToWorld(e.clientX, e.clientY);
     const hit = this.hitShape(w.x, w.y);
     if (!hit) return;
@@ -2755,9 +2781,10 @@ export class CanvasEngine {
   // ─── public API ──────────────────────────────────────────────────────────
   private cursorForTool(): string {
     if (this.tool === 'select') return 'default';
-    if (this.tool === 'lasso-select' || this.tool === 'pen' || this.tool === 'eraser' ||
-        isBoxShapeTool(this.tool) || this.tool === 'arrow') return 'crosshair';
-    if (this.tool === 'sticky' || this.tool === 'text' || this.tool === 'math' || this.tool === 'code') return 'crosshair';
+    if (this.tool === 'text' || this.tool === 'math' || this.tool === 'code') return 'text';
+    if (this.tool === 'sticky') return 'default';
+    if (this.tool === 'eraser') return 'default';
+    if (this.tool === 'lasso-select' || this.tool === 'pen' || isBoxShapeTool(this.tool) || this.tool === 'arrow') return 'crosshair';
     if (this.tool === 'image') return 'copy';
     return 'default';
   }
@@ -2879,12 +2906,14 @@ export class CanvasEngine {
   }
 
   deleteSel() {
+    if (this.isReadOnly) return;
     this.deleteShapes([...this.sel]);
     this.clearSelection();
     this.saveH();
   }
 
   dupSel() {
+    if (this.isReadOnly) return;
     const originalById = new Map<string, AnyShape>();
     const selected = [...this.sel].map(id => this.shapes.get(id)).filter((shape): shape is AnyShape => Boolean(shape));
     const add = (shape: AnyShape | undefined) => { if (shape) originalById.set(shape.id, shape); };
@@ -4211,6 +4240,155 @@ export class CanvasEngine {
       this.saveH();
     };
     img.src = src;
+  }
+
+  private internalClipboard: AnyShape[] = [];
+
+  copySel(): boolean {
+    const selected = [...this.sel].map(id => this.shapes.get(id)).filter(Boolean) as AnyShape[];
+    if (!selected.length) return false;
+    this.internalClipboard = JSON.parse(JSON.stringify(selected));
+    return true;
+  }
+
+  hasInternalClipboard(): boolean {
+    return this.internalClipboard.length > 0;
+  }
+
+  pasteInternal(clientX?: number, clientY?: number): string[] {
+    if (!this.internalClipboard.length) return [];
+    const newIds: string[] = [];
+    const idMap = new Map<string, string>();
+    this.internalClipboard.forEach(s => idMap.set(s.id, uid()));
+
+    let offsetX = 24, offsetY = 24;
+    if (typeof clientX === 'number' && typeof clientY === 'number') {
+      const worldMouse = this.clientToWorld(clientX, clientY);
+      let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY;
+      this.internalClipboard.forEach(s => {
+        if ('x' in s && typeof s.x === 'number') {
+          minX = Math.min(minX, s.x);
+          minY = Math.min(minY, (s as PositionedShape).y);
+        } else if ('minX' in s && typeof s.minX === 'number') {
+          minX = Math.min(minX, s.minX);
+          minY = Math.min(minY, s.minY);
+        }
+      });
+      if (Number.isFinite(minX) && Number.isFinite(minY)) {
+        offsetX = worldMouse.x - minX;
+        offsetY = worldMouse.y - minY;
+      }
+    }
+
+    const clones: AnyShape[] = this.internalClipboard.map(s => {
+      const newId = idMap.get(s.id) || uid();
+      newIds.push(newId);
+      const clone = JSON.parse(JSON.stringify(s)) as AnyShape;
+      clone.id = newId;
+      if ('x' in clone && 'y' in clone && typeof clone.x === 'number' && typeof clone.y === 'number') {
+        clone.x += offsetX;
+        clone.y += offsetY;
+        if ('minX' in clone) {
+          clone.minX += offsetX;
+          clone.minY += offsetY;
+          clone.maxX += offsetX;
+          clone.maxY += offsetY;
+        }
+      } else if ('x1' in clone && 'y1' in clone) {
+        (clone as LineShape).x1 += offsetX;
+        (clone as LineShape).y1 += offsetY;
+        (clone as LineShape).x2 += offsetX;
+        (clone as LineShape).y2 += offsetY;
+        if ('minX' in clone) {
+          clone.minX += offsetX;
+          clone.minY += offsetY;
+          clone.maxX += offsetX;
+          clone.maxY += offsetY;
+        }
+      } else if ('pts' in clone && Array.isArray((clone as PenShape).pts)) {
+        (clone as PenShape).pts = (clone as PenShape).pts.map(pt => [pt[0] + offsetX, pt[1] + offsetY, ...(pt.slice(2))]);
+        if ('minX' in clone) {
+          clone.minX += offsetX;
+          clone.minY += offsetY;
+          clone.maxX += offsetX;
+          clone.maxY += offsetY;
+        }
+      }
+      return clone;
+    });
+
+    this.putMany(clones);
+    this.sel.clear();
+    newIds.forEach(id => this.sel.add(id));
+    this.onSel?.(newIds);
+    this.saveH();
+    return newIds;
+  }
+
+  addVideo(src: string, clientX: number, clientY: number, title?: string): string {
+    const w = this.clientToWorld(clientX, clientY);
+    const fw = 440, fh = 260;
+    const id = uid();
+    const s: VideoShape = {
+      id, type: 'video', src, title,
+      x: w.x - fw / 2, y: w.y - fh / 2, w: fw, h: fh,
+      minX: w.x - fw / 2, minY: w.y - fh / 2, maxX: w.x + fw / 2, maxY: w.y + fh / 2,
+    };
+    this.put(s);
+    this.sel.clear(); this.sel.add(id); this.onSel?.([id]);
+    this.saveH();
+    return id;
+  }
+
+  addLinkCard(url: string, clientX: number, clientY: number, initialMeta?: Partial<LinkCardShape>): string {
+    const w = this.clientToWorld(clientX, clientY);
+    const fw = 360, fh = 260;
+    const id = uid();
+    const s: LinkCardShape = {
+      id, type: 'link-card', url,
+      status: initialMeta?.status ?? 'loading',
+      title: initialMeta?.title ?? '',
+      description: initialMeta?.description ?? '',
+      image: initialMeta?.image ?? '',
+      favicon: initialMeta?.favicon ?? '',
+      siteName: initialMeta?.siteName ?? '',
+      mediaType: initialMeta?.mediaType ?? 'website',
+      embedUrl: initialMeta?.embedUrl ?? '',
+      x: w.x - fw / 2, y: w.y - fh / 2, w: fw, h: fh,
+      minX: w.x - fw / 2, minY: w.y - fh / 2, maxX: w.x + fw / 2, maxY: w.y + fh / 2,
+    };
+    this.put(s);
+    this.sel.clear(); this.sel.add(id); this.onSel?.([id]);
+    this.saveH();
+    return id;
+  }
+
+  updateLinkCardMeta(id: string, meta: Partial<LinkCardShape>): void {
+    const shape = this.shapes.get(id);
+    if (!shape || shape.type !== 'link-card') return;
+    const updated: LinkCardShape = { ...shape, ...meta };
+    this.put(updated);
+    this.saveH();
+  }
+
+  addSticky(text: string, clientX: number, clientY: number): string {
+    const w = this.clientToWorld(clientX, clientY);
+    const id = uid();
+    const x = w.x - 120;
+    const y = w.y - 120;
+    const s: StickyShape = {
+      id, type: 'sticky',
+      x, y, w: 240, h: 240, fs: 14,
+      bg: this.style.stickyBg || '#fef08a', text,
+      createdAt: formatStickyTimestamp(),
+      minX: x, minY: y, maxX: x + 240, maxY: y + 240,
+    };
+    this.put(s);
+    this.sel.clear();
+    this.sel.add(id);
+    this.onSel?.([id]);
+    this.saveH();
+    return id;
   }
 
   mark() { this.dirty = true; }
@@ -6039,9 +6217,10 @@ export class CanvasEngine {
       const text = 'text' in s && typeof s.text === 'string' ? s.text : '';
       const previewText = s.type === 'math' ? s.previewText ?? '' : '';
       const language = s.type === 'code' ? s.language ?? '' : '';
-      const source = s.type === 'image' ? s.src : '';
+      const source = s.type === 'image' ? s.src : s.type === 'video' ? (s as VideoShape).src : '';
+      const linkCardSig = s.type === 'link-card' ? `${(s as LinkCardShape).url}:${(s as LinkCardShape).status}:${(s as LinkCardShape).title}:${(s as LinkCardShape).image}` : '';
       const stickyTime = s.type === 'sticky' ? (s as StickyShape).createdAt ?? '' : '';
-      stateSignature += `${s.id}:${text}:${previewText}:${language}:${s.w}:${s.h}:${s.x}:${s.y}:${s.rotation ?? 0}:${source}:${stickyTime}:sel${this.sel.has(s.id)}|`;
+      stateSignature += `${s.id}:${text}:${previewText}:${language}:${s.w}:${s.h}:${s.x}:${s.y}:${s.rotation ?? 0}:${source}:${linkCardSig}:${stickyTime}:sel${this.sel.has(s.id)}|`;
     });
     stateSignature += `editing:${this.editingId}`;
 
@@ -6052,6 +6231,61 @@ export class CanvasEngine {
         let content = '';
         if (s.type === 'image') {
           overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; pointer-events:auto;"><img src="${s.src}" style="width:100%; height:100%; display:block; pointer-events:none;" /></div>`;
+        } else if (s.type === 'video') {
+          const vid = s as VideoShape;
+          const safeSrc = (vid.src || '').replace(/"/g, '&quot;');
+          overlayHtml += `<div id="ol_${s.id}" class="board-video-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; pointer-events:auto; border-radius:8px; overflow:hidden; background:#0f172a; box-shadow:0 6px 20px rgba(0,0,0,0.2); display:flex; flex-direction:column;">
+            <video src="${safeSrc}" controls playsinline preload="metadata" style="width:100%; height:100%; object-fit:contain; display:block; outline:none; background:#000;" onpointerdown="event.stopPropagation()"></video>
+          </div>`;
+        } else if (s.type === 'link-card') {
+          const card = s as LinkCardShape;
+          const safeUrl = (card.url || '').replace(/"/g, '&quot;');
+          const safeTitle = (card.title || card.siteName || card.url || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+          const safeDesc = (card.description || card.url || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+          let domain = 'Website';
+          try { domain = new URL(card.url, 'http://localhost').hostname.replace(/^www\./i, ''); } catch { /* ignore */ }
+          const safeSite = (card.siteName || domain).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const safeFavicon = card.favicon ? card.favicon.replace(/"/g, '&quot;') : '';
+          const safeImage = card.image ? card.image.replace(/"/g, '&quot;') : '';
+          const isVideo = card.mediaType === 'video' || Boolean(card.embedUrl) || card.url.includes('youtube.com') || card.url.includes('youtu.be');
+          const isLoading = card.status === 'loading';
+
+          let mediaHtml = '';
+          if (isLoading) {
+            mediaHtml = `<div class="link-card-shimmer" style="width:100%; height:55%; background:linear-gradient(90deg, #e2e8f0 25%, #f8fafc 50%, #e2e8f0 75%); background-size:200% 100%; animation:shimmer 1.5s infinite; flex-shrink:0;"></div>`;
+          } else if (safeImage) {
+            const playBadge = isVideo ? `<div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.25); pointer-events:none;"><div style="width:40px; height:40px; border-radius:50%; background:rgba(239,68,68,0.92); display:flex; align-items:center; justify-content:center; box-shadow:0 4px 12px rgba(0,0,0,0.3);"><svg width="18" height="18" viewBox="0 0 24 24" fill="#ffffff" style="margin-left:2px;"><polygon points="5 3 19 12 5 21 5 3"/></svg></div></div>` : '';
+            mediaHtml = `<div style="position:relative; width:100%; height:55%; overflow:hidden; background:#0f172a; flex-shrink:0;">
+              <img src="${safeImage}" alt="" style="width:100%; height:100%; object-fit:cover; display:block; pointer-events:none;" />
+              ${playBadge}
+            </div>`;
+          }
+
+          const faviconHtml = safeFavicon ? `<img src="${safeFavicon}" alt="" style="width:13px; height:13px; border-radius:2px; flex-shrink:0; pointer-events:none;" onerror="this.style.display='none'" />` : '';
+
+          overlayHtml += `<div id="ol_${s.id}" class="board-link-card-overlay" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; transform:rotate(${s.rotation ?? 0}deg); transform-origin:center center; pointer-events:auto; border-radius:10px; overflow:hidden; background:#ffffff; border:1px solid rgba(226, 232, 240, 0.9); box-shadow:0 8px 24px -4px rgba(0,0,0,0.10), 0 4px 8px -2px rgba(0,0,0,0.05); display:flex; flex-direction:column; user-select:none; font-family:'Inter',system-ui,sans-serif;">
+            ${mediaHtml}
+            <div style="flex:1; padding:8px 12px 6px 12px; display:flex; flex-direction:column; justify-content:space-between; overflow:hidden; background:#ffffff;">
+              <div style="overflow:hidden;">
+                <div style="display:flex; align-items:center; gap:5px; font-size:10.5px; font-weight:600; color:#64748b; text-transform:uppercase; letter-spacing:0.03em; margin-bottom:3px;">
+                  ${faviconHtml}
+                  <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${safeSite}</span>
+                </div>
+                <div style="font-size:12.5px; font-weight:650; color:#0f172a; line-height:1.25; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; margin-bottom:3px;">
+                  ${safeTitle}
+                </div>
+                <div style="font-size:11px; color:#475569; line-height:1.3; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;">
+                  ${safeDesc}
+                </div>
+              </div>
+              <div style="display:flex; align-items:center; justify-content:space-between; padding-top:4px; border-top:1px solid #f1f5f9; margin-top:2px;" onpointerdown="event.stopPropagation()">
+                <a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:4px; font-size:11px; font-weight:600; color:#2563eb; text-decoration:none;" onpointerdown="event.stopPropagation()">
+                  <span>Open link</span>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                </a>
+              </div>
+            </div>
+          </div>`;
         } else if (s.type === 'sticky') {
           content = s.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
           const timestamp = (s as StickyShape).createdAt;
@@ -7751,7 +7985,8 @@ function isPositionedShape(shape: AnyShape): shape is PositionedShape {
 
 function isDomOverlayShape(shape: AnyShape): shape is DomOverlayShape {
   return shape.type === 'sticky' || shape.type === 'math' || shape.type === 'code'
-    || shape.type === 'text' || shape.type === 'image';
+    || shape.type === 'text' || shape.type === 'image' || shape.type === 'video'
+    || shape.type === 'link-card';
 }
 
 function isTextTool(value: string): value is 'text' | 'math' | 'code' {

@@ -25,16 +25,26 @@ function base64UrlToUint8(base64url: string): Uint8Array {
   return bytes;
 }
 
+export type BoardUserRole = 'owner' | 'editor' | 'commenter' | 'viewer';
+
+export interface DecodedBoardTokenPayload {
+  boardId: string;
+  role: BoardUserRole;
+}
+
 /**
- * Encrypts/obfuscates a raw board ID into an opaque, high-entropy URL-safe token.
+ * Encrypts/obfuscates a raw board ID and role into an opaque, high-entropy URL-safe token.
  * Generates distinct cipher output on each call due to dynamic random nonce.
- * Example: 'board-1' -> 'brd_q-xLz8fPzXAEfw'
+ * Cryptographically seals the permission level into the token so URL manipulation cannot grant privileges.
+ * Example: ('board-1', 'viewer') -> 'brd_q-xLz8fPzXAEfw'
  */
-export function encodeBoardToken(rawBoardId: string): string {
+export function encodeBoardToken(rawBoardId: string, role: BoardUserRole = 'editor'): string {
   if (!rawBoardId || typeof rawBoardId !== 'string') return '';
   const trimmed = rawBoardId.trim();
+  const normalizedRole = role === 'owner' ? 'editor' : role;
+  const payload = `${trimmed}#${normalizedRole}`;
   const encoder = new TextEncoder();
-  const idBytes = encoder.encode(trimmed);
+  const idBytes = encoder.encode(payload);
   const nonce = (Math.random() * 0xffff) | 0;
   const out = new Uint8Array(idBytes.length + 3);
   out[0] = 0xAA; // magic byte
@@ -47,10 +57,10 @@ export function encodeBoardToken(rawBoardId: string): string {
 }
 
 /**
- * Decodes an encrypted board token back to its underlying raw board ID.
+ * Decodes an encrypted board token and extracts both the underlying board ID and sealed user role.
  * Returns null if token is malformed, invalid, or corrupted.
  */
-export function decodeBoardToken(token: string): string | null {
+export function decodeBoardTokenPayload(token: string): DecodedBoardTokenPayload | null {
   if (!token || typeof token !== 'string' || !token.startsWith('brd_')) return null;
   try {
     const buf = base64UrlToUint8(token.slice(4));
@@ -61,10 +71,71 @@ export function decodeBoardToken(token: string): string | null {
       out[i] = buf[i + 3] ^ ((nonceH + i * 31) & 0xff);
     }
     const decoded = new TextDecoder().decode(out).trim();
-    return decoded || null;
+    if (!decoded) return null;
+
+    const hashIndex = decoded.lastIndexOf('#');
+    if (hashIndex !== -1) {
+      const boardId = decoded.slice(0, hashIndex).trim();
+      const roleStr = decoded.slice(hashIndex + 1).trim().toLowerCase();
+      let role: BoardUserRole = 'editor';
+      if (roleStr === 'viewer' || roleStr === 'view') role = 'viewer';
+      else if (roleStr === 'commenter' || roleStr === 'comment') role = 'commenter';
+      else if (roleStr === 'editor' || roleStr === 'edit') role = 'editor';
+      return { boardId: boardId || decoded, role };
+    }
+
+    return { boardId: decoded, role: 'editor' };
   } catch {
     return null;
   }
+}
+
+/**
+ * Decodes an encrypted board token back to its underlying raw board ID.
+ * Returns null if token is malformed, invalid, or corrupted.
+ */
+export function decodeBoardToken(token: string): string | null {
+  const payload = decodeBoardTokenPayload(token);
+  return payload ? payload.boardId : null;
+}
+
+/**
+ * Resolves the authoritative user role from window.location.
+ * The cryptographically sealed token is the single source of truth:
+ * URL tampering (e.g. deleting &role=view or adding &role=edit) CANNOT bypass the token role!
+ */
+export function resolveBoardRoleFromUrl(): BoardUserRole {
+  if (typeof window === 'undefined') return 'editor';
+  try {
+    const params = new URLSearchParams(window.location.search);
+
+    // 1. Authoritative check: Sealed role inside token parameter
+    const tokenParam = params.get('token')?.trim();
+    if (tokenParam) {
+      const payload = decodeBoardTokenPayload(tokenParam);
+      if (payload) {
+        return payload.role;
+      }
+    }
+
+    // 2. Authoritative check: Board parameter if formatted as token
+    const boardParam = params.get('board')?.trim();
+    if (boardParam && boardParam.startsWith('brd_')) {
+      const payload = decodeBoardTokenPayload(boardParam);
+      if (payload) {
+        return payload.role;
+      }
+    }
+
+    // 3. Fallback for unencrypted board params (dev/testing mode only)
+    const r = params.get('role')?.toLowerCase().trim();
+    if (r === 'view' || r === 'viewer') return 'viewer';
+    if (r === 'comment' || r === 'commenter') return 'commenter';
+    if (r === 'edit' || r === 'editor') return 'editor';
+  } catch {
+    // Ignore URL parse errors
+  }
+  return 'editor';
 }
 
 /**

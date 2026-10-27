@@ -86,14 +86,13 @@ export default function FormulaEditor({
   const [toolsMaxHeight, setToolsMaxHeight] = useState<number | undefined>(undefined);
   const [workspaceSize, setWorkspaceSize] = useState({ w: view.w, h: view.h });
 
-  const safeZoom = Math.max(0.01, zoom);
   const availableView = {
     w: workspaceSize.w > 0 ? workspaceSize.w : view.w,
     h: workspaceSize.h > 0 ? workspaceSize.h : view.h,
   };
   const screenX = (worldX - cam.x) * zoom + availableView.w / 2;
   const screenY = (worldY - cam.y) * zoom + availableView.h / 2;
-  const editorWidth = Math.max(1, Math.min(520, Math.max(1, availableView.w - 24) / safeZoom));
+  const editorWidth = Math.max(320, Math.min(520, availableView.w - 24));
   const toolsWidth = Math.max(1, Math.min(360, availableView.w - 16));
 
   const [panelPosition, setPanelPosition] = useState(() => {
@@ -101,7 +100,7 @@ export default function FormulaEditor({
     const clamp = (value: number, max: number) => Math.min(Math.max(value, margin), Math.max(margin, max - margin));
     const initW = view.w > 0 ? view.w : 1200;
     const initH = view.h > 0 ? view.h : 800;
-    const edW = Math.max(1, Math.min(520, Math.max(1, initW - 24) / safeZoom));
+    const edW = Math.max(320, Math.min(520, initW - 24));
     const scX = (worldX - cam.x) * zoom + initW / 2;
     const scY = (worldY - cam.y) * zoom + initH / 2;
     return {
@@ -113,7 +112,7 @@ export default function FormulaEditor({
   const [toolsPos, setToolsPos] = useState<{ x: number; y: number }>(() => {
     const initW = view.w > 0 ? view.w : 1200;
     const initH = view.h > 0 ? view.h : 800;
-    const edW = Math.max(1, Math.min(520, Math.max(1, initW - 24) / safeZoom));
+    const edW = Math.max(320, Math.min(520, initW - 24));
     const tW = Math.max(1, Math.min(360, initW - 16));
     const scX = (worldX - cam.x) * zoom + initW / 2;
     const scY = (worldY - cam.y) * zoom + initH / 2;
@@ -160,7 +159,7 @@ export default function FormulaEditor({
     onASTChangeRef.current = onASTChange;
   }, [onTextChange, onCommit, onResize, onASTChange]);
 
-  const maxPanelHeight = Math.max(1, (availableView.h - 16) / safeZoom);
+  const maxPanelHeight = Math.max(120, availableView.h - 16);
   const sourceChromeHeight = EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT +
     (sourceError ? SOURCE_ERROR_HEIGHT : 0) + EDITOR_BORDER_ALLOWANCE;
   const maxSourceHeight = Math.max(1, maxPanelHeight - sourceChromeHeight);
@@ -169,10 +168,10 @@ export default function FormulaEditor({
   const initialSourceCursor = useMemo(() => {
     const parsed = parseSourceText(initialText);
     if (clickX === undefined || clickY === undefined) return parsed.normalized.length;
-    const charWidth = Math.max(4, 8 * zoom);
-    const lineHeight = Math.max(12, 25.6 * zoom);
-    const leftPadding = (screenX + 56 * zoom);
-    const topPadding = (screenY + (EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT + 8) * zoom);
+    const charWidth = 8;
+    const lineHeight = 25.6;
+    const leftPadding = (screenX + 56);
+    const topPadding = (screenY + EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT + 8);
     const dx = Math.max(0, clickX - leftPadding);
     const dy = Math.max(0, clickY - topPadding);
     const lines = parsed.normalized.split('\n');
@@ -181,7 +180,7 @@ export default function FormulaEditor({
     for (let index = 0; index < row; index++) offset += lines[index].length + 1;
     const column = Math.min(lines[row]?.length ?? 0, Math.round(dx / charWidth));
     return Math.min(parsed.normalized.length, offset + column);
-  }, [initialText, clickX, clickY, screenX, screenY, zoom]);
+  }, [initialText, clickX, clickY, screenX, screenY]);
 
   const onDragDown = (event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -509,10 +508,10 @@ export default function FormulaEditor({
     }
   }, [showTools, toolsPos, openToolsSafe]);
 
+  // Recalculate anchor when camera changes or shape moves, decoupled from editor's internal content resizing.
   useLayoutEffect(() => {
-    const frame = window.requestAnimationFrame(repositionPanels);
-    return () => window.cancelAnimationFrame(frame);
-  }, [repositionPanels, workspaceSize]);
+    repositionPanels();
+  }, [repositionPanels]);
 
   const commitRef = useRef(commitDraft);
   useLayoutEffect(() => {
@@ -543,8 +542,7 @@ export default function FormulaEditor({
           width: editorWidth,
           maxWidth: editorWidth,
           maxHeight: maxPanelHeight,
-          transform: `scale(${zoom})`,
-          transformOrigin: 'top left',
+          transform: 'none',
           zIndex: 1001,
         }}
         onPointerDown={event => event.stopPropagation()}

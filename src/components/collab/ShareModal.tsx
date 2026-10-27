@@ -1,11 +1,13 @@
 import * as React from 'react';
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef } from 'react';
 import {
   Link2, Check, Globe, X, Wifi, HelpCircle,
   ChevronDown, Lock
 } from 'lucide-react';
 import type { CollabPeer, CollabUser } from '../../store/collabPresence';
-import { encodeBoardToken } from '../../store/boardSecurity';
+import { encodeBoardToken, type BoardUserRole } from '../../store/boardSecurity';
+
+export type ShareRole = 'edit' | 'comment' | 'view';
 
 interface ShareModalProps {
   isOpen: boolean;
@@ -13,6 +15,7 @@ interface ShareModalProps {
   boardId: string;
   collabPeers?: CollabPeer[];
   collabUser?: CollabUser | null;
+  onRoleChange?: (targetClientId: number, role: 'owner' | 'editor' | 'commenter' | 'viewer') => void;
 }
 
 interface NetworkInfoResponse {
@@ -26,6 +29,7 @@ export function ShareModal({
   boardId,
   collabPeers = [],
   collabUser = null,
+  onRoleChange,
 }: ShareModalProps): React.ReactElement | null {
   const [networkIps, setNetworkIps] = useState<string[]>([]);
   const [serverPort, setServerPort] = useState<number>(5175);
@@ -33,6 +37,21 @@ export function ShareModal({
   const [copied, setCopied] = useState<boolean>(false);
   const [showHelp, setShowHelp] = useState<boolean>(false);
   const [originInfo, setOriginInfo] = useState({ origin: '', host: '', protocol: 'http:' });
+  const [selectedRole, setSelectedRole] = useState<ShareRole>('edit');
+  const [isRoleDropdownOpen, setIsRoleDropdownOpen] = useState<boolean>(false);
+  const [openPeerDropdownId, setOpenPeerDropdownId] = useState<number | null>(null);
+  const roleDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isRoleDropdownOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (roleDropdownRef.current && !roleDropdownRef.current.contains(e.target as Node)) {
+        setIsRoleDropdownOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handleClickOutside);
+    return () => window.removeEventListener('mousedown', handleClickOutside);
+  }, [isRoleDropdownOpen]);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -65,7 +84,10 @@ export function ShareModal({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  const encryptedToken = useMemo(() => encodeBoardToken(boardId), [boardId, isOpen]);
+  const encryptedToken = useMemo(() => {
+    const targetRole: BoardUserRole = selectedRole === 'view' ? 'viewer' : selectedRole === 'comment' ? 'commenter' : 'editor';
+    return encodeBoardToken(boardId, targetRole);
+  }, [boardId, selectedRole, isOpen]);
 
   if (!isOpen) return null;
 
@@ -80,6 +102,15 @@ export function ShareModal({
   } else if (useLocalhost) {
     activeUrl = `${originInfo.protocol}//localhost:${currentPort}/?token=${encodeURIComponent(encryptedToken)}`;
   }
+  if (selectedRole !== 'edit') {
+    activeUrl += `&role=${selectedRole}`;
+  }
+
+  const roleLabels: Record<ShareRole, { label: string; desc: string }> = {
+    edit: { label: 'Can edit', desc: 'Can view and edit with secure link token' },
+    comment: { label: 'Can comment', desc: 'Can view and leave reactions with secure link token' },
+    view: { label: 'Can view', desc: 'Can view only with secure link token' },
+  };
 
   const handleCopy = async () => {
     try {
@@ -138,12 +169,61 @@ export function ShareModal({
             </div>
             <div className="share-access-text">
               <span className="share-access-title">Anyone with the link</span>
-              <span className="share-access-desc">Can view and edit with secure link token</span>
+              <span className="share-access-desc">{roleLabels[selectedRole].desc}</span>
             </div>
           </div>
-          <div className="share-permission-pill" title="Public real-time edit access">
-            <span>Can edit</span>
-            <ChevronDown size={13} className="text-slate-400" />
+          <div className="relative" ref={roleDropdownRef}>
+            <button
+              type="button"
+              className={`share-permission-pill ${isRoleDropdownOpen ? 'is-open' : ''}`}
+              title="Change public access permission"
+              aria-label="Change access permission"
+              aria-expanded={isRoleDropdownOpen}
+              onClick={() => setIsRoleDropdownOpen(prev => !prev)}
+            >
+              <span>{roleLabels[selectedRole].label}</span>
+              <ChevronDown size={13} className={`text-slate-400 transition-transform ${isRoleDropdownOpen ? 'rotate-180' : ''}`} />
+            </button>
+
+            {isRoleDropdownOpen && (
+              <div className="share-permission-dropdown" role="menu">
+                <button
+                  type="button"
+                  className={`share-permission-option ${selectedRole === 'edit' ? 'is-selected' : ''}`}
+                  onClick={() => { setSelectedRole('edit'); setIsRoleDropdownOpen(false); }}
+                >
+                  <div className="share-permission-option-info">
+                    <span className="share-permission-option-label">Can edit</span>
+                    <span className="share-permission-option-desc">Can add, draw, and edit shapes</span>
+                  </div>
+                  {selectedRole === 'edit' && <Check size={14} className="share-permission-check" />}
+                </button>
+
+                <button
+                  type="button"
+                  className={`share-permission-option ${selectedRole === 'comment' ? 'is-selected' : ''}`}
+                  onClick={() => { setSelectedRole('comment'); setIsRoleDropdownOpen(false); }}
+                >
+                  <div className="share-permission-option-info">
+                    <span className="share-permission-option-label">Can comment</span>
+                    <span className="share-permission-option-desc">Can view and leave reactions</span>
+                  </div>
+                  {selectedRole === 'comment' && <Check size={14} className="share-permission-check" />}
+                </button>
+
+                <button
+                  type="button"
+                  className={`share-permission-option ${selectedRole === 'view' ? 'is-selected' : ''}`}
+                  onClick={() => { setSelectedRole('view'); setIsRoleDropdownOpen(false); }}
+                >
+                  <div className="share-permission-option-info">
+                    <span className="share-permission-option-label">Can view</span>
+                    <span className="share-permission-option-desc">Can only view, no editing</span>
+                  </div>
+                  {selectedRole === 'view' && <Check size={14} className="share-permission-check" />}
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -230,25 +310,78 @@ export function ShareModal({
               <span className="share-role-text">Editor</span>
             </div>
 
-            {/* Remote Peers */}
-            {collabPeers.map(peer => (
-              <div key={peer.clientId} className="share-collaborator-item">
-                <div
-                  className="share-avatar-circle"
-                  style={{
-                    background: peer.user.gradient,
-                    color: '#ffffff',
-                  }}
-                >
-                  {peer.user.avatarLabel}
+            {/* Remote Peers with Individual Role Selectors */}
+            {collabPeers.map(peer => {
+              const currentPeerRole = peer.user.role || 'editor';
+              const isMenuOpen = openPeerDropdownId === peer.clientId;
+              return (
+                <div key={peer.clientId} className="share-collaborator-item">
+                  <div
+                    className="share-avatar-circle"
+                    style={{
+                      background: peer.user.gradient,
+                      color: '#ffffff',
+                    }}
+                  >
+                    {peer.user.avatarLabel}
+                  </div>
+                  <div className="share-collab-info">
+                    <span className="share-collab-name">{peer.user.name}</span>
+                    <span className="share-collab-status">Active now</span>
+                  </div>
+
+                  <div className="relative">
+                    <button
+                      type="button"
+                      className="share-collab-role-btn"
+                      onClick={() => setOpenPeerDropdownId(isMenuOpen ? null : peer.clientId)}
+                      title="Change user permission"
+                    >
+                      <span>{currentPeerRole === 'viewer' ? 'Viewer' : currentPeerRole === 'commenter' ? 'Commenter' : 'Editor'}</span>
+                      <ChevronDown size={11} className={`text-slate-400 transition-transform ${isMenuOpen ? 'rotate-180' : ''}`} />
+                    </button>
+
+                    {isMenuOpen && (
+                      <div className="share-collab-role-menu" role="menu">
+                        <button
+                          type="button"
+                          className={`share-collab-role-option ${currentPeerRole === 'editor' ? 'is-selected' : ''}`}
+                          onClick={() => {
+                            onRoleChange?.(peer.clientId, 'editor');
+                            setOpenPeerDropdownId(null);
+                          }}
+                        >
+                          <span>Editor</span>
+                          {currentPeerRole === 'editor' && <Check size={12} className="text-blue-600" />}
+                        </button>
+                        <button
+                          type="button"
+                          className={`share-collab-role-option ${currentPeerRole === 'commenter' ? 'is-selected' : ''}`}
+                          onClick={() => {
+                            onRoleChange?.(peer.clientId, 'commenter');
+                            setOpenPeerDropdownId(null);
+                          }}
+                        >
+                          <span>Commenter</span>
+                          {currentPeerRole === 'commenter' && <Check size={12} className="text-blue-600" />}
+                        </button>
+                        <button
+                          type="button"
+                          className={`share-collab-role-option ${currentPeerRole === 'viewer' ? 'is-selected' : ''}`}
+                          onClick={() => {
+                            onRoleChange?.(peer.clientId, 'viewer');
+                            setOpenPeerDropdownId(null);
+                          }}
+                        >
+                          <span>Viewer</span>
+                          {currentPeerRole === 'viewer' && <Check size={12} className="text-blue-600" />}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div className="share-collab-info">
-                  <span className="share-collab-name">{peer.user.name}</span>
-                  <span className="share-collab-status">Active now</span>
-                </div>
-                <span className="share-role-text">Editor</span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 

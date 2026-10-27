@@ -4,7 +4,7 @@ import type { AnyShape } from '../engine/CanvasEngine';
 import { IndexedDbYjsUpdateStorage, LocalYjsPersistence, type LocalPersistenceStatus, type YjsUpdateStorage } from './localYjsPersistence';
 import { initCollabPresence } from './collabPresence';
 
-import { resolveBoardIdFromUrl, encodeBoardToken } from './boardSecurity';
+import { resolveBoardIdFromUrl, encodeBoardToken, resolveBoardRoleFromUrl } from './boardSecurity';
 
 export function getBoardId(): string {
   return resolveBoardIdFromUrl();
@@ -17,7 +17,8 @@ if (typeof window !== 'undefined') {
   try {
     const url = new URL(window.location.href);
     if (!url.searchParams.get('board') && !url.searchParams.get('token')) {
-      url.searchParams.set('token', encodeBoardToken(BOARD_ID));
+      const initialRole = resolveBoardRoleFromUrl();
+      url.searchParams.set('token', encodeBoardToken(BOARD_ID, initialRole));
       window.history.replaceState(null, '', url.toString());
     }
   } catch {
