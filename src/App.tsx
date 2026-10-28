@@ -46,7 +46,7 @@ import BoardStatusBanner from './store/BoardStatusBanner';
 import FormulaEditor from './formula/FormulaEditor';
 import FormulaEditorBoundary from './formula/FormulaEditorBoundary';
 import { DEFAULT_CODE_LANGUAGE, normalizeCodeLanguage, type CodeLanguage } from './code/languages';
-import { getCustomCursors, HIGH_CONTRAST_CURSORS, visibleCursor } from './cursors';
+import { getCustomCursors, visibleCursor } from './cursors';
 import type { LucideIcon } from 'lucide-react';
 
 const CodeEditor = React.lazy(() => import('./code/CodeEditor'));

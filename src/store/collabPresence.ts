@@ -300,6 +300,19 @@ function notifyListeners() {
   listeners.forEach(fn => fn());
 }
 
+function getStoredUserPreferences(): { preferredNum?: number; preferredColor?: string } {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const rawNum = window.sessionStorage.getItem(STORAGE_KEY_NUM);
+      const preferredNum = rawNum ? parseInt(rawNum, 10) : undefined;
+      const rawColor = window.sessionStorage.getItem(STORAGE_KEY_COLOR);
+      const preferredColor = rawColor || undefined;
+      return { preferredNum: Number.isNaN(preferredNum) ? undefined : preferredNum, preferredColor };
+    }
+  } catch {}
+  return {};
+}
+
 export function initCollabPresence(awareness: Awareness): CollabUser {
   activeAwareness = awareness;
 
@@ -320,18 +333,7 @@ export function initCollabPresence(awareness: Awareness): CollabUser {
   });
 
   if (!localCollabUser) {
-    let preferredNum: number | undefined;
-    let preferredColor: string | undefined;
-    try {
-      if (typeof window !== 'undefined' && window.sessionStorage) {
-        const rawNum = window.sessionStorage.getItem(STORAGE_KEY_NUM);
-        if (rawNum) preferredNum = parseInt(rawNum, 10);
-        const rawColor = window.sessionStorage.getItem(STORAGE_KEY_COLOR);
-        if (rawColor) preferredColor = rawColor;
-      }
-    } catch {
-      // Ignore
-    }
+    const { preferredNum, preferredColor } = getStoredUserPreferences();
     localCollabUser = resolveAnonymousUser(takenNumbers, takenColors, preferredNum, undefined, preferredColor);
   }
 
@@ -385,18 +387,7 @@ export function initCollabPresence(awareness: Awareness): CollabUser {
 
 export function ensureLocalCollabUser(): CollabUser {
   if (!localCollabUser) {
-    let preferredNum: number | undefined;
-    let preferredColor: string | undefined;
-    try {
-      if (typeof window !== 'undefined' && window.sessionStorage) {
-        const rawNum = window.sessionStorage.getItem(STORAGE_KEY_NUM);
-        if (rawNum) preferredNum = parseInt(rawNum, 10);
-        const rawColor = window.sessionStorage.getItem(STORAGE_KEY_COLOR);
-        if (rawColor) preferredColor = rawColor;
-      }
-    } catch {
-      // Ignore
-    }
+    const { preferredNum, preferredColor } = getStoredUserPreferences();
     localCollabUser = resolveAnonymousUser(new Set(), new Set(), preferredNum, undefined, preferredColor, !preferredColor);
   }
   return localCollabUser;

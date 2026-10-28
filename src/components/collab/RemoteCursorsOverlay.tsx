@@ -173,34 +173,23 @@ export function RemoteCursorsOverlay({ engine, camera }: RemoteCursorsOverlayPro
     if (!engine) return [];
     const now = Date.now();
     const overlayEl = overlayRef.current;
-    const list: Array<{ id: string; emoji: string; screenX: number; screenY: number }> = [];
+    const allReactions = [
+      ...peers.map(p => p.reaction),
+      localReaction,
+    ].filter((r): r is NonNullable<typeof r> => Boolean(r && now - r.timestamp < 2800));
 
-    // Peer reactions
-    for (const p of peers) {
-      if (p.reaction && now - p.reaction.timestamp < 2800) {
-        const pos = engine.worldToOverlay(p.reaction.x, p.reaction.y, overlayEl);
-        list.push({
-          id: p.reaction.id,
-          emoji: p.reaction.emoji,
-          screenX: Math.round(pos.x * 10) / 10,
-          screenY: Math.round(pos.y * 10) / 10,
-        });
-      }
-    }
-
-    // Local reaction
-    if (localReaction && now - localReaction.timestamp < 2800) {
-      const pos = engine.worldToOverlay(localReaction.x, localReaction.y, overlayEl);
-      list.push({
-        id: localReaction.id,
-        emoji: localReaction.emoji,
+    return allReactions.map(r => {
+      const pos = engine.worldToOverlay(r.x, r.y, overlayEl);
+      return {
+        id: r.id,
+        emoji: r.emoji,
         screenX: Math.round(pos.x * 10) / 10,
         screenY: Math.round(pos.y * 10) / 10,
-      });
-    }
-
-    return list;
+      };
+    });
   }, [peers, localReaction, engine, camera]);
+
+  const stopPropagation = (e: React.SyntheticEvent) => e.stopPropagation();
 
   const handleJumpToPeer = (worldX: number, worldY: number, e: React.SyntheticEvent) => {
     e.stopPropagation();
@@ -329,10 +318,10 @@ export function RemoteCursorsOverlay({ engine, camera }: RemoteCursorsOverlayPro
             tabIndex={0}
             title={`Click to jump to ${peer.user.name}`}
             aria-label={`Jump to ${peer.user.name}`}
-            onPointerDown={e => { e.stopPropagation(); }}
-            onPointerUp={e => { e.stopPropagation(); }}
-            onMouseDown={e => { e.stopPropagation(); }}
-            onTouchStart={e => { e.stopPropagation(); }}
+            onPointerDown={stopPropagation}
+            onPointerUp={stopPropagation}
+            onMouseDown={stopPropagation}
+            onTouchStart={stopPropagation}
             onClick={e => handleJumpToPeer(worldX, worldY, e)}
             onKeyDown={e => {
               if (e.key === 'Enter' || e.key === ' ') {

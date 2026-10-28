@@ -968,7 +968,7 @@ export class CanvasEngine {
     return Number.isFinite(pressure) && pressure > 0 ? Math.max(0, Math.min(1, pressure)) : fallback;
   }
 
-  private appendPenSamples(event: PointerEvent) {
+  private appendPenSamples(event: PointerEvent, force = false) {
     const shape = this.currId ? this.shapes.get(this.currId) : undefined;
     if (!shape || shape.type !== 'pen') return;
     const stroke = shape as PenShape;
@@ -985,15 +985,27 @@ export class CanvasEngine {
     let minX = stroke.minX, minY = stroke.minY, maxX = stroke.maxX, maxY = stroke.maxY;
     let last = points[points.length - 1];
     let changed = false;
-    for (const sample of samples) {
+
+    // Zoom-invariant minimum distance threshold:
+    // Requires at least 0.5 screen pixels between sampled points to filter subpixel sensor noise
+    // while keeping slow movements completely smooth and responsive at any zoom.
+    const minScreenDist = 0.5;
+    const minWorldDistSq = (minScreenDist / Math.max(0.01, this.cam.zoom)) ** 2;
+
+    for (let i = 0; i < samples.length; i++) {
+      const sample = samples[i];
+      const isLastSample = i === samples.length - 1;
       if (this.activePointerId !== null && Number.isFinite(sample.pointerId) && sample.pointerId !== this.activePointerId) continue;
       const world = this.clientToWorld(sample.clientX, sample.clientY);
       const pressure = this.pressureOf(sample, last?.[2] ?? 0.5);
-      if (last && (world.x - last[0]) ** 2 + (world.y - last[1]) ** 2 < 1e-8 && Math.abs(pressure - (last[2] ?? 0.5)) < 0.015) continue;
-      last = [world.x, world.y, pressure];
+      const dSq = last ? (world.x - last[0]) ** 2 + (world.y - last[1]) ** 2 : Infinity;
+      if (last && !(force && isLastSample && dSq > 1e-6) && dSq < minWorldDistSq && Math.abs(pressure - (last[2] ?? 0.5)) < 0.02) continue;
+      
+      const ptX = world.x, ptY = world.y;
+      last = [ptX, ptY, pressure];
       points.push(last);
-      minX = Math.min(minX, world.x); maxX = Math.max(maxX, world.x);
-      minY = Math.min(minY, world.y); maxY = Math.max(maxY, world.y);
+      minX = Math.min(minX, ptX); maxX = Math.max(maxX, ptX);
+      minY = Math.min(minY, ptY); maxY = Math.max(maxY, ptY);
       changed = true;
     }
     if (!changed) return;
@@ -1355,7 +1367,7 @@ export class CanvasEngine {
       const shape = this.shapes.get(this.currId);
       const world = this.clientToWorld(event.clientX, event.clientY);
       if (shape?.type === 'pen' && event.button === 0) {
-        this.appendPenSamples(event);
+        this.appendPenSamples(event, true);
       } else if (shape?.type === 'arrow') {
         const arrow = shape as ArrowShape;
         this.put({ ...arrow, x2: world.x, y2: world.y,
@@ -1807,10 +1819,20 @@ export class CanvasEngine {
   private finalizeSmartStroke(stroke: PenShape): boolean {
     const result = recognizeSmartDrawing(stroke.pts, stroke.size);
     if (result.kind === 'unchanged') return false;
-    if (result.kind === 'line') {
+    if (result.kind === 'line' || result.kind === 'arrow') {
       if (result.points.length < 2) return false;
       const [first, last] = result.points;
       if (!Number.isFinite(first[0]) || !Number.isFinite(first[1]) || !Number.isFinite(last[0]) || !Number.isFinite(last[1])) return false;
+      if (result.kind === 'arrow') {
+        this.put({
+          id: stroke.id, type: 'arrow',
+          x1: first[0], y1: first[1], x2: last[0], y2: last[1],
+          color: stroke.color, sw: stroke.size,
+          minX: Math.min(first[0], last[0]), minY: Math.min(first[1], last[1]),
+          maxX: Math.max(first[0], last[0]), maxY: Math.max(first[1], last[1]),
+        } as ArrowShape);
+        return true;
+      }
       this.put({
         id: stroke.id, type: 'line',
         x1: first[0], y1: first[1], x2: last[0], y2: last[1],
@@ -1820,19 +1842,61 @@ export class CanvasEngine {
       } as LineShape);
       return true;
     }
-    if (result.kind !== 'rectangle' && result.kind !== 'ellipse' && result.kind !== 'triangle') return false;
+    if (result.kind === 'heart') {
+      const bounds = result.bounds;
+      if (!bounds || !Number.isFinite(bounds.x + bounds.y + bounds.w + bounds.h) || bounds.w <= 0 || bounds.h <= 0) return false;
+      this.put({
+        id: stroke.id,
+        type: 'diagram',
+        shapeId: 'basic.heart',
+        x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.h,
+        fill: 'transparent', stroke: stroke.color, sw: stroke.size,
+        minX: bounds.x, minY: bounds.y, maxX: bounds.x + bounds.w, maxY: bounds.y + bounds.h,
+      } as DiagramShape);
+      return true;
+    }
+    if (result.kind !== 'rectangle' && result.kind !== 'ellipse' && result.kind !== 'triangle' && result.kind !== 'diamond' && result.kind !== 'star' && result.kind !== 'parallelogram' && result.kind !== 'trapezoid') return false;
     const bounds = result.bounds;
     if (!bounds || !Number.isFinite(bounds.x + bounds.y + bounds.w + bounds.h) || bounds.w <= 0 || bounds.h <= 0) return false;
-    const vertices = (result.kind === 'triangle' || result.kind === 'rectangle') && result.vertices
-      ? result.vertices.map(([x, y]) => [(x - bounds.x) / bounds.w, (y - bounds.y) / bounds.h] as [number, number])
+    let { x, y, w, h } = bounds;
+    // Miro-standard: If ellipse is near 1:1 (ratio <= 1.25), snap to true circle; if elongated, keep clean ellipse
+    let shapeRotation = result.rotation;
+    if (result.kind === 'ellipse') {
+      const ratio = Math.max(w, h) / Math.min(w, h);
+      if (ratio <= 1.25) {
+        const side = (w + h) / 2;
+        x -= (side - w) / 2;
+        y -= (side - h) / 2;
+        w = side;
+        h = side;
+        shapeRotation = undefined;
+      } else if (shapeRotation !== undefined) {
+        const absRot = Math.abs(shapeRotation);
+        if (absRot < 15 || Math.abs(absRot - 90) < 15) {
+          shapeRotation = undefined;
+        }
+      }
+    } else if (result.kind === 'rectangle') {
+      const ratio = Math.max(w, h) / Math.min(w, h);
+      if (ratio <= 1.08) {
+        const side = (w + h) / 2;
+        x -= (side - w) / 2;
+        y -= (side - h) / 2;
+        w = side;
+        h = side;
+      }
+    }
+    const vertices = (result.kind === 'triangle' || result.kind === 'rectangle' || result.kind === 'parallelogram' || result.kind === 'trapezoid') && result.vertices
+      ? result.vertices.map(([vx, vy]) => [(vx - bounds.x) / bounds.w, (vy - bounds.y) / bounds.h] as [number, number])
       : undefined;
     const type = result.kind === 'rectangle' ? 'rect' : result.kind;
     this.put({
       id: stroke.id,
       type,
-      x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.h,
+      x, y, w, h,
       fill: 'transparent', stroke: stroke.color, sw: stroke.size,
-      minX: bounds.x, minY: bounds.y, maxX: bounds.x + bounds.w, maxY: bounds.y + bounds.h,
+      minX: x, minY: y, maxX: x + w, maxY: y + h,
+      ...(shapeRotation && Math.abs(shapeRotation) >= 1.0 ? { rotation: shapeRotation } : {}),
       ...(vertices ? { vertices } : {}),
     } as AnyShape);
     return true;
@@ -2847,7 +2911,7 @@ export class CanvasEngine {
     if (this.currId) {
       let shape = this.shapes.get(this.currId);
       if (shape?.type === 'pen' && event) {
-        this.appendPenSamples(event);
+        this.appendPenSamples(event, true);
         shape = this.shapes.get(this.currId);
       }
       if (shape?.type === 'pen' && !this.activeSmartDrawing) this.flushPenPublish();
@@ -7620,14 +7684,14 @@ export class CanvasEngine {
         const hasMeasuredPressure = s.pts.some(point => Number.isFinite(point[2]) && Math.abs(point[2]! - 0.5) > 0.02);
         const outline = getStroke(s.pts, {
           size: Math.max(0.1, s.size),
-          thinning: 0.4,
-          smoothing: 0.5,
-          streamline: 0.25,
+          thinning: hasMeasuredPressure ? 0.20 : 0, // Zero thinning on mouse -> uniform width, no pinching or distorted wiggles
+          smoothing: 0.50,
+          streamline: 0.08, // Low streamline -> follows cursor faithfully without lagging or shrinking wiggles
           easing: pressure => pressure,
-          simulatePressure: s.simulatePressure ?? !hasMeasuredPressure,
-          start: {cap:true, taper:0},
-          end: {cap:true, taper:0},
-          last:true,
+          simulatePressure: false,
+          start: { cap: true, taper: 0 },
+          end: { cap: true, taper: 0 },
+          last: true,
         });
         if (!outline.length) break;
         cx.fillStyle = s.color;
@@ -7638,15 +7702,11 @@ export class CanvasEngine {
           }
           break;
         }
-        // getStroke returns a filled outline, not a centerline. Follow the library's
-        // midpoint/quadratic construction so outline corners remain smooth and the
-        // generated start/end cap geometry is preserved.
         const path = new Path2D();
-        path.moveTo(outline[0][0], outline[0][1]);
-        const first = outline[1], second = outline[2];
-        path.quadraticCurveTo(first[0], first[1], (first[0] + second[0]) / 2, (first[1] + second[1]) / 2);
-        for (let index = 2; index < outline.length - 1; index++) {
-          const control = outline[index], next = outline[index + 1];
+        const first = outline[0], second = outline[1];
+        path.moveTo((first[0] + second[0]) / 2, (first[1] + second[1]) / 2);
+        for (let index = 1; index < outline.length; index++) {
+          const control = outline[index], next = outline[(index + 1) % outline.length];
           path.quadraticCurveTo(control[0], control[1], (control[0] + next[0]) / 2, (control[1] + next[1]) / 2);
         }
         path.closePath();

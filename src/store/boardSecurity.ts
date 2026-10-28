@@ -99,6 +99,13 @@ export function decodeBoardToken(token: string): string | null {
   return payload ? payload.boardId : null;
 }
 
+function extractTokenFromParams(params: URLSearchParams): string | null {
+  const token = params.get('token')?.trim();
+  if (token?.startsWith('brd_')) return token;
+  const board = params.get('board')?.trim();
+  return board?.startsWith('brd_') ? board : null;
+}
+
 /**
  * Resolves the authoritative user role from window.location.
  * The cryptographically sealed token is the single source of truth:
@@ -108,26 +115,12 @@ export function resolveBoardRoleFromUrl(): BoardUserRole {
   if (typeof window === 'undefined') return 'editor';
   try {
     const params = new URLSearchParams(window.location.search);
-
-    // 1. Authoritative check: Sealed role inside token parameter
-    const tokenParam = params.get('token')?.trim();
-    if (tokenParam) {
-      const payload = decodeBoardTokenPayload(tokenParam);
-      if (payload) {
-        return payload.role;
-      }
+    const token = extractTokenFromParams(params);
+    if (token) {
+      const payload = decodeBoardTokenPayload(token);
+      if (payload) return payload.role;
     }
 
-    // 2. Authoritative check: Board parameter if formatted as token
-    const boardParam = params.get('board')?.trim();
-    if (boardParam && boardParam.startsWith('brd_')) {
-      const payload = decodeBoardTokenPayload(boardParam);
-      if (payload) {
-        return payload.role;
-      }
-    }
-
-    // 3. Fallback for unencrypted board params (dev/testing mode only)
     const r = params.get('role')?.toLowerCase().trim();
     if (r === 'view' || r === 'viewer') return 'viewer';
     if (r === 'comment' || r === 'commenter') return 'commenter';
@@ -147,23 +140,14 @@ export function resolveBoardIdFromUrl(): string {
   if (typeof window === 'undefined') return 'board-1';
   try {
     const params = new URLSearchParams(window.location.search);
-
-    // 1. Check encrypted token parameter first
-    const tokenParam = params.get('token')?.trim();
-    if (tokenParam) {
-      const decoded = decodeBoardToken(tokenParam);
+    const token = extractTokenFromParams(params);
+    if (token) {
+      const decoded = decodeBoardToken(token);
       if (decoded) return decoded;
     }
 
-    // 2. Check board parameter (can be either raw ID or encrypted token)
-    const boardParam = params.get('board')?.trim();
-    if (boardParam) {
-      if (boardParam.startsWith('brd_')) {
-        const decoded = decodeBoardToken(boardParam);
-        if (decoded) return decoded;
-      }
-      return boardParam;
-    }
+    const board = params.get('board')?.trim();
+    if (board) return board;
   } catch {
     // Ignore URL parse errors
   }

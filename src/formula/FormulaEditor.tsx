@@ -82,7 +82,6 @@ export default function FormulaEditor({
   const [sourceError, setSourceError] = useState(initialProjection.sourceError);
   const refreshInitialPreviewRef = useRef(initialProjection.refreshStoredPreview);
   const [mode, setMode] = useState<FormulaEditorMode>('rendered');
-  const [_sourceContentHeight, setSourceContentHeight] = useState(60);
   const [toolsMaxHeight, setToolsMaxHeight] = useState<number | undefined>(undefined);
   const [workspaceSize, setWorkspaceSize] = useState({ w: view.w, h: view.h });
 
@@ -613,7 +612,7 @@ export default function FormulaEditor({
             maxHeight={maxSourceHeight}
             active={mode === 'source'}
             onChange={handleSourceChange}
-            onLayout={height => setSourceContentHeight(current => current === height ? current : height)}
+            onLayout={() => {}}
             onCommit={commitDraft}
           />
           {mode === 'rendered' && sourceError && (
